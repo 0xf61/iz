@@ -1,0 +1,139 @@
+# iz
+
+iz records shell commands together with their full terminal output, and makes
+all of it searchable from a single SQLite database.
+
+If you have ever re-run a five minute scan just to look at one line of its
+output again, that is the problem iz solves. Commands run through iz behave
+normally: colors, progress bars and interactivity all work as usual. The
+difference is that afterwards the command line, exit code, duration, working
+directory and the complete colored output are stored and indexed.
+
+## Why not atuin or asciinema?
+
+- [atuin](https://atuin.sh) stores your shell history with great search, but it
+  only keeps the command line. What the command printed is gone the moment you
+  close the terminal.
+- [asciinema](https://asciinema.org) records the whole session, but there is no
+  way to search for "that nmap run where port 443 was filtered" or "the last
+  build that mentioned this warning". You scrub through video.
+
+iz sits between the two: per-command recording like atuin, output capture like
+asciinema, and full-text search over both.
+
+## How it works
+
+- **Capture**: `iz -- <cmd>` runs the command inside a PTY. Output is mirrored
+  to your terminal while being recorded. The program still sees a tty, so
+  colors and progress bars stay on.
+- **Storage**: one SQLite file per machine. Run metadata (command, exit code,
+  duration, hostname, cwd), the raw output gzipped (typically 10-20x smaller),
+  and an FTS5 index over the plain text.
+- **Cleanup**: clear-screen sequences are dropped and progress-bar redraws
+  collapse to their final frame, so replayed output looks like what you
+  actually saw.
+- **Search**: the TUI lists one colored line per run — id, date, tool,
+  directory, command — and re-runs the full-text query live as you type
+  (`change:reload` + `--phony`, so fzf itself never re-filters and every
+  keystroke hits the FTS index). Lowercase terms match case-insensitively;
+  mixed-case terms (like `ESC8`) match verbatim. `host:`, `dir:` and `size:`
+  filter on columns; exit status and size are shown in the preview, whose
+  header carries the hostname. The preview highlights whatever you type.
+
+## Install
+
+```fish
+go install github.com/0xf61/iz@latest
+```
+
+The binary lands in `$GOBIN` (default `~/go/bin/iz`); make sure it is on your
+`$PATH`. Requires Go 1.24+. No cgo, so the same works on Linux.
+
+Or build from source:
+
+```fish
+git clone https://github.com/0xf61/iz && cd iz
+go build -o ~/.local/bin/iz .
+echo 'iz f | source' >> ~/.config/fish/config.fish
+```
+
+Cross-compiling for another machine (a server, a VM, a container) is a single
+command since there is no cgo:
+
+```fish
+GOOS=linux GOARCH=amd64 go build -o dist/iz-linux-amd64 .
+```
+
+## Usage
+
+```fish
+iz -- cargo build --release       # run + record any command
+iz a cargo make pytest            # record these tools automatically via wrappers
+iz f | source                     # generate fish wrappers + ctrl-g search widget
+iz                                # search TUI
+iz sh 42                          # replay output #42, colors intact
+iz e 42                           # open output #42 in $EDITOR
+iz i cargo build.log              # import a log file
+iz m laptop.db                    # merge a db from another machine
+iz r                              # delete runs (fzf multi-select)
+iz d less                         # remove a wrapper + blacklist it
+```
+
+Search examples:
+
+```fish
+iz "warning: unused" cmd:cargo    # cargo runs mentioning a warning
+iz timeout host:build01           # runs on a specific machine
+iz size:>1mb                      # only large outputs (kb/mb/gb, > < >= <=)
+iz 'deprecated'                   # exact phrase via FTS
+```
+
+### TUI keys
+
+| key | action |
+|---|---|
+| `enter` | view output with `less -R` (colors kept, query highlighted) |
+| `tab` | toggle selection / insert command into the prompt (widget) |
+| `ctrl-a` | select all |
+| `ctrl-e` | open output in `$EDITOR` |
+| `ctrl-y` | delete selected runs and reload |
+| `'term` | fzf exact match (e.g. `'tool:make`) |
+
+### Pausing recording
+
+Recording is gated on the `$IZ` environment variable, which defaults to
+`~/.iz/iz.db`:
+
+```fish
+set -e IZ                 # stop recording in this session (wrappers pass through)
+set -gx IZ ~/.iz/iz.db    # resume
+```
+
+## Multiple machines
+
+Each host writes to its own database and stamps every run with its hostname.
+Copy one over and merge, then query by machine:
+
+```fish
+scp build01:~/.iz/iz.db b01.db
+iz m b01.db
+iz host:build01 failed
+```
+
+## Development
+
+```fish
+make test      # go test ./...
+make build     # go build -o iz .
+make linux     # static linux/amd64 + linux/arm64 into dist/
+```
+
+| file | role |
+|---|---|
+| `main.go` | CLI dispatch |
+| `db.go` | schema, CRUD, query parsing |
+| `record.go` | PTY capture, shell quoting |
+| `text.go` | ANSI cleanup, gzip |
+| `search.go` | fzf TUI |
+| `cmds.go` | add/del/list/rm/import/merge/show/edit |
+| `fish.go` | fish integration generator |
