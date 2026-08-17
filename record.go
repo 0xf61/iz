@@ -41,7 +41,7 @@ func runRecord(args []string) int {
 	cmd := exec.Command(args[0], args[1:]...)
 	// CLICOLOR/CLICOLOR_FORCE: keep BSD ls (macOS) colored even when a fish
 	// alias is bypassed; GNU ls is colored automatically inside a PTY.
-	cmd.Env = append(os.Environ(), "IZ_PTY=1", "CLICOLOR=1", "CLICOLOR_FORCE=1")
+	cmd.Env = append(os.Environ(), "CLICOLOR=1", "CLICOLOR_FORCE=1")
 	start := time.Now()
 
 	// Start with the current terminal size: fast tools (fastfetch!) would
@@ -95,7 +95,7 @@ func runRecord(args []string) int {
 		exit = int(r.ExitCode.Int64)
 	}
 
-	id, dbErr := insertRun(db, r, gz(raw), plainText(buf.Bytes()))
+	id, dbErr := insertRun(db, r, gz(raw), stripANSI(raw))
 	if dbErr != nil {
 		fmt.Fprintf(os.Stderr, "[iz] RECORD FAILED: %v\n", dbErr)
 		return exit
@@ -142,11 +142,11 @@ func cwd() string {
 
 func humanBytes(n int64) string {
 	f := float64(n)
-	for _, u := range []string{"B", "KB", "MB", "GB"} {
-		if f < 1024 || u == "GB" {
+	for _, u := range []string{"B", "KB", "MB"} {
+		if f < 1024 {
 			return fmt.Sprintf("%.0f%s", f, u)
 		}
 		f /= 1024
 	}
-	return fmt.Sprintf("%dB", n)
+	return fmt.Sprintf("%.0fGB", f)
 }

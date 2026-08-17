@@ -38,17 +38,6 @@ bind -M default $__iz_key __iz_widget
 bind -M insert  $__iz_key __iz_widget
 `)
 
-	// no wrappers for blacklisted tools
-	blocked := map[string]bool{}
-	if rows, err := db.Query(`SELECT name FROM blacklist`); err == nil {
-		for rows.Next() {
-			var n string
-			rows.Scan(&n) //nolint
-			blocked[n] = true
-		}
-		rows.Close()
-	}
-
 	rows, err := db.Query(`SELECT name FROM tools ORDER BY name`)
 	if err != nil {
 		fmt.Fprintln(os.Stdout, "# --- iz: end ---")
@@ -58,7 +47,7 @@ bind -M insert  $__iz_key __iz_widget
 	for rows.Next() {
 		var name string
 		rows.Scan(&name) //nolint
-		if name == "" || !isToolName(name) || blocked[name] {
+		if name == "" || !isToolName(name) {
 			continue
 		}
 		fmt.Fprintf(os.Stdout, `

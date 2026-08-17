@@ -17,8 +17,8 @@ Usage:
   iz sh <id> [id...] [query] print output(s) as-is; query terms get highlighted
   iz e <id>                  open output in $EDITOR
   iz a <tool>...             add tools to the auto-record list
-  iz d <tool>...             remove from list and blacklist
-  iz l                       list auto-record tools + blacklist
+  iz d <tool>...             remove tools from the auto-record list
+  iz l                       list auto-record tools
   iz i <tool> <file>         import a file (e.g. iz i nmap gm.xml; one arg: tool = file name)
   iz m <iz.db>               merge another machine's database
   iz f                       print fish integration (iz f | source)

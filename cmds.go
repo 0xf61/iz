@@ -32,7 +32,6 @@ func toolsCmd(sub string, args []string) int {
 				fmt.Fprintln(os.Stderr, "[iz] 'iz' cannot record itself")
 				continue
 			}
-			db.Exec(`DELETE FROM blacklist WHERE name=?`, t) //nolint
 			if _, err := db.Exec(`INSERT OR IGNORE INTO tools(name) VALUES(?)`, t); err != nil {
 				fmt.Fprintln(os.Stderr, "iz:", err)
 				return 1
@@ -45,21 +44,13 @@ func toolsCmd(sub string, args []string) int {
 			return 2
 		}
 		for _, t := range args {
-			// Always remove from tools AND blacklist: no more wrappers or imports.
-			db.Exec(`DELETE FROM tools WHERE name=?`, t)                  //nolint
-			db.Exec(`INSERT OR IGNORE INTO blacklist(name) VALUES(?)`, t) //nolint
+			db.Exec(`DELETE FROM tools WHERE name=?`, t) //nolint
 		}
-		fmt.Fprintln(os.Stderr, "[iz] removed + blacklisted. (drop the fish function: functions -e <tool>)")
+		fmt.Fprintln(os.Stderr, "[iz] removed. (drop the fish function: functions -e <tool>)")
 	case "list":
 		fmt.Println("# tools:")
 		for _, n := range queryNames(db, "tools") {
 			fmt.Println(n)
-		}
-		if names := queryNames(db, "blacklist"); len(names) > 0 {
-			fmt.Println("# blacklist:")
-			for _, n := range names {
-				fmt.Println("!", n)
-			}
 		}
 	}
 	return 0
@@ -118,13 +109,6 @@ func importCmd(args []string) int {
 	}
 	defer db.Close()
 
-	var blocked int
-	db.QueryRow(`SELECT 1 FROM blacklist WHERE name=?`, tool).Scan(&blocked) //nolint
-	if blocked == 1 {
-		fmt.Fprintf(os.Stderr, "[iz] %s is blacklisted; import cancelled\n", tool)
-		return 1
-	}
-
 	raw := tidyRaw(data)
 	abs, err := filepath.Abs(file)
 	if err != nil {
@@ -138,7 +122,7 @@ func importCmd(args []string) int {
 		Cwd:      filepath.Dir(abs), // dir of the imported file, not the caller's cwd
 		Size:     ni(int64(len(gz(raw)))),
 	}
-	id, err := insertRun(db, r, gz(raw), plainText(data))
+	id, err := insertRun(db, r, gz(raw), stripANSI(raw))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "iz:", err)
 		return 1
@@ -167,12 +151,40 @@ func mergeCmd(path string) int {
 	}
 	defer other.Close()
 
+	// Dedup key: the same run from the same machine has identical (hostname,
+	// tool, ts, cmd). Loading existing keys once makes this O(n+m) instead of
+	// one index-less scan per incoming row.
+	type key struct {
+		host string
+		tool string
+		ts   float64
+		cmd  string
+	}
+	seen := map[key]bool{}
+	if kr, err := db.Query(`SELECT ts,hostname,tool,cmd FROM runs`); err == nil {
+		for kr.Next() {
+			var k key
+			kr.Scan(&k.ts, &k.host, &k.tool, &k.cmd) //nolint
+			seen[k] = true
+		}
+		kr.Close()
+	}
+
 	rows, err := other.Query(`SELECT ts,hostname,tool,cmd,cwd,exit_code,duration_ms,size,raw FROM runs`)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "iz:", err)
 		return 1
 	}
 	defer rows.Close()
+
+	// One transaction for the whole merge: a single WAL commit instead of one
+	// fsync pair per row.
+	tx, err := db.Begin()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "iz:", err)
+		return 1
+	}
+	defer tx.Rollback() //nolint
 
 	added, skipped := 0, 0
 	for rows.Next() {
@@ -182,17 +194,16 @@ func mergeCmd(path string) int {
 			&r.ExitCode, &r.Dur, &r.Size, &raw); err != nil {
 			continue
 		}
-		var exists int
-		db.QueryRow(`SELECT 1 FROM runs WHERE hostname=? AND tool=? AND abs(ts-?)<0.001 AND cmd=?`,
-			r.Hostname, r.Tool, r.Ts, r.Cmd).Scan(&exists) //nolint
-		if exists == 1 {
+		if seen[key{r.Hostname, r.Tool, r.Ts, r.Cmd}] {
 			skipped++
 			continue
 		}
-		if _, err := insertRun(db, r, raw, plainText(ungz(raw))); err == nil {
+		if _, err := insertRunTx(tx, r, raw, stripANSI(ungz(raw))); err == nil {
+			seen[key{r.Hostname, r.Tool, r.Ts, r.Cmd}] = true
 			added++
 		}
 	}
+	tx.Commit() //nolint
 	fmt.Fprintf(os.Stderr, "[iz] %d merged, %d duplicates skipped\n", added, skipped)
 	return 0
 }
@@ -345,7 +356,7 @@ func editCmd(idArg string) int {
 	return 0
 }
 
-// queryNames reads the name column from tools or blacklist.
+// queryNames reads the name column from the tools table.
 func queryNames(db *sql.DB, table string) []string {
 	rows, err := db.Query(`SELECT name FROM ` + table + ` ORDER BY name`) //nolint
 	if err != nil {

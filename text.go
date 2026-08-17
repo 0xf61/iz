@@ -37,9 +37,13 @@ func tidyRaw(b []byte) []byte {
 	return bytes.Join(lines, []byte{'\n'})
 }
 
-// plainText returns the ANSI-free text used for the search index.
+// stripANSI removes escape sequences from already-tidied output.
+func stripANSI(b []byte) []byte { return reANSI.ReplaceAll(b, nil) }
+
+// plainText tidies raw terminal output and returns the ANSI-free text used
+// for the search index.
 func plainText(b []byte) []byte {
-	return reANSI.ReplaceAll(tidyRaw(b), nil)
+	return stripANSI(tidyRaw(b))
 }
 
 func gz(b []byte) []byte {

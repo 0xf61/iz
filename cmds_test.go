@@ -12,7 +12,7 @@ func TestSubcommands(t *testing.T) {
 	path := testDB(t)
 	t.Setenv("IZ", path)
 
-	// add / list / del-blacklist round trip
+	// add / list / del round trip
 	if code := toolsCmd("add", []string{"nmap", "nuclei"}); code != 0 {
 		t.Fatalf("add exit=%d", code)
 	}
@@ -27,15 +27,10 @@ func TestSubcommands(t *testing.T) {
 	}
 	db.Close()
 
-	if code := toolsCmd("del", []string{"nmap", "vim"}); code != 0 {
+	if code := toolsCmd("del", []string{"nmap"}); code != 0 {
 		t.Fatalf("del exit=%d", code)
 	}
 	db, _ = openDBAt(path)
-	var blocked int
-	db.QueryRow(`SELECT count(*) FROM blacklist`).Scan(&blocked) //nolint
-	if blocked != 2 {                                            // nmap + vim both land there
-		t.Errorf("blacklist = %d, want 2", blocked)
-	}
 	var left int
 	db.QueryRow(`SELECT count(*) FROM tools`).Scan(&left) //nolint
 	if left != 1 {
@@ -43,14 +38,14 @@ func TestSubcommands(t *testing.T) {
 	}
 	db.Close()
 
-	// blacklisted tool cannot be imported
+	// previously blacklisted names import fine now
 	dir := t.TempDir()
 	f := filepath.Join(dir, "nmap.xml")
 	if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if code := importCmd([]string{"nmap", f}); code != 1 {
-		t.Errorf("import of blacklisted tool exit=%d, want 1", code)
+	if code := importCmd([]string{"nmap", f}); code != 0 {
+		t.Errorf("import after del exit=%d, want 0", code)
 	}
 }
 

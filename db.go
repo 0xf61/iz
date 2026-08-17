@@ -46,7 +46,6 @@ CREATE TABLE IF NOT EXISTS runs(
   raw         BLOB             -- original output incl. ANSI, gzipped
 );
 CREATE TABLE IF NOT EXISTS tools(name TEXT PRIMARY KEY);     -- auto-record list
-CREATE TABLE IF NOT EXISTS blacklist(name TEXT PRIMARY KEY); -- never record/wrap (iz, vim, ssh...)
 CREATE VIRTUAL TABLE IF NOT EXISTS outputs_fts USING fts5(text, tokenize='unicode61');`
 	if _, err := db.Exec(schema); err != nil {
 		return nil, err
@@ -70,10 +69,25 @@ type Run struct {
 
 func ni(v int64) sql.NullInt64 { return sql.NullInt64{Int64: v, Valid: true} }
 
-// insertRun writes the run and its FTS row (rowid = run id). The FTS text is
-// hostname+tool+cmd+plain output, so a single MATCH searches everything.
+// insertRun writes the run and its FTS row (rowid = run id) atomically. The
+// FTS text is hostname+tool+cmd+plain output, so a single MATCH searches everything.
 func insertRun(db *sql.DB, r Run, raw, text []byte) (int64, error) {
-	res, err := db.Exec(
+	tx, err := db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	id, err := insertRunTx(tx, r, raw, text)
+	if err != nil {
+		tx.Rollback() //nolint
+		return 0, err
+	}
+	return id, tx.Commit()
+}
+
+// insertRunTx is the transactional core of insertRun; merges use it to batch
+// thousands of rows into one commit.
+func insertRunTx(tx *sql.Tx, r Run, raw, text []byte) (int64, error) {
+	res, err := tx.Exec(
 		`INSERT INTO runs(ts,hostname,tool,cmd,cwd,exit_code,duration_ms,size,raw)
 		 VALUES(?,?,?,?,?,?,?,?,?)`,
 		r.Ts, r.Hostname, r.Tool, r.Cmd, r.Cwd, r.ExitCode, r.Dur, r.Size, raw)
@@ -87,21 +101,28 @@ func insertRun(db *sql.DB, r Run, raw, text []byte) (int64, error) {
 	fts := append([]byte(r.Hostname+" "+r.Tool+" "+r.Cmd+" "), text...)
 	// string() is critical: []byte binds as BLOB, and SQLite LIKE never matches BLOBs
 	// (FTS MATCH still would, silently hiding the bug).
-	_, err = db.Exec(`INSERT INTO outputs_fts(rowid,text) VALUES(?,?)`, id, string(fts))
+	_, err = tx.Exec(`INSERT INTO outputs_fts(rowid,text) VALUES(?,?)`, id, string(fts))
 	return id, err
 }
 
-// deleteRuns removes runs and their FTS rows; returns how many were deleted.
+// deleteRuns removes runs and their FTS rows in one transaction; returns how
+// many were deleted.
 func deleteRuns(db *sql.DB, ids []int64) int {
+	tx, err := db.Begin()
+	if err != nil {
+		return 0
+	}
+	defer tx.Rollback() //nolint
 	n := 0
 	for _, id := range ids {
-		db.Exec(`DELETE FROM outputs_fts WHERE rowid=?`, id) //nolint
-		if res, err := db.Exec(`DELETE FROM runs WHERE id=?`, id); err == nil {
+		tx.Exec(`DELETE FROM outputs_fts WHERE rowid=?`, id) //nolint
+		if res, err := tx.Exec(`DELETE FROM runs WHERE id=?`, id); err == nil {
 			if k, _ := res.RowsAffected(); k > 0 {
 				n++
 			}
 		}
 	}
+	tx.Commit() //nolint
 	return n
 }
 

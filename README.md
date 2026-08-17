@@ -76,7 +76,7 @@ iz e 42                           # open output #42 in $EDITOR
 iz i cargo build.log              # import a log file
 iz m laptop.db                    # merge a db from another machine
 iz r                              # delete runs (fzf multi-select)
-iz d less                         # remove a wrapper + blacklist it
+iz d less                         # remove a wrapper
 ```
 
 Search examples:
