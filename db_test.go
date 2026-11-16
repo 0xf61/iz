@@ -161,6 +161,12 @@ func TestHighlight(t *testing.T) {
 	if string(highlight(in, nil)) != string(in) {
 		t.Error("no terms must leave output untouched")
 	}
+	// ANSI sequences must never be matched/corrupted when searching numbers like "31"
+	ansiIn := []byte("\x1b[31mport 31 open\x1b[0m\n")
+	ansiGot := string(highlight(ansiIn, []string{"31"}))
+	if !strings.HasPrefix(ansiGot, "\x1b[31m") || !strings.Contains(ansiGot, "port \x1b[7m31\x1b[27m open") {
+		t.Errorf("highlight corrupted ANSI escape or missed match: %q", ansiGot)
+	}
 }
 
 func TestCaseSensitivity(t *testing.T) {
@@ -291,22 +297,21 @@ func TestMergeDedup(t *testing.T) {
 }
 
 func TestRunLineSearchableFields(t *testing.T) {
-	r := Run{ID: 7, Ts: 1700000000, Hostname: "kali", Tool: "nmap",
-		Cmd: "nmap -sV", Cwd: "/home/user/eng", ExitCode: ni(0), Size: ni(4096),
+	r := Run{ID: 7, Ts: 1700000000, Hostname: "kali.local", Tool: "nmap",
+		Cmd: "nmap -sV", Cwd: "/home/user/eng", ExitCode: ni(1), Size: ni(4096),
 		Snippet: "80/tcp open"}
-	line := r.line()
+	line := r.line(10, "macbook")
 
-	// visible: id, date, tool, dir name, command
-	for _, want := range []string{"nmap", "eng", "nmap -sV"} {
+	// visible: id (red on non-zero exit), date, dir name, tool, command args, @host when remote
+	for _, want := range []string{"\x1b[31m7\x1b[0m", "nmap", "eng", "-sV", "@kali"} {
 		if !strings.Contains(line, want) {
 			t.Errorf("line missing %q: %q", want, line)
 		}
 	}
-	// host stays a filter token in the dim run; exit/size are preview-only
-	for _, want := range []string{"host:kali"} {
-		if !strings.Contains(line, want) {
-			t.Errorf("line missing filter token %q: %q", want, line)
-		}
+	// local host is omitted for compactness
+	localLine := r.line(10, "kali.local")
+	if strings.Contains(localLine, "@kali") {
+		t.Errorf("local host should be omitted: %q", localLine)
 	}
 	// the output snippet must not leak into the visible list line
 	if strings.Contains(line, "80/tcp open") {

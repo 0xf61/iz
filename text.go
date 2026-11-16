@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"compress/gzip"
 	"io"
+	"os"
 	"regexp"
+	"strings"
+	"unicode/utf8"
 )
 
 // Terminal output post-processing.
@@ -65,4 +68,45 @@ func ungz(b []byte) []byte {
 		return b
 	}
 	return out
+}
+
+// asciiLower folds A-Z only, so byte offsets stay valid for the original
+// (unicode.ToLower changes lengths, e.g. 'İ' is 2 bytes, 'i' is 1).
+func asciiLower(b []byte) []byte {
+	out := make([]byte, len(b))
+	for i, c := range b {
+		if 'A' <= c && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		out[i] = c
+	}
+	return out
+}
+
+// trunc cuts s to at most n runes (never inside a UTF-8 sequence).
+func trunc(s string, n int) string {
+	if utf8.RuneCountInString(s) <= n {
+		return s
+	}
+	return string([]rune(s)[:n-1]) + "…"
+}
+
+// truncLeft keeps the tail of s (for commands: the arguments matter most).
+func truncLeft(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return "…" + string(r[len(r)-n+1:])
+}
+
+// oneLine collapses all whitespace (newlines included) to single spaces.
+func oneLine(s string) string { return strings.Join(strings.Fields(s), " ") }
+
+// tildify shortens $HOME to ~.
+func tildify(p string) string {
+	if home, _ := os.UserHomeDir(); home != "" && (p == home || strings.HasPrefix(p, home+"/")) {
+		return "~" + p[len(home):]
+	}
+	return p
 }

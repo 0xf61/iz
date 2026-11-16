@@ -8,22 +8,35 @@ import (
 	"strings"
 )
 
-const usage = `iz — command history with recorded tool output
+const usage = `iz — command history, recorded output, and AI memory/recall
 
 Usage:
   iz [query]                 search TUI (fzf); query: free text + filters
-                                 host:machine  cmd:tool  size:>1mb  size:<500kb
+                                 host:machine  cmd:tool  dir:name  size:>1mb
   iz -- <cmd> [args...]      run command under a PTY, record its colored output
   iz sh <id> [id...] [query] print output(s) as-is; query terms get highlighted
   iz e <id>                  open output in $EDITOR
   iz a <tool>...             add tools to the auto-record list
   iz d <tool>...             remove tools from the auto-record list
   iz l                       list auto-record tools
-  iz i <tool> <file>         import a file (e.g. iz i nmap gm.xml; one arg: tool = file name)
-  iz m <iz.db>               merge another machine's database
+  iz i [tool] <file>         import a file (e.g. iz i nmap gm.xml)
+  iz m <iz.db>               merge another machine's database (runs + notes)
+  iz sync                    two-way sync with remote LibSQL/Turso (IZ_SYNC_URL)
   iz f                       print fish integration (iz f | source)
 
-TUI: enter=output · tab=insert command into prompt · ctrl-e=editor · ctrl-y=delete
+Memory & Recall:
+  iz recall <query>          search notes and runs (--json, --pretty, -n, -r)
+  iz n                       interactive notes TUI (fzf)
+  iz n <ns:title> [-t tags] [content]  save a note (or pipe via stdin)
+  iz n new | edit <id>       create or edit a note in $EDITOR
+  iz n show <id> | del <id>  view or delete a note
+  iz n list [namespace]      list saved notes (alias: iz nl)
+  iz n import <file|dir>     import markdown files/notes into memory
+
+AI Agents:
+  iz ai                      output agent guide for memory, recall, and tool calling
+
+TUI: enter=view · tab=select/insert · ctrl-e=editor · ctrl-y=delete · ctrl-o=notes
 DB path: $IZ (default ~/.iz/iz.db). Pause recording with: set -e IZ`
 
 func main() {
@@ -47,6 +60,16 @@ func main() {
 		os.Exit(toolsCmd("del", args))
 	case "list", "l":
 		os.Exit(toolsCmd("list", nil))
+	case "note", "n":
+		os.Exit(noteCmd(args))
+	case "recall", "rc":
+		os.Exit(recallCmd(args))
+	case "notes", "nl":
+		os.Exit(listNotes(strings.Join(args, " ")))
+	case "sync", "s":
+		os.Exit(syncCmd(args))
+	case "ai":
+		os.Exit(aiGuideCmd())
 	case "--rm": // internal: delete runs, called by the TUI (ctrl-y)
 		os.Exit(delRuns(args))
 	case "import", "i":

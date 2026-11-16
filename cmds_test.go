@@ -134,3 +134,22 @@ func TestSizeFilterComposition(t *testing.T) {
 		}
 	}
 }
+
+func TestResolveEditor(t *testing.T) {
+	t.Setenv("EDITOR", "my-custom-editor")
+	if ed := resolveEditor(); ed != "my-custom-editor" {
+		t.Errorf("resolveEditor() = %q, want 'my-custom-editor'", ed)
+	}
+
+	t.Setenv("EDITOR", "")
+	ed := resolveEditor()
+	if ed != "nvim" && ed != "vim" && ed != "vi" && ed != "nano" {
+		t.Errorf("resolveEditor() fallback = %q, want one of nvim/vim/vi/nano", ed)
+	}
+}
+
+func TestAIGuideCmd(t *testing.T) {
+	if code := aiGuideCmd(); code != 0 {
+		t.Errorf("aiGuideCmd() = %d, want 0", code)
+	}
+}

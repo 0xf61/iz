@@ -69,14 +69,23 @@ GOOS=linux GOARCH=amd64 go build -o dist/iz-linux-amd64 .
 ```fish
 iz -- cargo build --release       # run + record any command
 iz a cargo make pytest            # record these tools automatically via wrappers
-iz f | source                     # generate fish wrappers + ctrl-g search widget
-iz                                # search TUI
+iz f | source                     # generate fish wrappers + ctrl-g / ctrl-o widgets
+iz                                # search runs TUI
 iz sh 42                          # replay output #42, colors intact
 iz e 42                           # open output #42 in $EDITOR
 iz i cargo build.log              # import a log file
-iz m laptop.db                    # merge a db from another machine
-iz r                              # delete runs (fzf multi-select)
+iz m laptop.db                    # merge a db from another machine (runs + notes)
 iz d less                         # remove a wrapper
+
+# Memory, notes & cloud sync
+iz n                              # interactive notes TUI (ctrl-o in fish)
+iz n machines:kali -t vpn "10.42.13.37"        # save a structured note
+iz n edit 1                       # edit note #1 in $EDITOR
+iz n import ./notes/              # import markdown files/directory
+iz recall "kali"                  # hybrid search across notes + command runs
+iz recall --json "kali"           # compact JSON for AI agents
+iz sync                           # two-way sync with Turso/LibSQL ($IZ_SYNC_URL)
+iz ai                             # print AI agent integration guide
 ```
 
 Search examples:
@@ -95,8 +104,9 @@ iz 'deprecated'                   # exact phrase via FTS
 | `enter` | view output with `less -R` (colors kept, query highlighted) |
 | `tab` | toggle selection / insert command into the prompt (widget) |
 | `ctrl-a` | select all |
-| `ctrl-e` | open output in `$EDITOR` |
-| `ctrl-y` | delete selected runs and reload |
+| `ctrl-e` | open output / note in `$EDITOR` |
+| `ctrl-n` | create a new note in `$EDITOR` (`iz n` TUI) |
+| `ctrl-y` | delete selected runs / note and reload |
 | `'term` | fzf exact match (e.g. `'tool:make`) |
 
 ### Pausing recording
@@ -109,10 +119,17 @@ set -e IZ                 # stop recording in this session (wrappers pass throug
 set -gx IZ ~/.iz/iz.db    # resume
 ```
 
-## Multiple machines
+## Multiple machines & Cloud Sync
 
-Each host writes to its own database and stamps every run with its hostname.
-Copy one over and merge, then query by machine:
+Sync two-way across machines with Turso / LibSQL via `$IZ_SYNC_URL` and `$IZ_AUTH_TOKEN`:
+
+```fish
+set -gx IZ_SYNC_URL "libsql://your-db.turso.io"
+set -gx IZ_AUTH_TOKEN "ey..."
+iz sync
+```
+
+Or copy a database file directly and merge:
 
 ```fish
 scp build01:~/.iz/iz.db b01.db
@@ -131,9 +148,12 @@ make linux     # static linux/amd64 + linux/arm64 into dist/
 | file | role |
 |---|---|
 | `main.go` | CLI dispatch |
-| `db.go` | schema, CRUD, query parsing |
+| `db.go` | schema, migrations, CRUD, query parsing |
 | `record.go` | PTY capture, shell quoting |
-| `text.go` | ANSI cleanup, gzip |
-| `search.go` | fzf TUI |
+| `text.go` | ANSI cleanup, gzip, UTF-8 truncation |
+| `search.go` | fzf runs TUI |
 | `cmds.go` | add/del/list/rm/import/merge/show/edit |
+| `memory.go` | structured notes, FTS5 recall, notes TUI |
+| `sync.go` | two-way LibSQL/Turso & file replication |
 | `fish.go` | fish integration generator |
+| `ai.go` | AI agent reference guide |

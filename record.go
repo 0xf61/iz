@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -58,15 +59,13 @@ func runRecord(args []string) int {
 	}
 	defer ptmx.Close()
 
-	// Forward terminal resizes to the PTY.
+	// Forward terminal resizes to the PTY (event-driven, no polling).
+	winch := make(chan os.Signal, 1)
+	signal.Notify(winch, syscall.SIGWINCH)
+	defer signal.Stop(winch)
 	go func() {
-		for {
-			ws, err := pty.GetsizeFull(os.Stdin)
-			if err != nil {
-				return
-			}
-			pty.Setsize(ptmx, ws) //nolint
-			time.Sleep(200 * time.Millisecond)
+		for range winch {
+			pty.InheritSize(os.Stdin, ptmx) //nolint
 		}
 	}()
 	// stdin → PTY
@@ -78,6 +77,7 @@ func runRecord(args []string) int {
 	cmd.Wait()                                     //nolint
 
 	raw := tidyRaw(buf.Bytes())
+	z := gz(raw)
 	r := Run{
 		Ts:       float64(start.UnixNano()) / 1e9,
 		Hostname: hostname(),
@@ -85,7 +85,7 @@ func runRecord(args []string) int {
 		Cmd:      joinArgs(args),
 		Cwd:      cwd(),
 		Dur:      ni(int64(time.Since(start) / time.Millisecond)),
-		Size:     ni(int64(len(gz(raw)))),
+		Size:     ni(int64(len(z))),
 	}
 	if ws, ok := cmd.ProcessState.Sys().(syscall.WaitStatus); ok {
 		r.ExitCode = ni(int64(ws.ExitStatus()))
@@ -95,7 +95,7 @@ func runRecord(args []string) int {
 		exit = int(r.ExitCode.Int64)
 	}
 
-	id, dbErr := insertRun(db, r, gz(raw), stripANSI(raw))
+	id, dbErr := insertRun(db, r, z, stripANSI(raw))
 	if dbErr != nil {
 		fmt.Fprintf(os.Stderr, "[iz] RECORD FAILED: %v\n", dbErr)
 		return exit

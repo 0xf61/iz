@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -11,6 +12,15 @@ import (
 
 	_ "modernc.org/sqlite" // pure-Go SQLite driver (no cgo → static binaries)
 )
+
+// dbtx is what *sql.DB and *sql.Tx have in common.
+type dbtx interface {
+	ExecContext(ctx context.Context, q string, args ...any) (sql.Result, error)
+	QueryContext(ctx context.Context, q string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, q string, args ...any) *sql.Row
+}
+
+var bg = context.Background()
 
 // dbPath: $IZ wins (wrappers also gate on it), default ~/.iz/iz.db.
 func dbPath() string {
@@ -32,8 +42,22 @@ func openDBAt(p string) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	const schema = `
-CREATE TABLE IF NOT EXISTS runs(
+	if err := ensureSchema(bg, db, false); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+// Schema shared by local databases and the sync remote. One statement per
+// entry: remote drivers execute a single statement per call.
+//
+// Notes carry a uid (stable identity across machines, survives edits and
+// renames) and an mtime (last edit, for last-write-wins sync). Deleting a run
+// or note leaves a tombstone so sync/merge propagate the delete instead of
+// resurrecting the row from the other side.
+var schema = []string{
+	`CREATE TABLE IF NOT EXISTS runs(
   id          INTEGER PRIMARY KEY,
   ts          REAL NOT NULL,   -- start time (unix)
   hostname    TEXT NOT NULL,
@@ -44,13 +68,55 @@ CREATE TABLE IF NOT EXISTS runs(
   duration_ms INTEGER,
   size        INTEGER,         -- compressed size in bytes
   raw         BLOB             -- original output incl. ANSI, gzipped
-);
-CREATE TABLE IF NOT EXISTS tools(name TEXT PRIMARY KEY);     -- auto-record list
-CREATE VIRTUAL TABLE IF NOT EXISTS outputs_fts USING fts5(text, tokenize='unicode61');`
-	if _, err := db.Exec(schema); err != nil {
-		return nil, err
+)`,
+	`CREATE INDEX IF NOT EXISTS runs_ts ON runs(ts)`,
+	`CREATE TABLE IF NOT EXISTS tools(name TEXT PRIMARY KEY)`,
+	`CREATE VIRTUAL TABLE IF NOT EXISTS outputs_fts USING fts5(text, tokenize='unicode61')`,
+	`CREATE TABLE IF NOT EXISTS memories(
+  id          INTEGER PRIMARY KEY,
+  ts          REAL NOT NULL,   -- creation time, never changed
+  hostname    TEXT NOT NULL,
+  namespace   TEXT NOT NULL,
+  title       TEXT NOT NULL,
+  content     TEXT NOT NULL,
+  author      TEXT NOT NULL,
+  tags        TEXT NOT NULL DEFAULT '',
+  uid         TEXT,
+  mtime       REAL NOT NULL DEFAULT 0
+)`,
+	`CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+  title, content, namespace, tags, tokenize='unicode61'
+)`,
+	`CREATE TABLE IF NOT EXISTS tombstones(key TEXT PRIMARY KEY)`,
+	// pre-uid databases: these fail with "duplicate column" once applied
+	`ALTER TABLE memories ADD COLUMN uid TEXT`,
+	`ALTER TABLE memories ADD COLUMN mtime REAL NOT NULL DEFAULT 0`,
+	`CREATE INDEX IF NOT EXISTS memories_uid ON memories(uid)`,
+	`CREATE INDEX IF NOT EXISTS memories_ns ON memories(namespace, title)`,
+	backfillUID,
+}
+
+// backfillUID gives legacy notes a deterministic uid, so copies of the same
+// note on two machines (made by older syncs) still match each other.
+const backfillUID = `UPDATE memories SET uid = hostname||'|'||ts||'|'||namespace||'|'||title WHERE uid IS NULL`
+
+const schemaVersion = 2
+
+// ensureSchema creates/migrates the schema. Local databases skip the work
+// once PRAGMA user_version says they are current; force always runs it
+// (the remote may be shared with older clients).
+func ensureSchema(ctx context.Context, db dbtx, force bool) error {
+	var v int
+	if !force && db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&v) == nil && v >= schemaVersion {
+		return nil
 	}
-	return db, nil
+	for _, s := range schema {
+		if _, err := db.ExecContext(ctx, s); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			return err
+		}
+	}
+	db.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version=%d`, schemaVersion)) //nolint — optional on remotes
+	return nil
 }
 
 // Run is one recorded command execution.
@@ -64,28 +130,35 @@ type Run struct {
 	ExitCode sql.NullInt64
 	Dur      sql.NullInt64
 	Size     sql.NullInt64
-	Snippet  string // first ~2000 chars of output: hidden but searchable fzf field
+	Snippet  string // matching output line (recall only)
 }
 
 func ni(v int64) sql.NullInt64 { return sql.NullInt64{Int64: v, Valid: true} }
 
-// insertRun writes the run and its FTS row (rowid = run id) atomically. The
-// FTS text is hostname+tool+cmd+plain output, so a single MATCH searches everything.
+// runKey / memTomb identify rows across machines (tombstones, sync dedup).
+func runKey(host string, ts float64, tool, cmd string) string {
+	return "r\x00" + host + "\x00" + strconv.FormatFloat(ts, 'f', -1, 64) + "\x00" + tool + "\x00" + cmd
+}
+func memTomb(uid string) string { return "m\x00" + uid }
+
+// ftsPrefix is prepended to the indexed output so one MATCH searches
+// hostname, tool and command line as well.
+func ftsPrefix(r Run) string { return r.Hostname + " " + r.Tool + " " + r.Cmd + " " }
+
+// insertRun writes the run and its FTS row (rowid = run id) atomically.
 func insertRun(db *sql.DB, r Run, raw, text []byte) (int64, error) {
 	tx, err := db.Begin()
 	if err != nil {
 		return 0, err
 	}
+	defer tx.Rollback() //nolint
 	id, err := insertRunTx(tx, r, raw, text)
 	if err != nil {
-		tx.Rollback() //nolint
 		return 0, err
 	}
 	return id, tx.Commit()
 }
 
-// insertRunTx is the transactional core of insertRun; merges use it to batch
-// thousands of rows into one commit.
 func insertRunTx(tx *sql.Tx, r Run, raw, text []byte) (int64, error) {
 	res, err := tx.Exec(
 		`INSERT INTO runs(ts,hostname,tool,cmd,cwd,exit_code,duration_ms,size,raw)
@@ -98,15 +171,14 @@ func insertRunTx(tx *sql.Tx, r Run, raw, text []byte) (int64, error) {
 	if err != nil {
 		return id, err
 	}
-	fts := append([]byte(r.Hostname+" "+r.Tool+" "+r.Cmd+" "), text...)
 	// string() is critical: []byte binds as BLOB, and SQLite LIKE never matches BLOBs
 	// (FTS MATCH still would, silently hiding the bug).
-	_, err = tx.Exec(`INSERT INTO outputs_fts(rowid,text) VALUES(?,?)`, id, string(fts))
+	_, err = tx.Exec(`INSERT INTO outputs_fts(rowid,text) VALUES(?,?)`, id, ftsPrefix(r)+string(text))
 	return id, err
 }
 
-// deleteRuns removes runs and their FTS rows in one transaction; returns how
-// many were deleted.
+// deleteRuns removes runs and their FTS rows in one transaction, leaving
+// tombstones; returns how many were deleted.
 func deleteRuns(db *sql.DB, ids []int64) int {
 	tx, err := db.Begin()
 	if err != nil {
@@ -115,15 +187,36 @@ func deleteRuns(db *sql.DB, ids []int64) int {
 	defer tx.Rollback() //nolint
 	n := 0
 	for _, id := range ids {
-		tx.Exec(`DELETE FROM outputs_fts WHERE rowid=?`, id) //nolint
-		if res, err := tx.Exec(`DELETE FROM runs WHERE id=?`, id); err == nil {
-			if k, _ := res.RowsAffected(); k > 0 {
-				n++
-			}
+		var r Run
+		if tx.QueryRow(`SELECT hostname,ts,tool,cmd FROM runs WHERE id=?`, id).Scan(&r.Hostname, &r.Ts, &r.Tool, &r.Cmd) != nil {
+			continue
 		}
+		if tombstone(tx, runKey(r.Hostname, r.Ts, r.Tool, r.Cmd)) != nil || purge(bg, tx, "runs", "outputs_fts", []any{id}) != nil {
+			return 0
+		}
+		n++
 	}
-	tx.Commit() //nolint
+	if tx.Commit() != nil {
+		return 0
+	}
 	return n
+}
+
+func tombstone(ex dbtx, key string) error {
+	_, err := ex.ExecContext(bg, `INSERT OR IGNORE INTO tombstones(key) VALUES(?)`, key)
+	return err
+}
+
+// purge deletes rows by id from table and its FTS index (no tombstone).
+func purge(ctx context.Context, ex dbtx, table, fts string, ids []any) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	if _, err := ex.ExecContext(ctx, `DELETE FROM `+fts+` WHERE rowid IN `+inList(len(ids)), ids...); err != nil {
+		return err
+	}
+	_, err := ex.ExecContext(ctx, `DELETE FROM `+table+` WHERE id IN `+inList(len(ids)), ids...)
+	return err
 }
 
 // getMeta returns the gzipped output plus all metadata, for show/edit headers.
@@ -134,9 +227,51 @@ func getMeta(db *sql.DB, id int64) (raw []byte, r Run, err error) {
 	return raw, r, err
 }
 
+// Filter prefixes: runs understand runFilters, notes memFilters; host: is
+// shared. Anything else is a free search term.
+var (
+	runFilters = []string{"dir:", "cmd:", "tool:", "size:"}
+	memFilters = []string{"ns:", "namespace:", "author:", "tag:", "tags:"}
+)
+
+func hasPrefixAny(t string, ps []string) bool {
+	for _, p := range ps {
+		if strings.HasPrefix(t, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func isFilter(t string) bool {
+	return strings.HasPrefix(t, "host:") || hasPrefixAny(t, runFilters) || hasPrefixAny(t, memFilters)
+}
+
+// freeTerms drops filter tokens, leaving what should be highlighted.
+func freeTerms(fields []string) []string {
+	var out []string
+	for _, t := range fields {
+		if !isFilter(t) {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// ftsValid probes MATCH syntax: through a JOIN, invalid FTS syntax (e.g.
+// unquoted "signing:False") silently yields zero rows instead of erroring.
+func ftsValid(db *sql.DB, table, q string) bool {
+	err := db.QueryRow(`SELECT 1 FROM `+table+` WHERE `+table+` MATCH ? LIMIT 1`, q).Scan(new(int))
+	return err == nil || err == sql.ErrNoRows
+}
+
 // queryRuns parses "failed host:build01 tool:cargo": free terms go to FTS5 MATCH
-// (output text is indexed), host:/tool: become SQL filters.
-func queryRuns(db *sql.DB, query string) ([]Run, error) {
+// (output text is indexed), host:/dir:/tool:/size: become SQL filters.
+func queryRuns(db *sql.DB, query string) ([]Run, error) { return searchRuns(db, query, 1000, false) }
+
+// searchRuns is queryRuns with a limit; withText also loads the indexed text
+// and keeps the first matching line in Snippet (recall).
+func searchRuns(db *sql.DB, query string, limit int, withText bool) ([]Run, error) {
 	var conds string
 	var args []any
 	var terms []string
@@ -163,10 +298,13 @@ func queryRuns(db *sql.DB, query string) ([]Run, error) {
 	}
 	q := strings.Join(terms, " ")
 
-	const selectSQL = `SELECT r.id,r.ts,r.hostname,r.tool,r.cmd,r.cwd,r.exit_code,r.duration_ms,r.size,
-	                   substr(f.text,1,2000)
-	                   FROM runs r JOIN outputs_fts f ON f.rowid = r.id`
-	const tail = " ORDER BY r.ts DESC LIMIT 1000"
+	text := "''"
+	if withText {
+		text = "f.text"
+	}
+	selectSQL := `SELECT r.id,r.ts,r.hostname,r.tool,r.cmd,r.cwd,r.exit_code,r.duration_ms,r.size,` + text + `
+	              FROM runs r JOIN outputs_fts f ON f.rowid = r.id`
+	tail := fmt.Sprintf(" ORDER BY r.ts DESC LIMIT %d", limit)
 
 	// Case rule: all-lowercase terms match case-insensitively via FTS; terms
 	// with any uppercase must occur verbatim (instr compares BINARY).
@@ -176,17 +314,44 @@ func queryRuns(db *sql.DB, query string) ([]Run, error) {
 			args = append(args, t)
 		}
 	}
-	if q == "" {
-		return scanRuns(db, selectSQL+" WHERE 1=1"+conds+tail, args)
+	var runs []Run
+	var err error
+	switch {
+	case q == "":
+		runs, err = scanRuns(db, selectSQL+" WHERE 1=1"+conds+tail, args)
+	case ftsValid(db, "outputs_fts", q):
+		runs, err = scanRuns(db, selectSQL+" WHERE outputs_fts MATCH ?"+conds+tail, append([]any{q}, args...))
+	default:
+		runs, err = scanRuns(db, selectSQL+" WHERE f.text LIKE ?"+conds+tail, append([]any{"%" + q + "%"}, args...))
 	}
-	// Probe MATCH validity first: through the JOIN, invalid FTS syntax
-	// (e.g. unquoted "signing:False") silently yields zero rows instead of erroring.
-	base := selectSQL + " WHERE outputs_fts MATCH ? AND 1=1" + conds + tail
-	if err := db.QueryRow(`SELECT 1 FROM outputs_fts WHERE outputs_fts MATCH ? LIMIT 1`, q).Scan(new(int)); err == nil || err == sql.ErrNoRows {
-		return scanRuns(db, base, append([]any{q}, args...))
+	if withText {
+		for i := range runs {
+			runs[i].Snippet = matchLine(strings.TrimPrefix(runs[i].Snippet, ftsPrefix(runs[i])), terms)
+		}
 	}
-	base = selectSQL + " WHERE f.text LIKE ? AND 1=1" + conds + tail
-	return scanRuns(db, base, append([]any{"%" + q + "%"}, args...))
+	return runs, err
+}
+
+// matchLine returns the first line containing a term (ASCII case-insensitive),
+// or the first non-empty line when nothing matches.
+func matchLine(text string, terms []string) string {
+	first := ""
+	for _, l := range strings.Split(text, "\n") {
+		l = strings.TrimSpace(l)
+		if l == "" {
+			continue
+		}
+		if first == "" {
+			first = l
+		}
+		ll := string(asciiLower([]byte(l)))
+		for _, t := range terms {
+			if len(t) >= 2 && strings.Contains(ll, string(asciiLower([]byte(t)))) {
+				return l
+			}
+		}
+	}
+	return first
 }
 
 // parseSize accepts ">1mb", "<500kb", ">=2gb", ">1024" and returns the SQL
@@ -247,3 +412,19 @@ func hostname() string {
 }
 
 func fmtTs(ts float64) string { return time.Unix(int64(ts), 0).Format("2006-01-02 15:04") }
+
+// fmtTsShort: "15:04" today, "01-02 15:04" this year, "2006-01-02" before.
+func fmtTsShort(ts float64) string {
+	t, now := time.Unix(int64(ts), 0), time.Now()
+	switch {
+	case t.Year() != now.Year():
+		return t.Format("2006-01-02")
+	case t.YearDay() == now.YearDay():
+		return t.Format("15:04")
+	}
+	return t.Format("01-02 15:04")
+}
+
+// inList renders "(?,?,?)"; ph renders n value tuples of k placeholders.
+func inList(n int) string { return "(" + strings.TrimSuffix(strings.Repeat("?,", n), ",") + ")" }
+func ph(n, k int) string     { return strings.TrimSuffix(strings.Repeat(inList(k)+",", n), ",") }

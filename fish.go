@@ -36,6 +36,19 @@ function __iz_widget --description 'iz: search commands + output'
 end
 bind -M default $__iz_key __iz_widget
 bind -M insert  $__iz_key __iz_widget
+
+set -l __iz_notes_key \co
+if set -q IZ_NOTES_KEY
+    set __iz_notes_key $IZ_NOTES_KEY
+end
+
+function __iz_notes_widget --description 'iz: interactive notes & pentest memory'
+    command iz n
+    commandline -f repaint
+end
+bind -M default $__iz_notes_key __iz_notes_widget
+bind -M insert  $__iz_notes_key __iz_notes_widget
+
 `)
 
 	rows, err := db.Query(`SELECT name FROM tools ORDER BY name`)

@@ -61,11 +61,7 @@ func toolsCmd(sub string, args []string) int {
 func delRuns(args []string) int {
 	var ids []int64
 	for _, a := range args {
-		f := strings.Fields(a)
-		if len(f) == 0 {
-			continue
-		}
-		if id, err := strconv.ParseInt(f[0], 10, 64); err == nil {
+		if id, ok := leadID(a); ok {
 			ids = append(ids, id)
 		}
 	}
@@ -110,29 +106,31 @@ func importCmd(args []string) int {
 	defer db.Close()
 
 	raw := tidyRaw(data)
+	z := gz(raw)
 	abs, err := filepath.Abs(file)
 	if err != nil {
 		abs = file
 	}
 	r := Run{
-		Ts:       float64(time.Now().Unix()),
+		Ts:       float64(time.Now().UnixNano()) / 1e9,
 		Hostname: hostname(),
 		Tool:     tool,
 		Cmd:      "import " + file,
 		Cwd:      filepath.Dir(abs), // dir of the imported file, not the caller's cwd
-		Size:     ni(int64(len(gz(raw)))),
+		Size:     ni(int64(len(z))),
 	}
-	id, err := insertRun(db, r, gz(raw), stripANSI(raw))
+	id, err := insertRun(db, r, z, stripANSI(raw))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "iz:", err)
 		return 1
 	}
 	db.Exec(`INSERT OR IGNORE INTO tools(name) VALUES(?)`, tool) //nolint
-	fmt.Fprintf(os.Stderr, "[iz] #%d imported · tool=%s · %s\n", id, tool, humanBytes(int64(r.Size.Int64)))
+	fmt.Fprintf(os.Stderr, "[iz] #%d imported · tool=%s · %s\n", id, tool, humanBytes(r.Size.Int64))
 	return 0
 }
 
-// mergeCmd merges another machine's database, deduping on (hostname, ts, cmd).
+// mergeCmd merges another machine's database (runs, notes and deletions),
+// deduping runs on (hostname, ts, tool, cmd) and notes on their uid.
 func mergeCmd(path string) int {
 	if _, err := os.Stat(path); err != nil {
 		fmt.Fprintln(os.Stderr, "iz:", err)
@@ -151,67 +149,20 @@ func mergeCmd(path string) int {
 	}
 	defer other.Close()
 
-	// Dedup key: the same run from the same machine has identical (hostname,
-	// tool, ts, cmd). Loading existing keys once makes this O(n+m) instead of
-	// one index-less scan per incoming row.
-	type key struct {
-		host string
-		tool string
-		ts   float64
-		cmd  string
-	}
-	seen := map[key]bool{}
-	if kr, err := db.Query(`SELECT ts,hostname,tool,cmd FROM runs`); err == nil {
-		for kr.Next() {
-			var k key
-			kr.Scan(&k.ts, &k.host, &k.tool, &k.cmd) //nolint
-			seen[k] = true
-		}
-		kr.Close()
-	}
-
-	rows, err := other.Query(`SELECT ts,hostname,tool,cmd,cwd,exit_code,duration_ms,size,raw FROM runs`)
+	st, err := replicate(bg, other, db)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "iz:", err)
+		fmt.Fprintln(os.Stderr, "iz: merge:", err)
 		return 1
 	}
-	defer rows.Close()
-
-	// One transaction for the whole merge: a single WAL commit instead of one
-	// fsync pair per row.
-	tx, err := db.Begin()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "iz:", err)
-		return 1
-	}
-	defer tx.Rollback() //nolint
-
-	added, skipped := 0, 0
-	for rows.Next() {
-		var r Run
-		var raw []byte
-		if err := rows.Scan(&r.Ts, &r.Hostname, &r.Tool, &r.Cmd, &r.Cwd,
-			&r.ExitCode, &r.Dur, &r.Size, &raw); err != nil {
-			continue
-		}
-		if seen[key{r.Hostname, r.Tool, r.Ts, r.Cmd}] {
-			skipped++
-			continue
-		}
-		if _, err := insertRunTx(tx, r, raw, stripANSI(ungz(raw))); err == nil {
-			seen[key{r.Hostname, r.Tool, r.Ts, r.Cmd}] = true
-			added++
-		}
-	}
-	tx.Commit() //nolint
-	fmt.Fprintf(os.Stderr, "[iz] %d merged, %d duplicates skipped\n", added, skipped)
+	fmt.Fprintf(os.Stderr, "[iz] %d merged, %d duplicates skipped · notes: %d · deletes: %d\n",
+		st.runs, st.skipped, st.notes, st.dels)
 	return 0
 }
 
 // showCmd prints recorded output as-is. It accepts several ids (fzf {+} passes
 // whole lines, so the leading token of each arg is used) and an optional search
 // query whose terms get highlighted in reverse video — this is what the fzf
-// preview ({q}) uses.
+// preview ({q}) uses. Filter tokens (host:, size:...) are not highlighted.
 func showCmd(args []string) int {
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, "usage: iz sh <id> [id...] [query]")
@@ -219,15 +170,15 @@ func showCmd(args []string) int {
 	}
 	var ids []int64
 	var terms []string
-	for _, a := range args {
-		f := strings.Fields(a)
-		if len(f) == 0 {
-			continue
+	for i, a := range args {
+		if a == "--" { // everything after is query (a numeric query is not an id)
+			terms = append(terms, freeTerms(strings.Fields(strings.Join(args[i+1:], " ")))...)
+			break
 		}
-		if id, err := strconv.ParseInt(f[0], 10, 64); err == nil {
+		if id, ok := leadID(a); ok {
 			ids = append(ids, id)
 		} else {
-			terms = append(terms, f...)
+			terms = append(terms, freeTerms(strings.Fields(a))...)
 		}
 	}
 	if len(ids) == 0 {
@@ -250,42 +201,57 @@ func showCmd(args []string) int {
 		if n > 0 {
 			fmt.Fprintln(os.Stderr)
 		}
-		dur, size := "", ""
+		meta := []string{"exit=?"}
+		if r.ExitCode.Valid {
+			meta[0] = fmt.Sprint("exit=", r.ExitCode.Int64)
+			if r.ExitCode.Int64 != 0 {
+				meta[0] = "\x1b[31m" + meta[0] + "\x1b[0m"
+			}
+		}
 		if r.Dur.Valid {
-			dur = fmt.Sprintf("%.1fs", float64(r.Dur.Int64)/1000)
+			meta = append(meta, fmt.Sprintf("%.1fs", float64(r.Dur.Int64)/1000))
 		}
 		if r.Size.Valid {
-			size = humanBytes(int64(r.Size.Int64))
+			meta = append(meta, humanBytes(r.Size.Int64))
 		}
-		exit := "?"
-		if r.ExitCode.Valid {
-			exit = fmt.Sprint(r.ExitCode.Int64)
+		meta = append(meta, "\x1b[36m"+tildify(r.Cwd)+"\x1b[0m")
+		out := ungz(raw)
+		if k := firstMatchLine(out, terms); k > 0 {
+			// start at the first matching line — the preview lands on the
+			// match instead of requiring manual scrolling
+			out = bytes.SplitN(out, []byte{'\n'}, k+1)[k]
+			meta = append(meta, fmt.Sprintf("\x1b[33m@L%d\x1b[0m", k+1))
 		}
 		// host carries the header (id is already visible in the list)
-		fmt.Fprintf(os.Stderr, "\x1b[2m[%s #%d]\x1b[0m \x1b[1m%s\x1b[0m · exit=%s · %s · %s · \x1b[36m%s\x1b[0m\n$ \x1b[1m%s\x1b[0m\n",
-			r.Hostname, r.ID, r.Tool, exit, dur, size, r.Cwd, r.Cmd)
-		out := ungz(raw)
-		if n := firstMatchLine(out, terms); n > 0 {
-			// skip to the first matching line — the preview lands on the
-			// match instead of requiring manual scrolling
-			lines := bytes.SplitN(out, []byte{'\n'}, n+1)
-			out = lines[n]
-			fmt.Fprintln(os.Stderr, "\x1b[2m··· (jumped to first match) ···\x1b[0m")
-		}
-		os.Stdout.Write(highlight(out, terms))
+		fmt.Fprintf(os.Stderr, "\x1b[2m[%s #%d]\x1b[0m %s\n$ \x1b[1m%s\x1b[0m\n",
+			r.Hostname, r.ID, strings.Join(meta, " · "), r.Cmd)
+		os.Stdout.Write(highlight(out, terms)) //nolint
 	}
 	return 0
 }
 
-// highlight wraps case-insensitive matches of every term (≥2 chars) in
-// reverse video, leaving the rest of the output untouched.
-// firstMatchLine returns the index of the first line containing any term,
-// or -1 when none matches (case-insensitively, like highlight).
+// needles returns the lowercased terms worth matching (≥2 bytes).
+func needles(terms []string) [][]byte {
+	var out [][]byte
+	for _, t := range terms {
+		if len(t) >= 2 {
+			out = append(out, asciiLower([]byte(t)))
+		}
+	}
+	return out
+}
+
+// firstMatchLine returns the index of the first line whose visible text
+// contains any term, or -1 when none matches (case-insensitively, like highlight).
 func firstMatchLine(b []byte, terms []string) int {
+	ns := needles(terms)
+	if len(ns) == 0 {
+		return -1
+	}
 	for i, line := range bytes.Split(b, []byte{'\n'}) {
-		l := strings.ToLower(string(line))
-		for _, t := range terms {
-			if len(t) >= 2 && strings.Contains(l, strings.ToLower(t)) {
+		l := asciiLower(stripANSI(line))
+		for _, n := range ns {
+			if bytes.Contains(l, n) {
 				return i
 			}
 		}
@@ -293,32 +259,71 @@ func firstMatchLine(b []byte, terms []string) int {
 	return -1
 }
 
+// highlight wraps case-insensitive matches of every term (≥2 chars) in
+// reverse video. Escape sequences are copied verbatim and never matched, so
+// a query like "31" cannot break a color code.
 func highlight(b []byte, terms []string) []byte {
-	for _, t := range terms {
-		if len(t) < 2 {
-			continue
-		}
-		needle := strings.ToLower(t)
-		hay := strings.ToLower(string(b))
-		var res []byte
-		for i := 0; i < len(hay); {
-			j := strings.Index(hay[i:], needle)
-			if j < 0 {
-				res = append(res, b[i:]...)
-				break
-			}
-			res = append(res, b[i:i+j]...)
-			res = append(res, "\x1b[7m"...)
-			res = append(res, b[i+j:i+j+len(t)]...)
-			res = append(res, "\x1b[27m"...)
-			i += j + len(t)
-		}
-		b = res
+	ns := needles(terms)
+	if len(ns) == 0 {
+		return b
 	}
-	return b
+	var out []byte
+	last := 0
+	for _, loc := range append(reANSI.FindAllIndex(b, -1), []int{len(b), len(b)}) {
+		out = append(out, hlText(b[last:loc[0]], ns)...)
+		out = append(out, b[loc[0]:loc[1]]...)
+		last = loc[1]
+	}
+	return out
 }
 
-// editCmd opens the raw ANSI output in $EDITOR (default: vim).
+// hlText highlights plain (escape-free) text; asciiLower keeps offsets aligned.
+func hlText(s []byte, ns [][]byte) []byte {
+	low := asciiLower(s)
+	var out []byte
+	for i := 0; i < len(s); {
+		at, w := -1, 0
+		for _, n := range ns { // earliest (then longest) match wins
+			if j := bytes.Index(low[i:], n); j >= 0 && (at < 0 || j < at || j == at && len(n) > w) {
+				at, w = j, len(n)
+			}
+		}
+		if at < 0 {
+			return append(out, s[i:]...)
+		}
+		out = append(out, s[i:i+at]...)
+		out = append(out, "\x1b[7m"...)
+		out = append(out, s[i+at:i+at+w]...)
+		out = append(out, "\x1b[27m"...)
+		i += at + w
+	}
+	return out
+}
+
+// resolveEditor returns $EDITOR if set and non-empty. Otherwise, it checks
+// nvim, vim, vi, nano in order on $PATH and returns the first one found.
+func resolveEditor() string {
+	if ed := os.Getenv("EDITOR"); ed != "" {
+		return ed
+	}
+	for _, candidate := range []string{"nvim", "vim", "vi", "nano"} {
+		if path, err := exec.LookPath(candidate); err == nil && path != "" {
+			return candidate
+		}
+	}
+	return "nano"
+}
+
+// runEditor opens path in the editor; $EDITOR may carry arguments
+// (e.g. "code --wait").
+func runEditor(path string) error {
+	f := strings.Fields(resolveEditor())
+	c := exec.Command(f[0], append(f[1:], path)...)
+	c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
+	return c.Run()
+}
+
+// editCmd opens the raw ANSI output in $EDITOR (fallback: nvim -> vim -> vi -> nano).
 func editCmd(idArg string) int {
 	id, err := strconv.ParseInt(idArg, 10, 64)
 	if err != nil {
@@ -345,14 +350,8 @@ func editCmd(idArg string) int {
 	f.Write(ungz(raw)) //nolint
 	f.Close()
 
-	editor := os.Getenv("EDITOR")
-	if editor == "" {
-		editor = "vim"
-	}
 	fmt.Fprintf(os.Stderr, "[iz] %s\n", r.Cmd)
-	c := exec.Command(editor, f.Name())
-	c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
-	c.Run() //nolint
+	runEditor(f.Name()) //nolint
 	return 0
 }
 

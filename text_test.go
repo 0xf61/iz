@@ -62,3 +62,15 @@ func TestUngzPassthrough(t *testing.T) {
 		t.Errorf("ungz should pass through non-gzip input, got %q", out)
 	}
 }
+
+func TestTruncUTF8Safe(t *testing.T) {
+	tr := "Şifreli bağlantı çözüldü ğüşıöçİ"
+	got := trunc(tr, 10)
+	if got != "Şifreli b…" {
+		t.Errorf("trunc(%q, 10) = %q, want %q", tr, got, "Şifreli b…")
+	}
+	left := truncLeft("nmap -sV --script=vuln 10.0.0.1", 10)
+	if left != "… 10.0.0.1" {
+		t.Errorf("truncLeft = %q, want %q", left, "… 10.0.0.1")
+	}
+}

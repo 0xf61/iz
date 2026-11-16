@@ -10,23 +10,40 @@ import (
 	"strings"
 )
 
-// Run.line is the fzf list entry: id, date, tool, dir name, command, with the
-// hostname in a dim run so host: filtering still works. Everything else
-// (output text, size, exit code) lives in the FTS index or the preview.
-func (r Run) line() string {
-	cmd := r.Cmd
-	if len(cmd) > 120 {
-		cmd = "…" + cmd[len(cmd)-119:]
+// line is the fzf list entry: id (red when the run failed), date, dir,
+// command (tool part colored), plus @host for runs from other machines.
+// Filtering is done by FTS via "iz lines {q}" (fzf runs with --phony), so the
+// line only carries what helps the eye; exit/size live in the preview.
+// dw pads the date column (dates are short for recent runs).
+func (r Run) line(dw int, localHost string) string {
+	id := strconv.FormatInt(r.ID, 10)
+	if r.ExitCode.Valid && r.ExitCode.Int64 != 0 {
+		id = "\x1b[31m" + id + "\x1b[0m"
 	}
 	dir := filepath.Base(r.Cwd)
 	if dir == "" || dir == "." {
 		dir = "/"
 	}
-	// Visible: id, date, tool, dir, command. host stays filterable in a dim
-	// run; size/exit live only in the preview. Filtering is done by FTS via
-	// "iz lines {q}" (fzf runs with --phony, so it does not re-filter).
-	return fmt.Sprintf("%d \x1b[90m%s\x1b[0m \x1b[36m%s\x1b[0m \x1b[34m%s\x1b[0m \x1b[2mhost:%s\x1b[0m %s",
-		r.ID, fmtTs(r.Ts), r.Tool, dir, r.Hostname, cmd)
+	rest := " " + r.Cmd
+	if r.Cmd == r.Tool || strings.HasPrefix(r.Cmd, r.Tool+" ") {
+		rest = r.Cmd[len(r.Tool):] // tool is printed (colored) in front already
+	}
+	host := ""
+	if r.Hostname != localHost {
+		host = " \x1b[2m@" + strings.TrimSuffix(r.Hostname, ".local") + "\x1b[0m"
+	}
+	return fmt.Sprintf("%s \x1b[90m%-*s\x1b[0m \x1b[34m%s\x1b[0m \x1b[36m%s\x1b[0m%s%s",
+		id, dw, fmtTsShort(r.Ts), dir, r.Tool, truncLeft(rest, 120), host)
+}
+
+// leadID parses the leading id of an fzf line (ANSI-safe).
+func leadID(s string) (int64, bool) {
+	f := strings.Fields(string(stripANSI([]byte(s))))
+	if len(f) == 0 {
+		return 0, false
+	}
+	id, err := strconv.ParseInt(f[0], 10, 64)
+	return id, err == nil
 }
 
 // tuiSearch is the fzf interface.
@@ -56,11 +73,12 @@ func tuiSearch(query string, pick bool) int {
 		// disable fzf's in-list match highlighting: matches are highlighted
 		// in the preview instead (see showCmd/highlight)
 		"--color", "hl:-1,hl+:-1",
-		"--header", "enter:output · tab:select · ctrl-a:all · ctrl-e:editor · ctrl-y:delete",
+		"--info", "inline", // counter on the prompt line: one more row for results
+		"--header", "⏎ view · ⇥ select · ^A all · ^E edit · ^Y del",
 		"--bind", "ctrl-a:select-all",
 		"--bind", "start:reload(" + src + ")",
 		"--bind", "change:reload(" + src + ")",
-		"--preview", iz + " show {1} {q}",
+		"--preview", iz + " show {1} -- {q}",
 		"--preview-window", "right:55%:wrap",
 		"--bind", "enter:execute(" + iz + " show {+} | less -R)",
 		"--bind", "ctrl-e:execute(" + iz + " edit {1})",
@@ -79,26 +97,28 @@ func tuiSearch(query string, pick bool) int {
 	c.Stderr = os.Stderr
 	c.Stdin = strings.NewReader("") // the list comes from the reload source
 	out, _ := c.StdoutPipe()
-	c.Start()
-
+	if err := c.Start(); err != nil {
+		fmt.Fprintln(os.Stderr, "iz: fzf:", err)
+		return 2
+	}
 	sel, _ := io.ReadAll(out) // fzf exits after accept, so this terminates
-	c.Wait()
-	fields := strings.Fields(string(sel))
+	c.Wait()                  //nolint
 
 	// print the selected command (for the fish widget)
-	for _, f := range fields {
-		if id, err := strconv.ParseInt(f, 10, 64); err == nil {
-			if db, err := openDB(); err == nil {
-				if _, r, err := getMeta(db, id); err == nil {
-					fmt.Println(r.Cmd)
-					db.Close()
-					return 0
-				}
-				db.Close()
-			}
-		}
+	id, ok := leadID(string(sel))
+	if !ok {
+		return 130 // cancelled or nothing selected
 	}
-	return 130 // cancelled or nothing selected
+	db, err := openDB()
+	if err != nil {
+		return 2
+	}
+	defer db.Close()
+	if _, r, err := getMeta(db, id); err == nil {
+		fmt.Println(r.Cmd)
+		return 0
+	}
+	return 130
 }
 
 // linesCmd is the live reload source for the TUI: it runs the FTS query that
@@ -113,8 +133,16 @@ func linesCmd(args []string) int {
 	if err != nil {
 		return 1
 	}
+	dw := 0
 	for _, r := range runs {
-		fmt.Println(r.line())
+		dw = max(dw, len(fmtTsShort(r.Ts)))
 	}
+	host := hostname()
+	var b strings.Builder
+	for _, r := range runs {
+		b.WriteString(r.line(dw, host))
+		b.WriteByte('\n')
+	}
+	os.Stdout.WriteString(b.String()) //nolint
 	return 0
 }
