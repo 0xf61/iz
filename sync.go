@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -23,11 +24,19 @@ import (
 // Only keys are read up front; output blobs are fetched for missing rows
 // only, and rows are written in multi-row chunks (few round trips per chunk).
 
-// getSyncConfig reads connection parameters strictly from environment variables.
-// Perfect for systems where environment variables are synced via atuin or shell profiles.
+// getSyncConfig reads connection parameters from environment variables,
+// falling back to Atuin KV store if unset (e.g. across machines with atuin sync).
 func getSyncConfig() (remoteURL, authToken string) {
 	remoteURL = firstEnv("IZ_SYNC_URL", "IZ_URL", "TURSO_DATABASE_URL")
 	authToken = firstEnv("IZ_AUTH_TOKEN", "IZ_TOKEN", "TURSO_AUTH_TOKEN")
+
+	if remoteURL == "" {
+		remoteURL = atuinKVGet("IZ_SYNC_URL")
+	}
+	if authToken == "" {
+		authToken = atuinKVGet("IZ_AUTH_TOKEN")
+	}
+
 	return strings.TrimSpace(remoteURL), strings.TrimSpace(authToken)
 }
 
@@ -38,6 +47,15 @@ func firstEnv(keys ...string) string {
 		}
 	}
 	return ""
+}
+
+// atuinKVGet retrieves a key from atuin's key-value store if atuin is installed.
+func atuinKVGet(key string) string {
+	out, err := exec.Command("atuin", "kv", "get", key).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 func buildLibsqlURL(rawURL, token string) string {
