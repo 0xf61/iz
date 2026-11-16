@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -98,5 +99,78 @@ func TestNoteDocAndCLISubcommands(t *testing.T) {
 	ns, title, tags, body, ok := parseNoteDoc("# machines:kali [kali,vpn]\n" + noteHint + "\n10.42.13.37\n")
 	if !ok || ns != "machines" || title != "kali" || tags != "kali,vpn" || !strings.Contains(body, "10.42.13.37") {
 		t.Errorf("parseNoteDoc = %q %q %q %q (%v)", ns, title, tags, body, ok)
+	}
+}
+
+func TestNoteUpsertAppendAndTargets(t *testing.T) {
+	path := testDB(t)
+	t.Setenv("IZ", path)
+
+	// Upsert by namespace:title must update in place without creating duplicates
+	if code := noteCmd([]string{"machines:kali", "-t", "vpn", "10.42.13.37"}); code != 0 {
+		t.Fatalf("initial noteCmd exit=%d", code)
+	}
+	if code := noteCmd([]string{"-t", "vpn,ssh", "machines:kali", "10.10.138.15"}); code != 0 {
+		t.Fatalf("upsert noteCmd exit=%d", code)
+	}
+	if code := noteCmd([]string{"-a", "machines:kali", "port 2222"}); code != 0 {
+		t.Fatalf("append noteCmd exit=%d", code)
+	}
+
+	db, _ := openDBAt(path)
+	defer db.Close()
+	res, err := queryMemories(db, "ns:machines", 10)
+	if err != nil || len(res) != 1 {
+		t.Fatalf("expected 1 deduplicated note, got %d (%v)", len(res), err)
+	}
+	if !strings.Contains(res[0].Content, "10.10.138.15") || !strings.Contains(res[0].Content, "port 2222") {
+		t.Errorf("unexpected content after upsert+append: %q", res[0].Content)
+	}
+
+	// tag:pi must not match tag "vpn,api"
+	if code := noteCmd([]string{"machines:router", "-t", "vpn,api", "router note"}); code != 0 {
+		t.Fatalf("router note exit=%d", code)
+	}
+	if piRes, _ := queryMemories(db, "tag:pi", 10); len(piRes) != 0 {
+		t.Errorf("tag:pi matched unrelated tag: %+v", piRes)
+	}
+	if apiRes, _ := queryMemories(db, "tag:api", 10); len(apiRes) != 1 {
+		t.Errorf("tag:api expected 1 match, got %d", len(apiRes))
+	}
+
+	// show and del by namespace:title
+	if code := noteCmd([]string{"show", "machines:kali"}); code != 0 {
+		t.Errorf("show by ns:title exit=%d", code)
+	}
+	if code := noteCmd([]string{"del", "machines:kali"}); code != 0 {
+		t.Errorf("del by ns:title exit=%d", code)
+	}
+	if after, _ := queryMemories(db, "ns:machines", 10); len(after) != 1 {
+		t.Errorf("expected 1 note left after delete, got %d", len(after))
+	}
+}
+
+func TestImportMarkdownCodeBlocksAndInlineSection(t *testing.T) {
+	dir := t.TempDir()
+	md := "# Setup\nSee (bkz. §LINT). Inline §Finans should not split.\n\n```bash\n# comment inside code block\necho hi\n```\n\n## Second Section\nBody 2\n"
+	file := filepath.Join(dir, "guide.md")
+	if err := os.WriteFile(file, []byte(md), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	path := testDB(t)
+	t.Setenv("IZ", path)
+	if code := importNotes(file); code != 0 {
+		t.Fatalf("importNotes exit=%d", code)
+	}
+
+	db, _ := openDBAt(path)
+	defer db.Close()
+	res, err := queryMemories(db, "ns:guide", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) != 2 {
+		t.Fatalf("expected 2 sections (Setup + Second Section), got %d: %+v", len(res), res)
 	}
 }

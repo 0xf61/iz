@@ -178,13 +178,20 @@ const aiPromptSnippet = `<!-- iz-memory:begin -->
 # iz — Terminal Execution & Memory Ledger
 
 iz is available on the PATH.
+- Discover what is stored in memory first:
+    iz prime                        # compact namespace/title index (--json available)
 - Recall past findings, credentials, and command runs before assuming context is missing:
-    iz recall "<query>"             # compact text output
+    iz recall "<query>"             # compact text output (--full for complete notes, -l N for limit)
     iz recall --json "<query>"      # structured JSON (token-efficient)
-- Store important discovery notes, credentials, user preferences:
+- Read a full note or command output by ID or namespace:title:
+    iz n show <id|ns:title>         # full note content
+    iz sh <run_id>                  # full recorded command output
+- Store or update notes (upserts by namespace:title — never creates duplicates):
     iz n <namespace:title> [-t tags] "<content>"
-- When running commands whose terminal output should be persistently indexed for later recall:
+    iz n -a <namespace:title> "<extra>"   # append to existing note
+- Record important command outputs persistently:
     iz -- <command> [args...]
+- Non-interactive rule: NEVER run bare 'iz', 'iz n', 'iz n edit', 'iz n new', or 'iz e' (they open fzf/$EDITOR).
 <!-- iz-memory:end -->
 `
 

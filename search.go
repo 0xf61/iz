@@ -55,6 +55,10 @@ func leadID(s string) (int64, bool) {
 //
 // In --pick mode (fish widget) tab accepts and prints the command to stdout.
 func tuiSearch(query string, pick bool) int {
+	if !isTTY() {
+		fmt.Fprintln(os.Stderr, "iz: interactive TUI requires a terminal (use 'iz recall <query>' instead)")
+		return 2
+	}
 	iz, _ := os.Executable()
 	if iz == "" {
 		iz = "iz"
@@ -104,7 +108,10 @@ func tuiSearch(query string, pick bool) int {
 	sel, _ := io.ReadAll(out) // fzf exits after accept, so this terminates
 	c.Wait()                  //nolint
 
-	// print the selected command (for the fish widget)
+	// print the selected command (for the fish/zsh/bash widget)
+	if !pick {
+		return 0
+	}
 	id, ok := leadID(string(sel))
 	if !ok {
 		return 130 // cancelled or nothing selected

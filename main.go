@@ -25,11 +25,12 @@ Usage:
   iz init [fish|zsh|bash]    setup or print shell & AI assistant integration (iz init --help)
 
 Memory & Recall:
-  iz recall <query>          search notes and runs (--json, --pretty, -n, -r)
+  iz recall <query>          search notes and runs (--json, --pretty, -n, -r, -l N, --full)
+  iz prime [--json]          compact index of all memory namespaces & titles
   iz n                       interactive notes TUI (fzf)
-  iz n <ns:title> [-t tags] [content]  save a note (or pipe via stdin)
-  iz n new | edit <id>       create or edit a note in $EDITOR
-  iz n show <id> | del <id>  view or delete a note
+  iz n <ns:title> [-t tags] [-a] [content]  create/update note (upsert, -a to append)
+  iz n new | edit <id|ns:title>       create or edit a note in $EDITOR
+  iz n show <id|ns:title> | del <id|ns:title>  view or delete a note
   iz n list [namespace]      list saved notes (alias: iz nl)
   iz n import <file|dir>     import markdown files/notes into memory
 
@@ -64,6 +65,8 @@ func main() {
 		os.Exit(noteCmd(args))
 	case "recall", "rc":
 		os.Exit(recallCmd(args))
+	case "prime", "context":
+		os.Exit(primeCmd(args))
 	case "notes", "nl":
 		os.Exit(listNotes(strings.Join(args, " ")))
 	case "sync", "s":

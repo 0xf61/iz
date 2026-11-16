@@ -12,11 +12,15 @@ It stores structured knowledge notes (rules, user preferences, architectures, ru
 
 ---
 
-## 1. Recalling Knowledge & Past Commands (QUERY)
+## 1. Discovering & Recalling Knowledge (QUERY)
 
-Always recall memory before asking the user or assuming context is missing:
+Always check what is in memory before asking the user or assuming context is missing:
 
-  iz recall "<query>"             # Compact hybrid search (notes + command runs)
+  iz prime                        # Compact index of all namespaces & note titles
+  iz prime --json                 # JSON index
+  iz recall "<query>"             # Hybrid search (notes + command runs)
+  iz recall --full "<query>"      # Hybrid search without truncating note bodies
+  iz recall -l 20 "<query>"       # Increase result limit (default: 10 notes, 5 runs)
   iz recall --json "<query>"      # Compact single-line JSON output (recommended for tool calls)
   iz recall --pretty "<query>"    # Indented JSON output
   iz recall -n "<query>"          # Knowledge notes only
@@ -31,17 +35,18 @@ Always recall memory before asking the user or assuming context is missing:
 
 ---
 
-## 2. Recording Notes, Facts & Findings (INGEST)
+## 2. Recording & Updating Notes (UPSERT)
 
-When you discover credentials, solve an infrastructure problem, learn preferences, or complete an audit step:
+Notes are unique by <namespace:title>. Writing to an existing <namespace:title> updates it in place (no duplicates). Use -a/--append to add lines to an existing note:
 
   iz n <namespace:title> [-t tag1,tag2] "<content>"
+  iz n -a <namespace:title> "<additional content>"
 
 ### Examples:
   iz n user:preferences "Prefers concise responses, CLI-first workflows, dark mode."
   iz n pentest:target-creds "Host: 10.10.138.12 | MSSQL sa:P@ssword123 | Domain: CORP"
   iz n machines:kali -t vpn "Kali box IP 10.42.13.37"
-  iz n lessons:api-timeouts "Long-running jobs require API_TIMEOUT_MS=3000000."
+  iz n -a machines:kali "SSH port 2222"
 
 ### Piped input:
   cat /path/to/findings.md | iz n pentest:recon-summary
@@ -51,8 +56,10 @@ When you discover credentials, solve an infrastructure problem, learn preference
 ## 3. Reading & Managing Notes
 
   iz n list [namespace]           # List existing notes
-  iz n show <id>                  # Print full markdown content of a note
-  iz n del <id>                   # Delete a note
+  iz n show <id|ns:title>         # Print full markdown content of a note
+  iz n del <id|ns:title>          # Delete a note
+
+> Note for AI Agents: Never run interactive TUI/editor commands ('iz', 'iz n', 'iz n new', 'iz n edit', 'iz e') as they require a TTY.
 
 ---
 

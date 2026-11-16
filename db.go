@@ -38,7 +38,7 @@ func openDBAt(p string) (*sql.DB, error) {
 	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite", p+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
+	db, err := sql.Open("sqlite", p+"?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, err
 	}
@@ -87,10 +87,13 @@ var schema = []string{
 	`CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
   title, content, namespace, tags, tokenize='unicode61'
 )`,
-	`CREATE TABLE IF NOT EXISTS tombstones(key TEXT PRIMARY KEY)`,
-	// pre-uid databases: these fail with "duplicate column" once applied
+	`CREATE TABLE IF NOT EXISTS tombstones(key TEXT PRIMARY KEY, ts REAL NOT NULL DEFAULT 0)`,
+	// pre-uid / pre-v4 databases: these fail with "duplicate column" once applied
 	`ALTER TABLE memories ADD COLUMN uid TEXT`,
 	`ALTER TABLE memories ADD COLUMN mtime REAL NOT NULL DEFAULT 0`,
+	`ALTER TABLE tombstones ADD COLUMN ts REAL NOT NULL DEFAULT 0`,
+	// v4: reset legacy NUL-delimited or truncated 1-byte tombstones
+	`DELETE FROM tombstones WHERE instr(key, char(0)) > 0 OR length(key) <= 1`,
 	`CREATE INDEX IF NOT EXISTS memories_uid ON memories(uid)`,
 	`CREATE INDEX IF NOT EXISTS memories_ns ON memories(namespace, title)`,
 	backfillUID,
@@ -128,7 +131,7 @@ const seedDefaultTools = `INSERT OR IGNORE INTO tools(name) VALUES
 // note on two machines (made by older syncs) still match each other.
 const backfillUID = `UPDATE memories SET uid = hostname||'|'||ts||'|'||namespace||'|'||title WHERE uid IS NULL`
 
-const schemaVersion = 3
+const schemaVersion = 4
 
 // ensureSchema creates/migrates the schema. Local databases skip the work
 // once PRAGMA user_version says they are current; force always runs it
@@ -143,8 +146,44 @@ func ensureSchema(ctx context.Context, db dbtx, force bool) error {
 			return err
 		}
 	}
+	if err := dedupMemories(ctx, db); err != nil {
+		return err
+	}
+	if _, err := db.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS memories_ns_title ON memories(namespace, title)`); err != nil {
+		return err
+	}
 	db.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version=%d`, schemaVersion)) //nolint — optional on remotes
 	return nil
+}
+
+// dedupMemories removes older duplicate (namespace, title) notes, keeping the
+// newest row by max(mtime, ts), id. Their FTS rows are cleaned up too.
+func dedupMemories(ctx context.Context, db dbtx) error {
+	rows, err := db.QueryContext(ctx, `
+		SELECT id FROM memories m
+		WHERE EXISTS (
+			SELECT 1 FROM memories m2
+			WHERE m2.namespace = m.namespace AND m2.title = m.title
+			  AND (max(m2.mtime, m2.ts) > max(m.mtime, m.ts)
+			       OR (max(m2.mtime, m2.ts) = max(m.mtime, m.ts) AND m2.id > m.id))
+		)`)
+	if err != nil {
+		return err
+	}
+	var ids []any
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	return purge(ctx, db, "memories", "memories_fts", ids)
 }
 
 // Run is one recorded command execution.
@@ -164,10 +203,11 @@ type Run struct {
 func ni(v int64) sql.NullInt64 { return sql.NullInt64{Int64: v, Valid: true} }
 
 // runKey / memTomb identify rows across machines (tombstones, sync dedup).
+// Printable colon-separated keys avoid NUL-byte truncation in SQLite/Turso UIs.
 func runKey(host string, ts float64, tool, cmd string) string {
-	return "r\x00" + host + "\x00" + strconv.FormatFloat(ts, 'f', -1, 64) + "\x00" + tool + "\x00" + cmd
+	return "r:" + host + ":" + strconv.FormatFloat(ts, 'f', -1, 64) + ":" + tool + ":" + cmd
 }
-func memTomb(uid string) string { return "m\x00" + uid }
+func memTomb(uid string) string { return "m:" + uid }
 
 // ftsPrefix is prepended to the indexed output so one MATCH searches
 // hostname, tool and command line as well.
@@ -231,8 +271,18 @@ func deleteRuns(db *sql.DB, ids []int64) int {
 }
 
 func tombstone(ex dbtx, key string) error {
-	_, err := ex.ExecContext(bg, `INSERT OR IGNORE INTO tombstones(key) VALUES(?)`, key)
+	_, err := ex.ExecContext(bg, `INSERT OR REPLACE INTO tombstones(key, ts) VALUES(?, ?)`, key, now())
 	return err
+}
+
+func pruneTombstones(ctx context.Context, ex dbtx, maxAge time.Duration) (int64, error) {
+	cutoff := float64(time.Now().Add(-maxAge).Unix())
+	res, err := ex.ExecContext(ctx, `DELETE FROM tombstones WHERE ts > 0 AND ts < ?`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
 }
 
 // purge deletes rows by id from table and its FTS index (no tombstone).
@@ -286,6 +336,20 @@ func freeTerms(fields []string) []string {
 	return out
 }
 
+// ftsQuoteQuery wraps each search term in double quotes so punctuation like
+// '-', '.', ':', '/' is treated as literal tokens by FTS5 instead of syntax
+// operators. op should be " " (AND) or " OR ".
+func ftsQuoteQuery(terms []string, op string) string {
+	if len(terms) == 0 {
+		return ""
+	}
+	quoted := make([]string, len(terms))
+	for i, t := range terms {
+		quoted[i] = `"` + strings.ReplaceAll(t, `"`, `""`) + `"`
+	}
+	return strings.Join(quoted, op)
+}
+
 // ftsValid probes MATCH syntax: through a JOIN, invalid FTS syntax (e.g.
 // unquoted "signing:False") silently yields zero rows instead of erroring.
 func ftsValid(db *sql.DB, table, q string) bool {
@@ -327,30 +391,50 @@ func searchRuns(db *sql.DB, query string, limit int, withText bool) ([]Run, erro
 	q := strings.Join(terms, " ")
 
 	text := "''"
+	joinFTS := ""
 	if withText {
 		text = "f.text"
+		joinFTS = " JOIN outputs_fts f ON f.rowid = r.id"
+	} else if q != "" {
+		joinFTS = " JOIN outputs_fts f ON f.rowid = r.id"
 	}
 	selectSQL := `SELECT r.id,r.ts,r.hostname,r.tool,r.cmd,r.cwd,r.exit_code,r.duration_ms,r.size,` + text + `
-	              FROM runs r JOIN outputs_fts f ON f.rowid = r.id`
+	              FROM runs r` + joinFTS
 	tail := fmt.Sprintf(" ORDER BY r.ts DESC LIMIT %d", limit)
 
 	// Case rule: all-lowercase terms match case-insensitively via FTS; terms
 	// with any uppercase must occur verbatim (instr compares BINARY).
+	var caseConds string
+	var caseArgs []any
 	for _, t := range terms {
 		if strings.ToLower(t) != t {
-			conds += " AND instr(f.text, ?) > 0"
-			args = append(args, t)
+			caseConds += " AND instr(f.text, ?) > 0"
+			caseArgs = append(caseArgs, t)
 		}
 	}
+
 	var runs []Run
 	var err error
 	switch {
 	case q == "":
 		runs, err = scanRuns(db, selectSQL+" WHERE 1=1"+conds+tail, args)
-	case ftsValid(db, "outputs_fts", q):
-		runs, err = scanRuns(db, selectSQL+" WHERE outputs_fts MATCH ?"+conds+tail, append([]any{q}, args...))
 	default:
-		runs, err = scanRuns(db, selectSQL+" WHERE f.text LIKE ?"+conds+tail, append([]any{"%" + q + "%"}, args...))
+		ftsQ := ftsQuoteQuery(terms, " ")
+		if ftsValid(db, "outputs_fts", q) {
+			runs, err = scanRuns(db, selectSQL+" WHERE outputs_fts MATCH ?"+conds+caseConds+tail, append(append([]any{q}, args...), caseArgs...))
+		} else if ftsValid(db, "outputs_fts", ftsQ) {
+			runs, err = scanRuns(db, selectSQL+" WHERE outputs_fts MATCH ?"+conds+caseConds+tail, append(append([]any{ftsQ}, args...), caseArgs...))
+		} else {
+			runs, err = scanRuns(db, selectSQL+" WHERE f.text LIKE ?"+conds+caseConds+tail, append(append([]any{"%" + q + "%"}, args...), caseArgs...))
+		}
+		// Multi-term fallback: if strict AND returned 0 rows, try OR ranked by bm25
+		if err == nil && len(runs) == 0 && len(terms) > 1 {
+			orQ := ftsQuoteQuery(terms, " OR ")
+			if ftsValid(db, "outputs_fts", orQ) {
+				orTail := fmt.Sprintf(" ORDER BY bm25(outputs_fts), r.ts DESC LIMIT %d", limit)
+				runs, err = scanRuns(db, selectSQL+" WHERE outputs_fts MATCH ?"+conds+orTail, append([]any{orQ}, args...))
+			}
+		}
 	}
 	if withText {
 		for i := range runs {
@@ -360,10 +444,16 @@ func searchRuns(db *sql.DB, query string, limit int, withText bool) ([]Run, erro
 	return runs, err
 }
 
-// matchLine returns the first line containing a term (ASCII case-insensitive),
+// matchLine returns the first line containing a term (Unicode case-insensitive),
 // or the first non-empty line when nothing matches.
 func matchLine(text string, terms []string) string {
 	first := ""
+	lowTerms := make([]string, 0, len(terms))
+	for _, t := range terms {
+		if len([]rune(t)) >= 2 {
+			lowTerms = append(lowTerms, strings.ToLower(t))
+		}
+	}
 	for _, l := range strings.Split(text, "\n") {
 		l = strings.TrimSpace(l)
 		if l == "" {
@@ -372,9 +462,9 @@ func matchLine(text string, terms []string) string {
 		if first == "" {
 			first = l
 		}
-		ll := string(asciiLower([]byte(l)))
-		for _, t := range terms {
-			if len(t) >= 2 && strings.Contains(ll, string(asciiLower([]byte(t)))) {
+		ll := strings.ToLower(l)
+		for _, lt := range lowTerms {
+			if strings.Contains(ll, lt) {
 				return l
 			}
 		}

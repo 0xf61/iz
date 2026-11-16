@@ -83,21 +83,59 @@ func asciiLower(b []byte) []byte {
 	return out
 }
 
-// trunc cuts s to at most n runes (never inside a UTF-8 sequence).
+// trunc cuts s to at most n runes (never inside a UTF-8 sequence) without
+// allocating a []rune slice for the entire string.
 func trunc(s string, n int) string {
-	if utf8.RuneCountInString(s) <= n {
-		return s
+	if n <= 0 {
+		return ""
 	}
-	return string([]rune(s)[:n-1]) + "…"
+	count := 0
+	cutByte := -1
+	for i := range s {
+		if count == n-1 {
+			cutByte = i
+		}
+		if count >= n {
+			return s[:cutByte] + "…"
+		}
+		count++
+	}
+	return s
 }
 
 // truncLeft keeps the tail of s (for commands: the arguments matter most).
 func truncLeft(s string, n int) string {
-	r := []rune(s)
-	if len(r) <= n {
+	if n <= 0 {
+		return ""
+	}
+	total := utf8.RuneCountInString(s)
+	if total <= n {
 		return s
 	}
-	return "…" + string(r[len(r)-n+1:])
+	skip := total - n + 1
+	count := 0
+	for i := range s {
+		if count == skip {
+			return "…" + s[i:]
+		}
+		count++
+	}
+	return s
+}
+
+// truncFTS caps indexed plain text to maxFTSBytes on a valid UTF-8 boundary
+// so huge command outputs don't bloat memory or SQLite FTS5.
+const maxFTSBytes = 2 << 20 // 2 MB
+
+func truncFTS(b []byte) []byte {
+	if len(b) <= maxFTSBytes {
+		return b
+	}
+	b = b[:maxFTSBytes]
+	for len(b) > 0 && !utf8.Valid(b[max(0, len(b)-4):]) {
+		b = b[:len(b)-1]
+	}
+	return b
 }
 
 // oneLine collapses all whitespace (newlines included) to single spaces.

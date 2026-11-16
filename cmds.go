@@ -119,7 +119,7 @@ func importCmd(args []string) int {
 		Cwd:      filepath.Dir(abs), // dir of the imported file, not the caller's cwd
 		Size:     ni(int64(len(z))),
 	}
-	id, err := insertRun(db, r, z, stripANSI(raw))
+	id, err := insertRun(db, r, z, truncFTS(stripANSI(raw)))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "iz:", err)
 		return 1
@@ -325,6 +325,10 @@ func runEditor(path string) error {
 
 // editCmd opens the raw ANSI output in $EDITOR (fallback: nvim -> vim -> vi -> nano).
 func editCmd(idArg string) int {
+	if !isTTY() {
+		fmt.Fprintln(os.Stderr, "iz e: interactive editor requires a terminal (use 'iz sh <id>' instead)")
+		return 2
+	}
 	id, err := strconv.ParseInt(idArg, 10, 64)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "usage: iz e <id>")

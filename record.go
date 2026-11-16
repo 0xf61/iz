@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"database/sql"
 	"fmt"
 	"io"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -38,6 +40,13 @@ func runRecord(args []string) int {
 		return 2
 	}
 	defer db.Close()
+
+	// Use PTY only when both stdin and stdout are terminals; otherwise run in
+	// pipe mode so piped commands (e.g. `cat urls | httpx` or `cmd | grep`)
+	// receive EOF cleanly and don't get ANSI/CRLF injected into pipelines.
+	if !isTTY() {
+		return runPipeRecord(db, args)
+	}
 
 	cmd := exec.Command(args[0], args[1:]...)
 	// CLICOLOR/CLICOLOR_FORCE: keep BSD ls (macOS) colored even when a fish
@@ -95,7 +104,7 @@ func runRecord(args []string) int {
 		exit = int(r.ExitCode.Int64)
 	}
 
-	id, dbErr := insertRun(db, r, z, stripANSI(raw))
+	id, dbErr := insertRun(db, r, z, truncFTS(stripANSI(raw)))
 	if dbErr != nil {
 		fmt.Fprintf(os.Stderr, "[iz] RECORD FAILED: %v\n", dbErr)
 		return exit
@@ -104,6 +113,60 @@ func runRecord(args []string) int {
 		id, exit, time.Since(start).Seconds(), humanBytes(int64(r.Size.Int64)))
 	return exit
 }
+
+// runPipeRecord runs the command without a PTY when stdin or stdout is piped,
+// mirroring stdout/stderr cleanly while recording the combined output.
+func runPipeRecord(db *sql.DB, args []string) int {
+	cmd := exec.Command(args[0], args[1:]...)
+	cmd.Stdin = os.Stdin
+	start := time.Now()
+
+	var mu sync.Mutex
+	var buf bytes.Buffer
+	syncWrite := func(w io.Writer, p []byte) (int, error) {
+		mu.Lock()
+		buf.Write(p)
+		mu.Unlock()
+		return w.Write(p)
+	}
+	cmd.Stdout = writerFunc(func(p []byte) (int, error) { return syncWrite(os.Stdout, p) })
+	cmd.Stderr = writerFunc(func(p []byte) (int, error) { return syncWrite(os.Stderr, p) })
+
+	exit := 0
+	if err := cmd.Run(); err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			exit = ee.ExitCode()
+		} else {
+			fmt.Fprintln(os.Stderr, "iz:", err)
+			return 2
+		}
+	}
+
+	raw := tidyRaw(buf.Bytes())
+	z := gz(raw)
+	r := Run{
+		Ts:       float64(start.UnixNano()) / 1e9,
+		Hostname: hostname(),
+		Tool:     filepath.Base(args[0]),
+		Cmd:      joinArgs(args),
+		Cwd:      cwd(),
+		ExitCode: ni(int64(exit)),
+		Dur:      ni(int64(time.Since(start) / time.Millisecond)),
+		Size:     ni(int64(len(z))),
+	}
+	id, dbErr := insertRun(db, r, z, truncFTS(stripANSI(raw)))
+	if dbErr != nil {
+		fmt.Fprintf(os.Stderr, "[iz] RECORD FAILED: %v\n", dbErr)
+		return exit
+	}
+	fmt.Fprintf(os.Stderr, "[iz] #%d saved · exit=%d · %.1fs · %s\n",
+		id, exit, time.Since(start).Seconds(), humanBytes(int64(r.Size.Int64)))
+	return exit
+}
+
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
 
 // passthrough runs the command directly, no PTY or recording.
 func passthrough(args []string) int {
