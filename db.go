@@ -94,13 +94,41 @@ var schema = []string{
 	`CREATE INDEX IF NOT EXISTS memories_uid ON memories(uid)`,
 	`CREATE INDEX IF NOT EXISTS memories_ns ON memories(namespace, title)`,
 	backfillUID,
+	seedDefaultTools,
 }
+
+// defaultTools is the list of penetration testing and security assessment tools
+// automatically registered in the tools table on database creation.
+var defaultTools = []string{
+	// Network & Port Scanning
+	"nmap", "masscan", "rustscan", "naabu",
+	// Web Recon & Discovery
+	"httpx", "httprobe", "subfinder", "assetfinder", "waybackurls", "gau",
+	// Web Fuzzing, Scanning & Testing
+	"ffuf", "feroxbuster", "gobuster", "dirsearch", "nuclei", "shortscan", "wpscan", "sqlmap",
+	// Active Directory, Network Exploitation & Auth
+	"nxc", "crackmapexec", "certipy", "bloodyad", "coercer", "kerbrute",
+	"evil-winrm", "responder", "mitm6", "smbclient", "enum4linux-ng",
+	// Tunneling, Pivoting & Infrastructure
+	"chisel", "ligolo-ng", "bettercap",
+	// Analysis, Cracking & Utilities
+	"hashcat", "radare2", "tshark", "meg", "qsreplace", "gf", "unew",
+}
+
+const seedDefaultTools = `INSERT OR IGNORE INTO tools(name) VALUES
+('nmap'),('masscan'),('rustscan'),('naabu'),
+('httpx'),('httprobe'),('subfinder'),('assetfinder'),('waybackurls'),('gau'),
+('ffuf'),('feroxbuster'),('gobuster'),('dirsearch'),('nuclei'),('shortscan'),('wpscan'),('sqlmap'),
+('nxc'),('crackmapexec'),('certipy'),('bloodyad'),('coercer'),('kerbrute'),
+('evil-winrm'),('responder'),('mitm6'),('smbclient'),('enum4linux-ng'),
+('chisel'),('ligolo-ng'),('bettercap'),
+('hashcat'),('radare2'),('tshark'),('meg'),('qsreplace'),('gf'),('unew')`
 
 // backfillUID gives legacy notes a deterministic uid, so copies of the same
 // note on two machines (made by older syncs) still match each other.
 const backfillUID = `UPDATE memories SET uid = hostname||'|'||ts||'|'||namespace||'|'||title WHERE uid IS NULL`
 
-const schemaVersion = 2
+const schemaVersion = 3
 
 // ensureSchema creates/migrates the schema. Local databases skip the work
 // once PRAGMA user_version says they are current; force always runs it

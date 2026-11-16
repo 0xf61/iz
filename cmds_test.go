@@ -13,28 +13,33 @@ func TestSubcommands(t *testing.T) {
 	t.Setenv("IZ", path)
 
 	// add / list / del round trip
-	if code := toolsCmd("add", []string{"nmap", "nuclei"}); code != 0 {
+	db, _ := openDBAt(path)
+	var initCount int
+	db.QueryRow(`SELECT count(*) FROM tools`).Scan(&initCount) //nolint
+	db.Close()
+
+	if code := toolsCmd("add", []string{"mycustomtool", "nuclei"}); code != 0 {
 		t.Fatalf("add exit=%d", code)
 	}
 	if code := toolsCmd("add", []string{"iz"}); code != 0 {
 		t.Fatalf("add iz exit=%d", code)
 	}
-	db, _ := openDBAt(path)
+	db, _ = openDBAt(path)
 	var n int
 	db.QueryRow(`SELECT count(*) FROM tools`).Scan(&n) //nolint
-	if n != 2 {                                        // iz must be rejected
-		t.Errorf("tools = %d, want 2", n)
+	if n != initCount+1 {                              // nuclei is already in default tools, mycustomtool added, iz rejected
+		t.Errorf("tools = %d, want %d", n, initCount+1)
 	}
 	db.Close()
 
-	if code := toolsCmd("del", []string{"nmap"}); code != 0 {
+	if code := toolsCmd("del", []string{"mycustomtool"}); code != 0 {
 		t.Fatalf("del exit=%d", code)
 	}
 	db, _ = openDBAt(path)
 	var left int
 	db.QueryRow(`SELECT count(*) FROM tools`).Scan(&left) //nolint
-	if left != 1 {
-		t.Errorf("tools after del = %d, want 1", left)
+	if left != initCount {
+		t.Errorf("tools after del = %d, want %d", left, initCount)
 	}
 	db.Close()
 
