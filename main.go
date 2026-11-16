@@ -22,7 +22,7 @@ Usage:
   iz i [tool] <file>         import a file (e.g. iz i nmap gm.xml)
   iz m <iz.db>               merge another machine's database (runs + notes)
   iz sync                    two-way sync with remote LibSQL/Turso (IZ_SYNC_URL)
-  iz f                       print fish integration (iz f | source)
+  iz init [fish|zsh|bash]    setup or print shell & AI assistant integration (iz init --help)
 
 Memory & Recall:
   iz recall <query>          search notes and runs (--json, --pretty, -n, -r)
@@ -76,6 +76,8 @@ func main() {
 		os.Exit(importCmd(args))
 	case "merge", "m":
 		os.Exit(oneArg("iz m <iz.db>", args, mergeCmd))
+	case "init":
+		os.Exit(initCmd(args))
 	case "fish", "f":
 		os.Exit(fishCmd())
 	case "lines": // internal: live reload source for the fzf TUI

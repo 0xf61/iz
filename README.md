@@ -64,12 +64,28 @@ command since there is no cgo:
 GOOS=linux GOARCH=amd64 go build -o dist/iz-linux-amd64 .
 ```
 
+## Quick Setup & Shell Integration
+
+Run `iz init` to automatically configure your current shell (fish, zsh, or bash) and detect installed AI coding assistants (Claude Code, OpenCode, Gemini, Cursor):
+
+```sh
+iz init           # auto-detect shell and AI assistants and inject hooks
+iz init --show    # view integration status
+```
+
+Or print integration scripts manually:
+```sh
+eval "$(iz init zsh)"             # zsh integration + ctrl-g (search) + ctrl-o (notes)
+eval "$(iz init bash)"            # bash integration + ctrl-g + ctrl-o
+iz init fish | source             # fish integration + ctrl-g + ctrl-o (alias: iz f)
+```
+
 ## Usage
 
 ```fish
 iz -- cargo build --release       # run + record any command
 iz a cargo make pytest            # record these tools automatically via wrappers
-iz f | source                     # generate fish wrappers + ctrl-g / ctrl-o widgets
+iz init                           # auto-setup shell wrappers & AI assistants
 iz                                # search runs TUI
 iz sh 42                          # replay output #42, colors intact
 iz e 42                           # open output #42 in $EDITOR
@@ -155,5 +171,5 @@ make linux     # static linux/amd64 + linux/arm64 into dist/
 | `cmds.go` | add/del/list/rm/import/merge/show/edit |
 | `memory.go` | structured notes, FTS5 recall, notes TUI |
 | `sync.go` | two-way LibSQL/Turso & file replication |
-| `fish.go` | fish integration generator |
+| `shell.go` | fish, zsh, bash & AI assistant init generator |
 | `ai.go` | AI agent reference guide |
