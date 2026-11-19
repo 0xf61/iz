@@ -89,6 +89,10 @@ Example:
 Two-way synchronization with Turso / LibSQL cloud using environment variables:
   - IZ_SYNC_URL (or TURSO_DATABASE_URL)
   - IZ_AUTH_TOKEN (or TURSO_AUTH_TOKEN)
+
+Best practices for AI agents:
+  - Run 'iz sync' at session start to pull the latest notes and context from other machines.
+  - Run 'iz sync' after recording important notes or runs so they propagate across machines immediately.
 `
 
 func aiGuideCmd() int {

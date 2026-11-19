@@ -175,22 +175,30 @@ func fishCmd() int {
 }
 
 const aiPromptSnippet = `<!-- iz-memory:begin -->
-# iz — Terminal Execution & Memory Ledger
+# iz — Terminal Execution & Persistent Memory Ledger
 
-iz is available on the PATH.
-- Discover what is stored in memory first:
-    iz prime                        # compact namespace/title index (--json available)
-- Recall past findings, credentials, and command runs before assuming context is missing:
-    iz recall "<query>"             # compact text output (--full for complete notes, -l N for limit)
+iz is available on the PATH. It is your persistent second-brain memory and command execution ledger across sessions and harnesses.
+
+- Recall First (before asking questions or assuming context is missing):
+    iz prime                        # compact namespace & note title index (--json available)
+    iz recall "<query>"             # search memory & past command runs
     iz recall --json "<query>"      # structured JSON (token-efficient)
-- Read a full note or command output by ID or namespace:title:
-    iz n show <id|ns:title>         # full note content
-    iz sh <run_id>                  # full recorded command output
-- Store or update notes (upserts by namespace:title — never creates duplicates):
-    iz n <namespace:title> [-t tags] "<content>"
-    iz n -a <namespace:title> "<extra>"   # append to existing note
-- Record important command outputs persistently:
-    iz -- <command> [args...]
+    iz recall --full "<query>"      # full untruncated note contents
+    iz n show <id|ns:title>         # inspect full note content
+    iz sh <run_id>                  # view full recorded terminal output
+
+- Persist All Learnings Proactively:
+    Whenever you discover user preferences, project architecture, credentials, bug fixes, or runbooks:
+    iz n <namespace:title> [-t tags] "<content>"  # upsert note (no duplicates)
+    iz n -a <namespace:title> "<extra>"            # append to existing note
+
+- Persistent Command Execution:
+    iz -- <command> [args...]       # record command metadata and full output in SQLite FTS5
+
+- Multi-Machine Sync (Turso/LibSQL):
+    iz sync                         # two-way sync to pull latest notes or push new learnings
+    Run 'iz sync' at session start to pull fresh context, and after recording important notes/runs.
+
 - Non-interactive rule: NEVER run bare 'iz', 'iz n', 'iz n edit', 'iz n new', or 'iz e' (they open fzf/$EDITOR).
 <!-- iz-memory:end -->
 `
@@ -246,7 +254,7 @@ Usage:
   iz init                     Auto-detect current shell & AI assistants and configure them
   iz init <fish|zsh|bash>     Print shell integration script to stdout
   iz init --shell <name>      Install hook into shell config (fish, zsh, bash)
-  iz init --agent <name>      Install memory instructions into AI config (claude, opencode, gemini, cursor)
+  iz init --agent <name>      Install memory instructions into AI config (claude, opencode, antigravity, cursor)
   iz init --show              Show detected shells, agents and installation status`)
 			return 0
 		}
@@ -280,6 +288,9 @@ Usage:
 	// 2. Configure AI Assistants
 	installedAgents := 0
 	if targetAgent != "" {
+		if targetAgent == "gemini" {
+			targetAgent = "antigravity"
+		}
 		if err := installAgentInstructions(home, targetAgent); err != nil {
 			fmt.Fprintf(os.Stderr, "[iz] agent install (%s): %v\n", targetAgent, err)
 		} else {
@@ -287,7 +298,7 @@ Usage:
 			installedAgents++
 		}
 	} else {
-		for _, ag := range []string{"claude", "opencode", "gemini", "cursor"} {
+		for _, ag := range []string{"claude", "opencode", "antigravity", "cursor"} {
 			if isAgentInstalled(home, ag) {
 				if err := installAgentInstructions(home, ag); err == nil {
 					fmt.Fprintf(os.Stderr, "[iz] configured memory instructions for %s\n", ag)
@@ -340,7 +351,7 @@ func isAgentInstalled(home, agent string) bool {
 	case "opencode":
 		fi, err := os.Stat(filepath.Join(home, ".config", "opencode"))
 		return err == nil && fi.IsDir()
-	case "gemini":
+	case "antigravity", "gemini":
 		fi, err := os.Stat(filepath.Join(home, ".gemini"))
 		return err == nil && fi.IsDir()
 	case "cursor":
@@ -357,10 +368,21 @@ func installAgentInstructions(home, agent string) error {
 		targetPath = filepath.Join(home, ".claude", "CLAUDE.md")
 	case "opencode":
 		targetPath = filepath.Join(home, ".config", "opencode", "AGENTS.md")
-	case "gemini":
-		dir := filepath.Join(home, ".gemini", "config", "rules")
-		os.MkdirAll(dir, 0o755) //nolint
-		targetPath = filepath.Join(dir, "IZ.md")
+	case "antigravity", "gemini":
+		pluginDir := filepath.Join(home, ".gemini", "config", "plugins", "iz")
+		_ = os.MkdirAll(filepath.Join(pluginDir, "rules"), 0o755)
+		pluginJSON := filepath.Join(pluginDir, "plugin.json")
+		if _, err := os.Stat(pluginJSON); os.IsNotExist(err) {
+			_ = os.WriteFile(pluginJSON, []byte(`{
+  "name": "iz",
+  "version": "1.0.0",
+  "description": "Antigravity plugin for persistent agent memory, recall, and terminal execution ledger via iz"
+}
+`), 0o644)
+		}
+		targetPath = filepath.Join(pluginDir, "rules", "AGENTS.md")
+		legacyPath := filepath.Join(home, ".gemini", "config", "rules", "IZ.md")
+		_ = patchManagedBlock(legacyPath, "<!-- iz-memory:begin -->", "<!-- iz-memory:end -->", aiPromptSnippet)
 	case "cursor":
 		targetPath = filepath.Join(home, ".cursorrules")
 	default:
@@ -451,7 +473,7 @@ func showInitStatus(home string) int {
 	}{
 		{"claude", filepath.Join(home, ".claude", "CLAUDE.md")},
 		{"opencode", filepath.Join(home, ".config", "opencode", "AGENTS.md")},
-		{"gemini", filepath.Join(home, ".gemini", "config", "rules", "IZ.md")},
+		{"antigravity", filepath.Join(home, ".gemini", "config", "plugins", "iz", "rules", "AGENTS.md")},
 		{"cursor", filepath.Join(home, ".cursorrules")},
 	}
 	fmt.Println("\nAI Assistants:")
