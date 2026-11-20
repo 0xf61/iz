@@ -493,12 +493,12 @@ func syncMemoriesBidirectional(ctx context.Context, local, remote *sql.DB, tomb 
 	// another note with the old (namespace, title) can collide with it.
 	for uid, lm := range lByUID {
 		if rm, ok := rByUID[uid]; ok {
-			claimedRemote[rm.id] = true
 			if lm.mtime > rm.mtime {
 				// Avoid UNIQUE(namespace, title) collision if a different UID owns target ns:title on remote
 				if rm2, occ := rByNS[nsKey(lm.ns, lm.title)]; occ && rm2.id != rm.id {
 					continue
 				}
+				claimedRemote[rm.id] = true
 				pushIDs = append(pushIDs, lm.id)
 				pushTargets[uid] = rm.id
 			}
@@ -521,11 +521,11 @@ func syncMemoriesBidirectional(ctx context.Context, local, remote *sql.DB, tomb 
 
 	for uid, rm := range rByUID {
 		if lm, ok := lByUID[uid]; ok {
-			claimedLocal[lm.id] = true
 			if rm.mtime > lm.mtime {
 				if lm2, occ := lByNS[nsKey(rm.ns, rm.title)]; occ && lm2.id != lm.id {
 					continue
 				}
+				claimedLocal[lm.id] = true
 				pullIDs = append(pullIDs, rm.id)
 				pullTargets[uid] = lm.id
 			}
@@ -635,6 +635,7 @@ func copyMemories(ctx context.Context, src, dst *sql.DB, tomb map[string]bool) (
 			return nil
 		}
 		v, ok := have[m.UID]
+		byUID := ok
 		if !ok {
 			v, ok = haveNS[nsKey(m.Namespace, m.Title)]
 		}
@@ -643,6 +644,12 @@ func copyMemories(ctx context.Context, src, dst *sql.DB, tomb map[string]bool) (
 			rows = append(rows, []any{m.UID, m.Ts, m.Mtime, m.Hostname, m.Namespace, m.Title, m.Content, m.Author, m.Tags})
 			fts = append(fts, []any{m.Title, m.Content, m.Namespace, m.Tags})
 		case m.Mtime > v.mtime: // last write wins
+			if byUID {
+				if v2, occ := haveNS[nsKey(m.Namespace, m.Title)]; occ && v2.id != v.id {
+					return nil
+				}
+				delete(haveNS, nsKey(v.ns, v.title))
+			}
 			m.ID = v.id
 			upd = append(upd, m)
 		default:

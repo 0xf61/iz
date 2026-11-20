@@ -53,6 +53,8 @@ func openDBAt(p string) (*sql.DB, error) {
 	}
 	if p != ":memory:" && !strings.HasPrefix(p, "file:") {
 		_ = os.Chmod(p, 0o600)
+		_ = os.Chmod(p+"-wal", 0o600)
+		_ = os.Chmod(p+"-shm", 0o600)
 	}
 	return db, nil
 }
@@ -423,7 +425,10 @@ func searchRuns(db *sql.DB, query string, limit int, withText bool) ([]Run, erro
 		}
 	}
 	if !hasOR {
-		for _, t := range terms {
+		for idx, t := range terms {
+			if idx > 0 && terms[idx-1] == "NOT" {
+				continue
+			}
 			clean := strings.Trim(t, `"'`)
 			if clean == "" || clean == "AND" || clean == "OR" || clean == "NOT" || clean == "NEAR" {
 				continue

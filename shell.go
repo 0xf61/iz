@@ -128,12 +128,12 @@ __iz_bash_widget() {
         READLINE_POINT=$(( READLINE_POINT + ${#cmd} ))
     fi
 }
-bind -x '"\C-g": __iz_bash_widget'
+bind -x "\"${IZ_KEY:-\\C-g}\": __iz_bash_widget"
 
 __iz_bash_notes_widget() {
     command iz n
 }
-bind -x '"\C-o": __iz_bash_notes_widget'
+bind -x "\"${IZ_NOTES_KEY:-\\C-o}\": __iz_bash_notes_widget"
 
 `)
 		for _, name := range tools {
@@ -361,17 +361,22 @@ Usage:
 	// 1. Configure Shells
 	installedShells := 0
 	if targetShell != "" {
-		if err := installShellHook(home, targetShell); err != nil {
+		changed, err := installShellHook(home, targetShell)
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "[iz] shell install (%s): %v\n", targetShell, err)
 			return 1
 		}
-		fmt.Fprintf(os.Stderr, "[iz] shell %s configured successfully\n", targetShell)
-		installedShells++
+		if changed {
+			fmt.Fprintf(os.Stderr, "[iz] shell %s configured successfully\n", targetShell)
+			installedShells++
+		} else {
+			fmt.Fprintf(os.Stderr, "[iz] shell %s already configured\n", targetShell)
+		}
 	} else if autoMode {
 		// Detect default shell
 		detected := detectShell()
 		if detected != "" {
-			if err := installShellHook(home, detected); err == nil {
+			if changed, err := installShellHook(home, detected); err == nil && changed {
 				fmt.Fprintf(os.Stderr, "[iz] configured shell hook in %s\n", detected)
 				installedShells++
 			}
@@ -384,16 +389,21 @@ Usage:
 		if targetAgent == "gemini" {
 			targetAgent = "antigravity"
 		}
-		if err := installAgentInstructions(home, targetAgent); err != nil {
+		changed, err := installAgentInstructions(home, targetAgent)
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "[iz] agent install (%s): %v\n", targetAgent, err)
 			return 1
 		}
-		fmt.Fprintf(os.Stderr, "[iz] assistant %s configured successfully\n", targetAgent)
-		installedAgents++
+		if changed {
+			fmt.Fprintf(os.Stderr, "[iz] assistant %s configured successfully\n", targetAgent)
+			installedAgents++
+		} else {
+			fmt.Fprintf(os.Stderr, "[iz] assistant %s already configured\n", targetAgent)
+		}
 	} else if autoMode {
 		for _, ag := range []string{"claude", "opencode", "antigravity", "cursor"} {
 			if isAgentInstalled(home, ag) {
-				if err := installAgentInstructions(home, ag); err == nil {
+				if changed, err := installAgentInstructions(home, ag); err == nil && changed {
 					fmt.Fprintf(os.Stderr, "[iz] configured memory instructions for %s\n", ag)
 					installedAgents++
 				}
@@ -417,7 +427,7 @@ func detectShell() string {
 	return "zsh" // default on modern macOS
 }
 
-func installShellHook(home, sh string) error {
+func installShellHook(home, sh string) (bool, error) {
 	var rcPath, hookLine string
 	switch sh {
 	case "fish":
@@ -430,7 +440,7 @@ func installShellHook(home, sh string) error {
 		rcPath = filepath.Join(home, ".bashrc")
 		hookLine = `if command -v iz >/dev/null 2>&1; then eval "$(iz init bash)"; fi`
 	default:
-		return fmt.Errorf("unsupported shell %s", sh)
+		return false, fmt.Errorf("unsupported shell %s", sh)
 	}
 
 	return appendLineIfMissing(rcPath, hookLine, "# iz shell integration")
@@ -454,7 +464,7 @@ func isAgentInstalled(home, agent string) bool {
 	return false
 }
 
-func installAgentInstructions(home, agent string) error {
+func installAgentInstructions(home, agent string) (bool, error) {
 	var targetPath string
 	switch agent {
 	case "claude":
@@ -483,16 +493,16 @@ func installAgentInstructions(home, agent string) error {
 	case "cursor":
 		targetPath = filepath.Join(home, ".cursorrules")
 	default:
-		return fmt.Errorf("unknown agent %s", agent)
+		return false, fmt.Errorf("unknown agent %s", agent)
 	}
 
 	return patchManagedBlock(targetPath, "<!-- iz-memory:begin -->", "<!-- iz-memory:end -->", aiPromptSnippet)
 }
 
-func patchManagedBlock(path, startMark, endMark, block string) error {
+func patchManagedBlock(path, startMark, endMark, block string) (bool, error) {
 	data, err := os.ReadFile(path)
 	if err != nil && !os.IsNotExist(err) {
-		return err
+		return false, err
 	}
 
 	content := string(data)
@@ -501,8 +511,11 @@ func patchManagedBlock(path, startMark, endMark, block string) error {
 
 	if start >= 0 && end > start {
 		// Replace existing block
-		newContent := content[:start] + strings.TrimSpace(block) + content[end+len(endMark):]
-		return os.WriteFile(path, []byte(strings.TrimSpace(newContent)+"\n"), 0o644)
+		newContent := strings.TrimSpace(content[:start]+strings.TrimSpace(block)+content[end+len(endMark):]) + "\n"
+		if newContent == content {
+			return false, nil
+		}
+		return true, os.WriteFile(path, []byte(newContent), 0o644)
 	}
 
 	// Append block
@@ -510,31 +523,31 @@ func patchManagedBlock(path, startMark, endMark, block string) error {
 	if len(content) == 0 {
 		sep = ""
 	}
-	content = strings.TrimSpace(content) + sep + strings.TrimSpace(block) + "\n"
+	newContent := strings.TrimSpace(content) + sep + strings.TrimSpace(block) + "\n"
 	os.MkdirAll(filepath.Dir(path), 0o755) //nolint
-	return os.WriteFile(path, []byte(content), 0o644)
+	return true, os.WriteFile(path, []byte(newContent), 0o644)
 }
 
-func appendLineIfMissing(path, line, comment string) error {
+func appendLineIfMissing(path, line, comment string) (bool, error) {
 	data, err := os.ReadFile(path)
 	if err != nil && !os.IsNotExist(err) {
-		return err
+		return false, err
 	}
 
 	content := string(data)
-	if strings.Contains(content, line) || (strings.Contains(content, "iz init") && strings.Contains(content, "source")) || strings.Contains(content, "iz fish") {
-		return nil // already configured
+	if strings.Contains(content, line) || strings.Contains(content, "iz init") || strings.Contains(content, "iz fish") {
+		return false, nil // already configured
 	}
 
 	entry := "\n" + comment + "\n" + line + "\n"
 	os.MkdirAll(filepath.Dir(path), 0o755) //nolint
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer f.Close()
 	_, err = f.WriteString(entry)
-	return err
+	return err == nil, err
 }
 
 func showInitStatus(home string) int {

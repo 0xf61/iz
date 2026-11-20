@@ -38,8 +38,8 @@ func TestPatchManagedBlock(t *testing.T) {
 	p := filepath.Join(dir, "CLAUDE.md")
 
 	// 1. First installation (append)
-	if err := patchManagedBlock(p, "<!-- iz:begin -->", "<!-- iz:end -->", "<!-- iz:begin -->\nline1\n<!-- iz:end -->"); err != nil {
-		t.Fatal(err)
+	if changed, err := patchManagedBlock(p, "<!-- iz:begin -->", "<!-- iz:end -->", "<!-- iz:begin -->\nline1\n<!-- iz:end -->"); err != nil || !changed {
+		t.Fatalf("first patch: changed=%v err=%v", changed, err)
 	}
 	data, _ := osReadFile(p)
 	if !strings.Contains(data, "line1") {
@@ -47,12 +47,17 @@ func TestPatchManagedBlock(t *testing.T) {
 	}
 
 	// 2. Re-install / update (replace in place)
-	if err := patchManagedBlock(p, "<!-- iz:begin -->", "<!-- iz:end -->", "<!-- iz:begin -->\nupdated\n<!-- iz:end -->"); err != nil {
-		t.Fatal(err)
+	if changed, err := patchManagedBlock(p, "<!-- iz:begin -->", "<!-- iz:end -->", "<!-- iz:begin -->\nupdated\n<!-- iz:end -->"); err != nil || !changed {
+		t.Fatalf("update patch: changed=%v err=%v", changed, err)
 	}
 	data, _ = osReadFile(p)
 	if !strings.Contains(data, "updated") || strings.Contains(data, "line1") {
 		t.Fatalf("replace failed: %q", data)
+	}
+
+	// 3. No-op re-run
+	if changed, err := patchManagedBlock(p, "<!-- iz:begin -->", "<!-- iz:end -->", "<!-- iz:begin -->\nupdated\n<!-- iz:end -->"); err != nil || changed {
+		t.Fatalf("noop patch: changed=%v err=%v", changed, err)
 	}
 }
 

@@ -41,7 +41,7 @@ func toolsCmd(sub string, args []string) int {
 				return 1
 			}
 		}
-		fmt.Fprintln(os.Stderr, "[iz] added. Refresh wrappers: iz f | source")
+		fmt.Fprintln(os.Stderr, "[iz] added. Refresh wrappers by restarting your shell or re-sourcing 'iz init <shell>'")
 	case "del":
 		if len(args) == 0 {
 			fmt.Fprintln(os.Stderr, "usage: iz d <tool>...")
@@ -50,7 +50,7 @@ func toolsCmd(sub string, args []string) int {
 		for _, t := range args {
 			db.Exec(`DELETE FROM tools WHERE name=?`, t) //nolint
 		}
-		fmt.Fprintln(os.Stderr, "[iz] removed. (drop the fish function: functions -e <tool>)")
+		fmt.Fprintln(os.Stderr, "[iz] removed. Refresh wrappers by restarting your shell.")
 	case "list":
 		fmt.Println("# tools:")
 		for _, n := range queryNames(db, "tools") {
@@ -161,7 +161,7 @@ func mergeCmd(path string) int {
 		return 2
 	}
 	defer db.Close()
-	other, err := openDBAt(path)
+	other, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?mode=ro&_pragma=busy_timeout(5000)")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "iz:", err)
 		return 1
@@ -187,6 +187,13 @@ func showCmd(args []string) int {
 		fmt.Fprintln(os.Stderr, "usage: iz sh <id> [id...] [query]")
 		return 2
 	}
+	db, err := openDB()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "iz:", err)
+		return 2
+	}
+	defer db.Close()
+
 	var ids []int64
 	var terms []string
 	for i, a := range args {
@@ -195,21 +202,22 @@ func showCmd(args []string) int {
 			break
 		}
 		if id, ok := leadID(a); ok {
-			ids = append(ids, id)
-		} else {
-			terms = append(terms, freeTerms(strings.Fields(a))...)
+			if len(ids) == 0 || strings.ContainsAny(a, " \t") {
+				ids = append(ids, id)
+				continue
+			}
+			var exists int64
+			if db.QueryRow(`SELECT id FROM runs WHERE id=?`, id).Scan(&exists) == nil {
+				ids = append(ids, id)
+				continue
+			}
 		}
+		terms = append(terms, freeTerms(strings.Fields(a))...)
 	}
 	if len(ids) == 0 {
 		fmt.Fprintln(os.Stderr, "usage: iz sh <id> [id...] [query]")
 		return 2
 	}
-	db, err := openDB()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "iz:", err)
-		return 2
-	}
-	defer db.Close()
 
 	for n, id := range ids {
 		raw, r, err := getMeta(db, id)
@@ -235,11 +243,13 @@ func showCmd(args []string) int {
 		}
 		meta = append(meta, "\x1b[36m"+tildify(r.Cwd)+"\x1b[0m")
 		out := ungz(raw)
-		if k := firstMatchLine(out, terms); k > 0 {
-			// start at the first matching line — the preview lands on the
-			// match instead of requiring manual scrolling
-			out = bytes.SplitN(out, []byte{'\n'}, k+1)[k]
-			meta = append(meta, fmt.Sprintf("\x1b[33m@L%d\x1b[0m", k+1))
+		if os.Getenv("FZF_PREVIEW_LINES") != "" {
+			if k := firstMatchLine(out, terms); k > 0 {
+				// start at the first matching line — the preview lands on the
+				// match instead of requiring manual scrolling
+				out = bytes.SplitN(out, []byte{'\n'}, k+1)[k]
+				meta = append(meta, fmt.Sprintf("\x1b[33m@L%d\x1b[0m", k+1))
+			}
 		}
 		// host carries the header (id is already visible in the list)
 		fmt.Fprintf(os.Stderr, "\x1b[2m[%s #%d]\x1b[0m %s\n$ \x1b[1m%s\x1b[0m\n",

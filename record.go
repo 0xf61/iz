@@ -189,7 +189,11 @@ func runPipeRecord(db *sql.DB, args []string) int {
 	exit := 0
 	if err := cmd.Run(); err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
-			exit = ee.ExitCode()
+			if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+				exit = 128 + int(ws.Signal())
+			} else {
+				exit = ee.ExitCode()
+			}
 		} else {
 			fmt.Fprintln(os.Stderr, "iz:", err)
 			return 2

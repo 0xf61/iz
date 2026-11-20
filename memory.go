@@ -30,6 +30,7 @@ type Memory struct {
 	Tags      string  `json:"tags,omitempty"`
 	UID       string  `json:"-"` // identity across machines
 	Mtime     float64 `json:"mtime,omitempty"` // last edit (sync: last write wins)
+	TagsSet   bool    `json:"-"`
 }
 
 func now() float64 { return float64(time.Now().UnixNano()) / 1e9 }
@@ -74,7 +75,7 @@ func upsertMemoryTx(ex dbtx, m Memory, appendMode bool) (int64, bool, error) {
 		if appendMode && oldContent != "" {
 			m.Content = strings.TrimRight(oldContent, "\n") + "\n" + m.Content
 		}
-		if m.Tags == "" {
+		if m.Tags == "" && !m.TagsSet {
 			m.Tags = oldTags
 		}
 		if m.Mtime == 0 {
@@ -322,7 +323,8 @@ func tuiNotes(query string) int {
 	if iz == "" {
 		iz = "iz"
 	}
-	src := iz + " n lines {q}"
+	izCmd := "'" + strings.ReplaceAll(iz, "'", `'\''`) + "'"
+	src := izCmd + " n lines {q}"
 	args := []string{
 		"--ansi",
 		"--phony",
@@ -331,12 +333,12 @@ func tuiNotes(query string) int {
 		"--header", "⏎ view · ^N new · ^E edit · ^Y del · esc exit",
 		"--bind", "start:reload(" + src + ")",
 		"--bind", "change:reload(" + src + ")",
-		"--preview", iz + " n show {1}",
+		"--preview", izCmd + " n show {1}",
 		"--preview-window", "right:60%:wrap",
-		"--bind", "enter:execute(" + iz + " n show {1} | less -R)",
-		"--bind", "ctrl-e:execute(" + iz + " n edit {1})+reload(" + src + ")",
-		"--bind", "ctrl-n:execute(" + iz + " n new)+reload(" + src + ")",
-		"--bind", "ctrl-y:execute-silent(" + iz + " n del {1})+reload(" + src + ")",
+		"--bind", "enter:execute(" + izCmd + " n show {1} | less -R)",
+		"--bind", "ctrl-e:execute(" + izCmd + " n edit {1})+reload(" + src + ")",
+		"--bind", "ctrl-n:execute(" + izCmd + " n new)+reload(" + src + ")",
+		"--bind", "ctrl-y:execute-silent(" + izCmd + " n del {1})+reload(" + src + ")",
 		"--query", query,
 	}
 
@@ -627,20 +629,29 @@ Usage:
 
 	// Adding or updating a note: `iz n [-t tags] [-a] <target> [content...]`
 	var tagsFlag string
+	tagsSet := false
 	appendMode := false
 	var pos []string
+	stopFlags := false
 	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "-t", "--tags":
-			if i+1 < len(args) {
-				tagsFlag = args[i+1]
-				i++
+		if !stopFlags && len(pos) < 2 {
+			switch args[i] {
+			case "--":
+				stopFlags = true
+				continue
+			case "-t", "--tags":
+				if i+1 < len(args) {
+					tagsFlag = args[i+1]
+					tagsSet = true
+					i++
+					continue
+				}
+			case "-a", "--append":
+				appendMode = true
+				continue
 			}
-		case "-a", "--append":
-			appendMode = true
-		default:
-			pos = append(pos, args[i])
 		}
+		pos = append(pos, args[i])
 	}
 	if len(pos) == 0 {
 		fmt.Fprintln(os.Stderr, "usage: iz n <ns:title> [-t tags] [-a] [content]")
@@ -649,8 +660,9 @@ Usage:
 
 	m := Memory{}
 	m.Namespace, m.Title, m.Tags = parseTarget(pos[0])
-	if tagsFlag != "" {
+	if tagsSet {
 		m.Tags = tagsFlag
+		m.TagsSet = true
 	}
 	words := pos[1:]
 	content := strings.Join(words, " ")

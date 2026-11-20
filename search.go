@@ -69,10 +69,11 @@ func tuiSearch(query string, pick bool) int {
 	if iz == "" {
 		iz = "iz"
 	}
+	izCmd := "'" + strings.ReplaceAll(iz, "'", `'\''`) + "'"
 	// The list is fed (and live-reloaded) through lines, which runs the FTS
 	// query as you type — that is what makes output-content search (e.g.
 	// "vmware-detect") work inside the TUI.
-	src := iz + " lines {q}"
+	src := izCmd + " lines {q}"
 	args := []string{
 		"--ansi",
 		// --phony: fzf does not filter itself; every keystroke re-runs the
@@ -88,11 +89,11 @@ func tuiSearch(query string, pick bool) int {
 		"--bind", "ctrl-a:select-all",
 		"--bind", "start:reload(" + src + ")",
 		"--bind", "change:reload(" + src + ")",
-		"--preview", iz + " show {1} -- {q}",
+		"--preview", izCmd + " show {1} -- {q}",
 		"--preview-window", "right:55%:wrap",
-		"--bind", "enter:execute(" + iz + " show {+} | less -R)",
-		"--bind", "ctrl-e:execute(" + iz + " edit {1})",
-		"--bind", "ctrl-y:execute-silent(" + iz + " --rm {+})+reload(" + src + ")",
+		"--bind", "enter:execute(" + izCmd + " show {+} | less -R)",
+		"--bind", "ctrl-e:execute(" + izCmd + " edit {1})",
+		"--bind", "ctrl-y:execute-silent(" + izCmd + " --rm {+})+reload(" + src + ")",
 	}
 	// The full query (filters included) seeds fzf; keystrokes flow to the
 	// reload source as {q}, which re-parses them. tab accepts in widget mode
