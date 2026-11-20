@@ -11,9 +11,12 @@ directory and the complete colored output are stored and indexed.
 
 ## Why not atuin or asciinema?
 
-- [atuin](https://atuin.sh) stores your shell history with great search, but it
+- [atuin](https://atuin.sh) stores your shell history with great search, ~~but it
   only keeps the command line. What the command printed is gone the moment you
-  close the terminal.
+  close the terminal.~~ *(Update: newer Atuin releases with `pty-proxy` +
+  daemon can now capture and search output too, though captured output stays
+  local-only on that machine — `iz` syncs runs, outputs, and structured AI
+  notes across machines via Turso/LibSQL without needing a background daemon.)*
 - [asciinema](https://asciinema.org) records the whole session, but there is no
   way to search for "that nmap run where port 443 was filtered" or "the last
   build that mentioned this warning". You scrub through video.
