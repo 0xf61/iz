@@ -82,21 +82,23 @@ export IZ="${IZ:-$HOME/.iz/iz.db}"
 
 __iz_zsh_widget() {
     local cmd
-    cmd=$(command iz --pick 2>/dev/null)
+    zle -I
+    cmd=$(command iz --pick </dev/tty 2>/dev/null)
     if [ -n "$cmd" ]; then
         LBUFFER+="$cmd"
     fi
     zle reset-prompt
 }
 zle -N __iz_zsh_widget
-bindkey "${IZ_KEY:-\^G}" __iz_zsh_widget
+bindkey "${IZ_KEY:-^G}" __iz_zsh_widget
 
 __iz_zsh_notes_widget() {
-    command iz n
+    zle -I
+    command iz n </dev/tty
     zle reset-prompt
 }
 zle -N __iz_zsh_notes_widget
-bindkey "${IZ_NOTES_KEY:-\^O}" __iz_zsh_notes_widget
+bindkey "${IZ_NOTES_KEY:-^O}" __iz_zsh_notes_widget
 
 `)
 		for _, name := range tools {
@@ -203,6 +205,88 @@ iz is available on the PATH. It is your persistent second-brain memory and comma
 <!-- iz-memory:end -->
 `
 
+const antigravitySkillMD = `---
+name: iz
+description: >-
+  Persistent second-brain memory, knowledge recall, and terminal command execution ledger.
+  Use whenever searching for previous context, decisions, credentials, machine details, or past command outputs with ` + "`iz recall`" + ` and ` + "`iz prime`" + `.
+  Also use proactively to record and persist anything learned (preferences, project architecture, bug workarounds, runbooks) using ` + "`iz n <namespace:title>`" + `.
+---
+
+# iz — Persistent Memory, Recall & Execution Ledger
+
+` + "`iz`" + ` stores structured knowledge notes alongside full terminal command executions and their complete outputs in a local SQLite FTS5 database (` + "`~/.iz/iz.db`" + `), with optional LibSQL/Turso cloud sync.
+
+## Query & Recall Workflow
+
+Before asking the user questions or assuming context is missing:
+
+1. **Check Available Namespaces & Titles**:
+   ` + "```bash" + `
+   iz prime
+   iz prime --json
+   ` + "```" + `
+
+2. **Recall Memories and Runs**:
+   ` + "```bash" + `
+   iz recall "<query>"              # Hybrid search across notes and runs
+   iz recall --json "<query>"       # Compact JSON (token-efficient)
+   iz recall --full "<query>"       # Untruncated note bodies
+   iz recall -n "<query>"           # Knowledge notes only
+   iz recall -r "<query>"           # Historical command runs only
+   iz recall -l 20 "<query>"        # Custom limit
+   ` + "```" + `
+
+3. **Inspect Full Note or Past Command Output**:
+   ` + "```bash" + `
+   iz n show <id|ns:title>          # View complete note in markdown
+   iz sh <run_id>                   # Replay full colored terminal output of a past run
+   iz sh <run_id> "<pattern>"       # Replay and highlight matching text
+   ` + "```" + `
+
+## Recording Learnings (Proactive Knowledge Persistence)
+
+Store new discoveries, configurations, and decisions as they happen:
+
+` + "```bash" + `
+# Upsert note (replaces if <namespace:title> exists, preventing duplicates)
+iz n <namespace:title> [-t tag1,tag2] "<content>"
+
+# Append to existing note
+iz n -a <namespace:title> "<additional lines>"
+` + "```" + `
+
+### Recommended Namespaces:
+- ` + "`user:preferences`" + ` — User work style, guidelines, communication preferences.
+- ` + "`project:<name>`" + ` — Repo layout, architecture, conventions, quirks.
+- ` + "`machines:<host>`" + ` — IPs, hostnames, open ports, SSH config, credentials.
+- ` + "`debug:<issue>`" + ` — Root causes, tricky bug solutions, diagnostic steps.
+- ` + "`runbook:<topic>`" + ` — Operational steps, deployments, migration commands.
+- ` + "`findings:<target>`" + ` — Pentest / audit findings, proof of concepts.
+
+## Persistent Command Execution
+
+When executing commands whose full output should be preserved for debugging, proof, or historical record:
+
+` + "```bash" + `
+iz -- <command> [args...]
+` + "```" + `
+
+## Multi-Machine Cloud Sync (Turso / LibSQL)
+
+` + "```bash" + `
+iz sync
+` + "```" + `
+- Run ` + "`iz sync`" + ` at session startup to pull the latest notes and context from other machines.
+- Run ` + "`iz sync`" + ` after recording important notes or findings so they propagate immediately.
+
+## Safety & Non-Interactive Usage
+
+NEVER execute interactive commands that launch a TTY/fzf interface or ` + "`$EDITOR`" + `:
+- Do NOT run: ` + "`iz`" + `, ` + "`iz n`" + `, ` + "`iz n new`" + `, ` + "`iz n edit`" + `, ` + "`iz e`" + `.
+- Always use the non-interactive CLI subcommands shown above.
+`
+
 // initCmd handles `iz init`:
 //   iz init                     (detects shell, auto-installs hooks to shell rc + agents)
 //   iz init <fish|zsh|bash>     (prints shell integration script to stdout)
@@ -238,15 +322,19 @@ func initCmd(args []string) int {
 		case "--show":
 			showOnly = true
 		case "--shell", "-s":
-			if i+1 < len(args) {
-				targetShell = args[i+1]
-				i++
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "iz init: --shell requires a shell name (fish, zsh, bash)")
+				return 2
 			}
+			targetShell = args[i+1]
+			i++
 		case "--agent", "-a":
-			if i+1 < len(args) {
-				targetAgent = args[i+1]
-				i++
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "iz init: --agent requires an agent name (claude, opencode, antigravity, cursor)")
+				return 2
 			}
+			targetAgent = args[i+1]
+			i++
 		case "-h", "--help":
 			fmt.Println(`iz init — shell & AI assistant initialization
 
@@ -257,6 +345,9 @@ Usage:
   iz init --agent <name>      Install memory instructions into AI config (claude, opencode, antigravity, cursor)
   iz init --show              Show detected shells, agents and installation status`)
 			return 0
+		default:
+			fmt.Fprintf(os.Stderr, "iz init: unknown argument %q (run 'iz init --help')\n", args[i])
+			return 2
 		}
 	}
 
@@ -265,16 +356,18 @@ Usage:
 		return showInitStatus(home)
 	}
 
+	autoMode := targetShell == "" && targetAgent == ""
+
 	// 1. Configure Shells
 	installedShells := 0
 	if targetShell != "" {
 		if err := installShellHook(home, targetShell); err != nil {
 			fmt.Fprintf(os.Stderr, "[iz] shell install (%s): %v\n", targetShell, err)
-		} else {
-			fmt.Fprintf(os.Stderr, "[iz] shell %s configured successfully\n", targetShell)
-			installedShells++
+			return 1
 		}
-	} else {
+		fmt.Fprintf(os.Stderr, "[iz] shell %s configured successfully\n", targetShell)
+		installedShells++
+	} else if autoMode {
 		// Detect default shell
 		detected := detectShell()
 		if detected != "" {
@@ -293,11 +386,11 @@ Usage:
 		}
 		if err := installAgentInstructions(home, targetAgent); err != nil {
 			fmt.Fprintf(os.Stderr, "[iz] agent install (%s): %v\n", targetAgent, err)
-		} else {
-			fmt.Fprintf(os.Stderr, "[iz] assistant %s configured successfully\n", targetAgent)
-			installedAgents++
+			return 1
 		}
-	} else {
+		fmt.Fprintf(os.Stderr, "[iz] assistant %s configured successfully\n", targetAgent)
+		installedAgents++
+	} else if autoMode {
 		for _, ag := range []string{"claude", "opencode", "antigravity", "cursor"} {
 			if isAgentInstalled(home, ag) {
 				if err := installAgentInstructions(home, ag); err == nil {
@@ -308,7 +401,7 @@ Usage:
 		}
 	}
 
-	if installedShells == 0 && installedAgents == 0 && targetShell == "" && targetAgent == "" {
+	if installedShells == 0 && installedAgents == 0 && autoMode {
 		fmt.Fprintln(os.Stderr, "[iz] nothing needed update (already configured). Run 'iz init --show' to check.")
 	}
 
@@ -371,6 +464,7 @@ func installAgentInstructions(home, agent string) error {
 	case "antigravity", "gemini":
 		pluginDir := filepath.Join(home, ".gemini", "config", "plugins", "iz")
 		_ = os.MkdirAll(filepath.Join(pluginDir, "rules"), 0o755)
+		_ = os.MkdirAll(filepath.Join(pluginDir, "skills", "iz"), 0o755)
 		pluginJSON := filepath.Join(pluginDir, "plugin.json")
 		if _, err := os.Stat(pluginJSON); os.IsNotExist(err) {
 			_ = os.WriteFile(pluginJSON, []byte(`{
@@ -380,9 +474,12 @@ func installAgentInstructions(home, agent string) error {
 }
 `), 0o644)
 		}
+		skillPath := filepath.Join(pluginDir, "skills", "iz", "SKILL.md")
+		_ = os.WriteFile(skillPath, []byte(antigravitySkillMD), 0o644)
+		// Remove legacy duplicate rule/skill files if present
+		_ = os.Remove(filepath.Join(home, ".gemini", "config", "rules", "IZ.md"))
+		_ = os.RemoveAll(filepath.Join(home, ".gemini", "config", "skills", "iz"))
 		targetPath = filepath.Join(pluginDir, "rules", "AGENTS.md")
-		legacyPath := filepath.Join(home, ".gemini", "config", "rules", "IZ.md")
-		_ = patchManagedBlock(legacyPath, "<!-- iz-memory:begin -->", "<!-- iz-memory:end -->", aiPromptSnippet)
 	case "cursor":
 		targetPath = filepath.Join(home, ".cursorrules")
 	default:

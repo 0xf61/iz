@@ -174,6 +174,8 @@ func syncPair(ctx context.Context, local, remote *sql.DB) (up, down repStats, er
 	if up.notes, down.notes, err = syncMemoriesBidirectional(ctx, local, remote, tomb); err != nil {
 		return up, down, fmt.Errorf("notes: %w", err)
 	}
+	pruneTombstones(ctx, local, tombstoneTTL)  //nolint
+	pruneTombstones(ctx, remote, tombstoneTTL) //nolint
 	return up, down, nil
 }
 
@@ -197,12 +199,9 @@ func replicate(ctx context.Context, src, dst *sql.DB) (st repStats, err error) {
 
 const tombstoneTTL = 30 * 24 * time.Hour
 
-// syncTombstones reads tombstones once from each side, propagates differences
-// both ways, and prunes tombstones older than tombstoneTTL.
+// syncTombstones reads tombstones once from each side and propagates differences
+// both ways. Expired tombstones are pruned at the end of syncPair.
 func syncTombstones(ctx context.Context, local, remote *sql.DB) (map[string]bool, int, int, error) {
-	pruneTombstones(ctx, local, tombstoneTTL)  //nolint
-	pruneTombstones(ctx, remote, tombstoneTTL) //nolint
-
 	localTombs := map[string]float64{}
 	if err := each(ctx, local, `SELECT key, ts FROM tombstones`, func(r *sql.Rows) error {
 		var k string
@@ -487,16 +486,30 @@ func syncMemoriesBidirectional(ctx context.Context, local, remote *sql.DB, tomb 
 	// Track update targets on dst when matched by uid or (namespace, title)
 	pushTargets := map[string]int64{} // src uid -> dst id
 	pullTargets := map[string]int64{} // src uid -> dst id
+	claimedRemote := map[int64]bool{}
+	claimedLocal := map[int64]bool{}
 
+	// Pass 1: match by UID first so renames claim their own remote row before
+	// another note with the old (namespace, title) can collide with it.
 	for uid, lm := range lByUID {
 		if rm, ok := rByUID[uid]; ok {
+			claimedRemote[rm.id] = true
 			if lm.mtime > rm.mtime {
+				// Avoid UNIQUE(namespace, title) collision if a different UID owns target ns:title on remote
+				if rm2, occ := rByNS[nsKey(lm.ns, lm.title)]; occ && rm2.id != rm.id {
+					continue
+				}
 				pushIDs = append(pushIDs, lm.id)
 				pushTargets[uid] = rm.id
 			}
+		}
+	}
+	for uid, lm := range lByUID {
+		if _, ok := rByUID[uid]; ok {
 			continue
 		}
-		if rm, ok := rByNS[nsKey(lm.ns, lm.title)]; ok {
+		if rm, ok := rByNS[nsKey(lm.ns, lm.title)]; ok && !claimedRemote[rm.id] {
+			claimedRemote[rm.id] = true
 			if lm.mtime >= rm.mtime {
 				pushIDs = append(pushIDs, lm.id)
 				pushTargets[uid] = rm.id
@@ -508,13 +521,22 @@ func syncMemoriesBidirectional(ctx context.Context, local, remote *sql.DB, tomb 
 
 	for uid, rm := range rByUID {
 		if lm, ok := lByUID[uid]; ok {
+			claimedLocal[lm.id] = true
 			if rm.mtime > lm.mtime {
+				if lm2, occ := lByNS[nsKey(rm.ns, rm.title)]; occ && lm2.id != lm.id {
+					continue
+				}
 				pullIDs = append(pullIDs, rm.id)
 				pullTargets[uid] = lm.id
 			}
+		}
+	}
+	for uid, rm := range rByUID {
+		if _, ok := lByUID[uid]; ok {
 			continue
 		}
-		if lm, ok := lByNS[nsKey(rm.ns, rm.title)]; ok {
+		if lm, ok := lByNS[nsKey(rm.ns, rm.title)]; ok && !claimedLocal[lm.id] {
+			claimedLocal[lm.id] = true
 			if rm.mtime > lm.mtime {
 				pullIDs = append(pullIDs, rm.id)
 				pullTargets[uid] = lm.id
@@ -560,14 +582,8 @@ func transferMemories(ctx context.Context, src, dst *sql.DB, ids []any, targets 
 	}
 
 	n := 0
-	for i := 0; i < len(rows); i += 100 {
-		j := min(i+100, len(rows))
-		if err := insertBatch(ctx, dst, "memories", "uid,ts,mtime,hostname,namespace,title,content,author,tags",
-			"memories_fts", "title,content,namespace,tags", rows[i:j], fts[i:j]); err != nil {
-			return n, err
-		}
-		n += j - i
-	}
+	// Apply updates/renames before inserts so renamed notes free their old
+	// (namespace, title) slot before new notes with that name are inserted.
 	if len(upd) > 0 {
 		tx, err := dst.BeginTx(ctx, nil)
 		if err != nil {
@@ -583,6 +599,14 @@ func transferMemories(ctx context.Context, src, dst *sql.DB, ids []any, targets 
 			return n, err
 		}
 		n += len(upd)
+	}
+	for i := 0; i < len(rows); i += 100 {
+		j := min(i+100, len(rows))
+		if err := insertBatch(ctx, dst, "memories", "uid,ts,mtime,hostname,namespace,title,content,author,tags",
+			"memories_fts", "title,content,namespace,tags", rows[i:j], fts[i:j]); err != nil {
+			return n, err
+		}
+		n += j - i
 	}
 	return n, nil
 }
@@ -632,14 +656,6 @@ func copyMemories(ctx context.Context, src, dst *sql.DB, tomb map[string]bool) (
 		return 0, err
 	}
 
-	for i := 0; i < len(rows); i += 100 {
-		j := min(i+100, len(rows))
-		if err := insertBatch(ctx, dst, "memories", "uid,ts,mtime,hostname,namespace,title,content,author,tags",
-			"memories_fts", "title,content,namespace,tags", rows[i:j], fts[i:j]); err != nil {
-			return n, err
-		}
-		n += j - i
-	}
 	if len(upd) > 0 {
 		tx, err := dst.BeginTx(ctx, nil)
 		if err != nil {
@@ -655,6 +671,14 @@ func copyMemories(ctx context.Context, src, dst *sql.DB, tomb map[string]bool) (
 			return n, err
 		}
 		n += len(upd)
+	}
+	for i := 0; i < len(rows); i += 100 {
+		j := min(i+100, len(rows))
+		if err := insertBatch(ctx, dst, "memories", "uid,ts,mtime,hostname,namespace,title,content,author,tags",
+			"memories_fts", "title,content,namespace,tags", rows[i:j], fts[i:j]); err != nil {
+			return n, err
+		}
+		n += j - i
 	}
 	return n, nil
 }

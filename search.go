@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"golang.org/x/term"
 )
 
 // line is the fzf list entry: id (red when the run failed), date, dir,
@@ -55,7 +57,11 @@ func leadID(s string) (int64, bool) {
 //
 // In --pick mode (fish widget) tab accepts and prints the command to stdout.
 func tuiSearch(query string, pick bool) int {
-	if !isTTY() {
+	ttyOK := isTTY()
+	if pick {
+		ttyOK = term.IsTerminal(int(os.Stdin.Fd()))
+	}
+	if !ttyOK {
 		fmt.Fprintln(os.Stderr, "iz: interactive TUI requires a terminal (use 'iz recall <query>' instead)")
 		return 2
 	}

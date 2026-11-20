@@ -50,7 +50,7 @@ go install github.com/0xf61/iz@latest
 ```
 
 The binary lands in `$GOBIN` (default `~/go/bin/iz`); make sure it is on your
-`$PATH`. Requires Go 1.24+. No cgo, so the same works on Linux.
+`$PATH`. Requires Go 1.26+. No cgo, so the same works on Linux.
 
 Or build from source:
 
@@ -69,7 +69,7 @@ GOOS=linux GOARCH=amd64 go build -o dist/iz-linux-amd64 .
 
 ## Quick Setup & Shell Integration
 
-Run `iz init` to automatically configure your current shell (fish, zsh, or bash) and detect installed AI coding assistants (Claude Code, OpenCode, Gemini, Cursor):
+Run `iz init` to automatically configure your current shell (fish, zsh, or bash) and detect installed AI coding assistants (Claude Code, OpenCode, Antigravity, Cursor):
 
 ```sh
 iz init           # auto-detect shell and AI assistants and inject hooks
@@ -98,12 +98,16 @@ iz d less                         # remove a wrapper
 
 # Memory, notes & cloud sync
 iz n                              # interactive notes TUI (ctrl-o in fish)
-iz n machines:kali -t vpn "10.42.13.37"        # save a structured note
+iz n machines:kali -t vpn "10.42.13.37"        # save a structured note (upsert)
+iz n -a machines:kali "SSH port 2222"          # append to an existing note
+iz n show machines:kali           # print full note content
+iz n list [namespace]             # list saved notes (alias: iz nl)
 iz n edit 1                       # edit note #1 in $EDITOR
 iz n import ./notes/              # import markdown files/directory
+iz prime [--json]                 # compact index of namespaces & note titles
 iz recall "kali"                  # hybrid search across notes + command runs
-iz recall --json "kali"           # compact JSON for AI agents
-iz sync                           # two-way sync with Turso/LibSQL ($IZ_SYNC_URL)
+iz recall --json "kali"           # compact JSON for AI agents (filters: ns:, tag:, author:, cmd:, host:, dir:, size:)
+iz sync                           # two-way sync with Turso/LibSQL ($IZ_SYNC_URL or atuin kv)
 iz ai                             # print AI agent integration guide
 ```
 

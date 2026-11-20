@@ -25,6 +25,11 @@ var bg = context.Background()
 // dbPath: $IZ wins (wrappers also gate on it), default ~/.iz/iz.db.
 func dbPath() string {
 	if p := os.Getenv("IZ"); p != "" {
+		if strings.HasPrefix(p, "~/") {
+			if home, err := os.UserHomeDir(); err == nil {
+				return filepath.Join(home, p[2:])
+			}
+		}
 		return p
 	}
 	home, _ := os.UserHomeDir()
@@ -45,6 +50,9 @@ func openDBAt(p string) (*sql.DB, error) {
 	if err := ensureSchema(bg, db, false); err != nil {
 		db.Close()
 		return nil, err
+	}
+	if p != ":memory:" && !strings.HasPrefix(p, "file:") {
+		_ = os.Chmod(p, 0o600)
 	}
 	return db, nil
 }
@@ -404,12 +412,26 @@ func searchRuns(db *sql.DB, query string, limit int, withText bool) ([]Run, erro
 
 	// Case rule: all-lowercase terms match case-insensitively via FTS; terms
 	// with any uppercase must occur verbatim (instr compares BINARY).
+	// Skip caseConds when the query uses an explicit OR operator.
 	var caseConds string
 	var caseArgs []any
+	hasOR := false
 	for _, t := range terms {
-		if strings.ToLower(t) != t {
-			caseConds += " AND instr(f.text, ?) > 0"
-			caseArgs = append(caseArgs, t)
+		if t == "OR" {
+			hasOR = true
+			break
+		}
+	}
+	if !hasOR {
+		for _, t := range terms {
+			clean := strings.Trim(t, `"'`)
+			if clean == "" || clean == "AND" || clean == "OR" || clean == "NOT" || clean == "NEAR" {
+				continue
+			}
+			if strings.ToLower(clean) != clean {
+				caseConds += " AND instr(f.text, ?) > 0"
+				caseArgs = append(caseArgs, clean)
+			}
 		}
 	}
 

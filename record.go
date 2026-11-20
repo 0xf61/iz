@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/creack/pty"
+	"golang.org/x/term"
 )
 
 // runRecord runs the command inside a PTY. Output is mirrored to the user's
@@ -27,6 +28,10 @@ func runRecord(args []string) int {
 	}
 	if args[0] == "--" {
 		args = args[1:]
+	}
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: iz -- <cmd> [args...]")
+		return 2
 	}
 
 	// Never record iz itself (wrapper chains would feed on themselves).
@@ -68,7 +73,22 @@ func runRecord(args []string) int {
 	}
 	defer ptmx.Close()
 
-	// Forward terminal resizes to the PTY (event-driven, no polling).
+	// Put stdin into raw mode so interactive tools (ssh, sudo, fzf) receive
+	// keystrokes directly, passwords are not echoed by the outer TTY, and
+	// Ctrl-C is delivered to the child PTY instead of killing iz mid-scan.
+	var oldTermState *term.State
+	if s, err := term.MakeRaw(int(os.Stdin.Fd())); err == nil {
+		oldTermState = s
+	}
+	restoreTerm := func() {
+		if oldTermState != nil {
+			_ = term.Restore(int(os.Stdin.Fd()), oldTermState)
+			oldTermState = nil
+		}
+	}
+	defer restoreTerm()
+
+	// Forward terminal resizes and external SIGINT/SIGTERM to the child PTY.
 	winch := make(chan os.Signal, 1)
 	signal.Notify(winch, syscall.SIGWINCH)
 	defer signal.Stop(winch)
@@ -77,6 +97,22 @@ func runRecord(args []string) int {
 			pty.InheritSize(os.Stdin, ptmx) //nolint
 		}
 	}()
+
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	go func() {
+		for sig := range sigCh {
+			if cmd.Process != nil {
+				if s, ok := sig.(syscall.Signal); ok {
+					_ = syscall.Kill(-cmd.Process.Pid, s)
+				} else {
+					_ = cmd.Process.Signal(sig)
+				}
+			}
+		}
+	}()
+
 	// stdin → PTY
 	go func() { io.Copy(ptmx, os.Stdin) }() //nolint
 
@@ -84,6 +120,7 @@ func runRecord(args []string) int {
 	var buf bytes.Buffer
 	io.Copy(io.MultiWriter(os.Stdout, &buf), ptmx) //nolint
 	cmd.Wait()                                     //nolint
+	restoreTerm()
 
 	raw := tidyRaw(buf.Bytes())
 	z := gz(raw)
@@ -96,8 +133,14 @@ func runRecord(args []string) int {
 		Dur:      ni(int64(time.Since(start) / time.Millisecond)),
 		Size:     ni(int64(len(z))),
 	}
-	if ws, ok := cmd.ProcessState.Sys().(syscall.WaitStatus); ok {
-		r.ExitCode = ni(int64(ws.ExitStatus()))
+	if cmd.ProcessState != nil {
+		if ws, ok := cmd.ProcessState.Sys().(syscall.WaitStatus); ok {
+			if ws.Signaled() {
+				r.ExitCode = ni(int64(128 + int(ws.Signal())))
+			} else {
+				r.ExitCode = ni(int64(ws.ExitStatus()))
+			}
+		}
 	}
 	exit := 0
 	if r.ExitCode.Valid {
@@ -131,6 +174,17 @@ func runPipeRecord(db *sql.DB, args []string) int {
 	}
 	cmd.Stdout = writerFunc(func(p []byte) (int, error) { return syncWrite(os.Stdout, p) })
 	cmd.Stderr = writerFunc(func(p []byte) (int, error) { return syncWrite(os.Stderr, p) })
+
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	go func() {
+		for sig := range sigCh {
+			if cmd.Process != nil {
+				_ = cmd.Process.Signal(sig)
+			}
+		}
+	}()
 
 	exit := 0
 	if err := cmd.Run(); err != nil {

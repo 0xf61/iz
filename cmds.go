@@ -28,8 +28,12 @@ func toolsCmd(sub string, args []string) int {
 			return 2
 		}
 		for _, t := range args {
-			if t == "iz" {
-				fmt.Fprintln(os.Stderr, "[iz] 'iz' cannot record itself")
+			if t == "iz" || isShellBuiltin(t) {
+				fmt.Fprintf(os.Stderr, "[iz] %q cannot be wrapped safely\n", t)
+				continue
+			}
+			if !isToolName(t) {
+				fmt.Fprintf(os.Stderr, "[iz] invalid tool name: %q\n", t)
 				continue
 			}
 			if _, err := db.Exec(`INSERT OR IGNORE INTO tools(name) VALUES(?)`, t); err != nil {
@@ -124,9 +128,24 @@ func importCmd(args []string) int {
 		fmt.Fprintln(os.Stderr, "iz:", err)
 		return 1
 	}
-	db.Exec(`INSERT OR IGNORE INTO tools(name) VALUES(?)`, tool) //nolint
+	if isToolName(tool) && !isShellBuiltin(tool) && tool != "iz" {
+		db.Exec(`INSERT OR IGNORE INTO tools(name) VALUES(?)`, tool) //nolint
+	}
 	fmt.Fprintf(os.Stderr, "[iz] #%d imported · tool=%s · %s\n", id, tool, humanBytes(r.Size.Int64))
 	return 0
+}
+
+func isShellBuiltin(s string) bool {
+	switch s {
+	case "cd", "test", "set", "eval", "exec", "export", "source", "command",
+		"builtin", "alias", "unalias", "read", "echo", "printf", "exit",
+		"return", "shift", "trap", "umask", "unset", "wait", "jobs", "fg",
+		"bg", "kill", "pwd", "pushd", "popd", "dirs", "true", "false",
+		"local", "declare", "typeset", "readonly", "which", "type", "hash",
+		"ulimit", "times", "getopts", "let", "break", "continue":
+		return true
+	}
+	return false
 }
 
 // mergeCmd merges another machine's database (runs, notes and deletions),

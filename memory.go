@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/term"
 )
 
 // Memory is a structured note, fact, runbook, or agent decision.
@@ -30,14 +32,10 @@ type Memory struct {
 	Mtime     float64 `json:"mtime,omitempty"` // last edit (sync: last write wins)
 }
 
-func now() float64 { return float64(time.Now().Unix()) }
+func now() float64 { return float64(time.Now().UnixNano()) / 1e9 }
 
 func isTTY() bool {
-	fiIn, errIn := os.Stdin.Stat()
-	fiOut, errOut := os.Stdout.Stat()
-	return errIn == nil && errOut == nil &&
-		fiIn.Mode()&os.ModeCharDevice != 0 &&
-		fiOut.Mode()&os.ModeCharDevice != 0
+	return term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stdout.Fd()))
 }
 
 func newUID() string {
@@ -886,6 +884,9 @@ func recallCmd(args []string) int {
 	for _, t := range strings.Fields(query) {
 		runsOnly = runsOnly || hasPrefixAny(t, runFilters)
 		notesOnly = notesOnly || hasPrefixAny(t, memFilters)
+	}
+	if runsOnly && notesOnly {
+		runsOnly, notesOnly = false, false
 	}
 
 	db, err := openDB()
