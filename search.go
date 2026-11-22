@@ -54,6 +54,7 @@ func leadID(s string) (int64, bool) {
 //	tab     → multi-select toggle (insert into prompt in --pick/widget mode)
 //	ctrl-e  → open in $EDITOR
 //	ctrl-y  → delete selected run(s) and reload
+//	ctrl-o  → notes TUI
 //
 // In --pick mode (fish widget) tab accepts and prints the command to stdout.
 func tuiSearch(query string, pick bool) int {
@@ -85,15 +86,16 @@ func tuiSearch(query string, pick bool) int {
 		// in the preview instead (see showCmd/highlight)
 		"--color", "hl:-1,hl+:-1",
 		"--info", "inline", // counter on the prompt line: one more row for results
-		"--header", "⏎ view · ⇥ select · ^A all · ^E edit · ^Y del",
+		"--header", "⏎ view · ⇥ select · ^A all · ^E edit · ^Y del · ^O notes",
 		"--bind", "ctrl-a:select-all",
 		"--bind", "start:reload(" + src + ")",
 		"--bind", "change:reload(" + src + ")",
 		"--preview", izCmd + " show {1} -- {q}",
 		"--preview-window", "right:55%:wrap",
-		"--bind", "enter:execute(" + izCmd + " show {+} | less -R)",
+		"--bind", "enter:execute(" + izCmd + " show {+} -- {q} | less -R)",
 		"--bind", "ctrl-e:execute(" + izCmd + " edit {1})",
 		"--bind", "ctrl-y:execute-silent(" + izCmd + " --rm {+})+reload(" + src + ")",
+		"--bind", "ctrl-o:execute(" + izCmd + " n)",
 	}
 	// The full query (filters included) seeds fzf; keystrokes flow to the
 	// reload source as {q}, which re-parses them. tab accepts in widget mode

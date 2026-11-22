@@ -83,8 +83,9 @@ func TestQueryFilters(t *testing.T) {
 	}
 }
 
-func TestQueryColonTermFallsBackToLike(t *testing.T) {
-	// "signing:False" is invalid FTS5 syntax (column filter); must fall back to LIKE.
+func TestQueryColonTermUsesQuotedFTS(t *testing.T) {
+	// "signing:False" is invalid FTS5 syntax (column filter); the quoted form
+	// ("signing:False" as a phrase) must still find it.
 	path := testDB(t)
 	mustInsert(t, path, sampleRun("nxc", "cmd", "SMB 10.0.0.5 signing:False"), "SMB 10.0.0.5 signing:False")
 
@@ -96,7 +97,7 @@ func TestQueryColonTermFallsBackToLike(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(runs) != 1 {
-		t.Errorf("expected LIKE fallback to find 1 run, got %d", len(runs))
+		t.Errorf("expected quoted FTS query to find 1 run, got %d", len(runs))
 	}
 }
 
@@ -316,5 +317,142 @@ func TestRunLineSearchableFields(t *testing.T) {
 	// the output snippet must not leak into the visible list line
 	if strings.Contains(line, "80/tcp open") {
 		t.Errorf("line should not contain the output snippet: %q", line)
+	}
+}
+
+// FTS syntax around words: a prefix star, parens and boolean operators keep
+// working, and smart case still applies to the bare word ("ESC*" used to
+// require the literal "ESC*" in the output and found nothing).
+func TestSearchRunsPrefixAndGroups(t *testing.T) {
+	path := testDB(t)
+	mustInsert(t, path, sampleRun("t1", "a", "ESCALATION possible"), "ESCALATION possible")
+	mustInsert(t, path, sampleRun("t2", "b", "escape hatch"), "escape hatch")
+	mustInsert(t, path, sampleRun("t3", "c", "SSH Admin login"), "SSH Admin login")
+	db, _ := openDBAt(path)
+	defer db.Close()
+
+	cases := []struct {
+		q    string
+		want int
+	}{
+		{"ESC*", 1},            // uppercase: case-sensitive prefix
+		{"esc*", 2},            // lowercase: any case
+		{"(SSH AND Admin)", 1}, // grouping
+		{"ssh OR escape", 2},   // pure OR
+		{"hatch possible", 2},  // AND finds nothing → OR fallback
+		{"nomatch", 0},
+	}
+	for _, c := range cases {
+		runs, err := queryRuns(db, c.q)
+		if err != nil {
+			t.Fatalf("%q: %v", c.q, err)
+		}
+		if len(runs) != c.want {
+			t.Errorf("queryRuns(%q) = %d runs, want %d", c.q, len(runs), c.want)
+		}
+	}
+}
+
+// Highlighting looks for the words of the query: quotes, parens and the
+// prefix star are stripped, operators and filters are not highlighted, and
+// case folding covers Turkish (İ/I/ı) with byte offsets kept intact.
+func TestHighlightQuotedAndTurkish(t *testing.T) {
+	in := []byte("error: \"443/tcp\" open, ESCALATION\n")
+	got := string(highlight(in, strings.Fields(`"443/tcp" OR (ESC* host:kali`)))
+	if !strings.Contains(got, "\x1b[7m443/tcp\x1b[27m") || !strings.Contains(got, "\x1b[7mESC\x1b[27mALATION") {
+		t.Errorf("quoted/prefix terms not highlighted: %q", got)
+	}
+	if strings.Contains(got, "err\x1b[7mor") || strings.Contains(got, "kali") {
+		t.Errorf("operator or filter highlighted: %q", got)
+	}
+
+	tr := []byte("İSTANBUL ofisi, IŞIK açık\n")
+	got = string(highlight(tr, []string{"istanbul", "ışık"}))
+	if want := "\x1b[7mİSTANBUL\x1b[27m ofisi, \x1b[7mIŞIK\x1b[27m açık\n"; got != want {
+		t.Errorf("turkish highlight = %q, want %q", got, want)
+	}
+	if n := firstMatchLine([]byte("satır\nŞİRKET ağı\n"), []string{"şirket"}); n != 1 {
+		t.Errorf("firstMatchLine(şirket) = %d, want 1", n)
+	}
+	if l := matchLine("a\nİzmir sunucusu\n", needles([]string{"izmir"})); l != "İzmir sunucusu" {
+		t.Errorf("matchLine(izmir) = %q", l)
+	}
+}
+
+// Pre-v4 NUL-delimited tombstone keys are converted, not dropped, so the
+// deletes they record still apply; truncated 1-byte keys are removed.
+func TestMigrationConvertsLegacyTombstones(t *testing.T) {
+	path := testDB(t)
+	db, err := openDBAt(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := []string{"m\x00abc123", "r\x00kali\x001700000000\x00nmap\x00nmap -sV", "m", "m\x00dup", "m:dup"}
+	for _, k := range legacy {
+		if _, err := db.Exec(`INSERT INTO tombstones(key, ts) VALUES(?, 0)`, k); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db.Exec(`PRAGMA user_version=3`) //nolint
+	db.Close()
+
+	db, err = openDBAt(path) // migrates
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var keys []string
+	rows, err := db.Query(`SELECT key FROM tombstones ORDER BY key`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var k string
+		rows.Scan(&k) //nolint
+		keys = append(keys, k)
+	}
+	rows.Close()
+	want := []string{"m:abc123", "m:dup", runKey("kali", 1700000000, "nmap", "nmap -sV")}
+	if strings.Join(keys, "|") != strings.Join(want, "|") {
+		t.Errorf("tombstones after migration = %q, want %q", keys, want)
+	}
+}
+
+// dir: matches whole path components and LIKE wildcards in filters are literal.
+func TestDirCondAndLikeEscaping(t *testing.T) {
+	path := testDB(t)
+	for _, c := range []struct{ host, cwd string }{
+		{"kali", "/Users/x/eng"}, {"kali", "/tmp/us"}, {"kali", "/opt/a_b"},
+		{"kali", "/opt/axb"}, {"kali", "/opt/50%"}, {"k_li", "/opt/5000"},
+	} {
+		r := sampleRun("ls", "ls "+c.cwd, "")
+		r.Hostname, r.Cwd = c.host, c.cwd
+		mustInsert(t, path, r, "")
+	}
+	db, err := openDBAt(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for q, want := range map[string]int{
+		"dir:/":          6,
+		"dir:us":         1, // not /Users
+		"dir:/Users":     1,
+		"dir:/Users/":    1,
+		"dir:x/eng":      1,
+		"dir:a_b":        1, // not axb
+		"dir:50%":        1, // not 5000
+		"dir:/opt":       4,
+		"host:k_li":      1, // not kali
+		"host:k%":        0,
+		"dir:/opt/a_b/c": 0,
+	} {
+		runs, err := queryRuns(db, q)
+		if err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		if len(runs) != want {
+			t.Errorf("%-16q → %d runs, want %d", q, len(runs), want)
+		}
 	}
 }

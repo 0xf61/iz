@@ -66,7 +66,7 @@ Notes are unique by <namespace:title>. Writing to an existing <namespace:title> 
 ## 4. Viewing Historical Terminal Outputs
 
   iz sh <run_id>                  # View full colored output of a previous run
-  iz sh <run_id> "<search_term>"  # Highlight matching terms in the output
+  iz sh <run_id> -- "<search_term>"  # Highlight matching terms in the output
 
 ---
 

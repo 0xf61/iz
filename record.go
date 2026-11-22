@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -13,14 +15,18 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/creack/pty"
+	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 )
 
-// runRecord runs the command inside a PTY. Output is mirrored to the user's
-// terminal (colors and all) while being collected into a buffer. The child's
-// exit code is returned unchanged so the shell's $status stays correct.
+// runRecord runs the command and records its output. Output is mirrored to
+// the user's terminal (colors and all) while being collected into a bounded
+// buffer. The child's exit code is returned unchanged so the shell's $status
+// stays correct; a command that cannot be started returns 127 (not found) or
+// 126 (not executable) and records nothing.
 func runRecord(args []string) int {
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, "usage: iz -- <cmd> [args...]")
@@ -38,38 +44,56 @@ func runRecord(args []string) int {
 	if filepath.Base(args[0]) == "iz" {
 		return passthrough(args)
 	}
+	if _, err := exec.LookPath(args[0]); err != nil {
+		fmt.Fprintln(os.Stderr, "iz:", err)
+		return startFailure(err)
+	}
 
+	// A broken database must never break the wrapped tool: run it unrecorded.
 	db, err := openDB()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "iz:", err)
-		return 2
+		fmt.Fprintln(os.Stderr, "[iz] not recording:", err)
+		return passthrough(args)
 	}
 	defer db.Close()
 
-	// Use PTY only when both stdin and stdout are terminals; otherwise run in
-	// pipe mode so piped commands (e.g. `cat urls | httpx` or `cmd | grep`)
-	// receive EOF cleanly and don't get ANSI/CRLF injected into pipelines.
-	if !isTTY() {
-		return runPipeRecord(db, args)
+	// PTY only when stdin and stdout are terminals and we are the terminal's
+	// foreground job. Otherwise pipe mode: piped commands (`cat urls | httpx`,
+	// `cmd | grep`) get EOF cleanly and no ANSI/CRLF injected into pipelines,
+	// and a background job (`iz -- x &`) is not stopped by SIGTTOU when it
+	// would switch the terminal to raw mode.
+	if isTTY() && foreground() {
+		return runPTYRecord(db, args)
 	}
+	return runPipeRecord(db, args)
+}
 
+// runPTYRecord runs the command inside a PTY so it sees a terminal (colors,
+// progress bars, interactive prompts).
+func runPTYRecord(db *sql.DB, args []string) int {
 	cmd := exec.Command(args[0], args[1:]...)
 	// CLICOLOR/CLICOLOR_FORCE: keep BSD ls (macOS) colored even when a fish
 	// alias is bypassed; GNU ls is colored automatically inside a PTY.
 	cmd.Env = append(os.Environ(), "CLICOLOR=1", "CLICOLOR_FORCE=1")
+	// `cmd 2>file`: keep the redirect (pty.Start only fills nil streams), so
+	// stderr goes to the file instead of being merged into the PTY output.
+	if !term.IsTerminal(int(os.Stderr.Fd())) {
+		cmd.Stderr = os.Stderr
+	}
 	start := time.Now()
 
 	// Start with the current terminal size: fast tools (fastfetch!) would
 	// otherwise render against the default 80x24 before the resize poller runs.
 	var ptmx *os.File
-	if ws, err := pty.GetsizeFull(os.Stdin); err == nil {
+	var err error
+	if ws, sizeErr := pty.GetsizeFull(os.Stdin); sizeErr == nil {
 		ptmx, err = pty.StartWithSize(cmd, ws)
 	} else {
 		ptmx, err = pty.Start(cmd) // child sees isatty(stdout) = true → colors
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "iz:", err)
-		return 2
+		return startFailure(err)
 	}
 	defer ptmx.Close()
 
@@ -88,119 +112,106 @@ func runRecord(args []string) int {
 	}
 	defer restoreTerm()
 
-	// Forward terminal resizes and external SIGINT/SIGTERM to the child PTY.
+	// Forward terminal resizes and external signals to the child PTY (the
+	// child leads its own session, so its whole process group is signaled).
 	winch := make(chan os.Signal, 1)
 	signal.Notify(winch, syscall.SIGWINCH)
-	defer signal.Stop(winch)
+	resized := make(chan struct{})
 	go func() {
+		defer close(resized)
 		for range winch {
 			pty.InheritSize(os.Stdin, ptmx) //nolint
 		}
 	}()
+	defer forwardSignals(cmd.Process, true, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)()
 
-	sigCh := make(chan os.Signal, 2)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(sigCh)
+	stopStdin, stdinDone := forwardStdin(ptmx)
+
+	// PTY → buffer + screen (buffer first: it never fails, the screen may)
+	capture := newCapture()
+	drained := make(chan struct{})
 	go func() {
-		for sig := range sigCh {
-			if cmd.Process != nil {
-				if s, ok := sig.(syscall.Signal); ok {
-					_ = syscall.Kill(-cmd.Process.Pid, s)
-				} else {
-					_ = cmd.Process.Signal(sig)
-				}
-			}
-		}
+		io.Copy(io.MultiWriter(capture, os.Stdout), ptmx) //nolint
+		close(drained)
 	}()
-
-	// stdin → PTY
-	go func() { io.Copy(ptmx, os.Stdin) }() //nolint
-
-	// PTY → screen + buffer
-	var buf bytes.Buffer
-	io.Copy(io.MultiWriter(os.Stdout, &buf), ptmx) //nolint
-	cmd.Wait()                                     //nolint
+	waitErr := cmd.Wait()
+	// The child is gone. Stop reading stdin, so typeahead stays with the
+	// shell, and give the remaining output a moment to drain: a daemonized
+	// grandchild still holding the PTY slave would otherwise block us forever.
+	// Nothing here waits unbounded: the stdin forwarder may be stuck writing
+	// to a full PTY nobody reads, so it is only waited for briefly, after the
+	// PTY is closed (which fails its next write).
+	stopStdin()
+	signal.Stop(winch) // no more sends after Stop: safe to close
+	close(winch)
+	<-resized
+	select {
+	case <-drained:
+	case <-time.After(drainTimeout):
+	}
+	ptmx.Close()
+	select {
+	case <-stdinDone:
+	case <-time.After(drainTimeout):
+	}
 	restoreTerm()
 
-	raw := tidyRaw(buf.Bytes())
-	z := gz(raw)
-	r := Run{
-		Ts:       float64(start.UnixNano()) / 1e9,
-		Hostname: hostname(),
-		Tool:     filepath.Base(args[0]),
-		Cmd:      joinArgs(args),
-		Cwd:      cwd(),
-		Dur:      ni(int64(time.Since(start) / time.Millisecond)),
-		Size:     ni(int64(len(z))),
-	}
-	if cmd.ProcessState != nil {
-		if ws, ok := cmd.ProcessState.Sys().(syscall.WaitStatus); ok {
-			if ws.Signaled() {
-				r.ExitCode = ni(int64(128 + int(ws.Signal())))
-			} else {
-				r.ExitCode = ni(int64(ws.ExitStatus()))
-			}
-		}
-	}
-	exit := 0
-	if r.ExitCode.Valid {
-		exit = int(r.ExitCode.Int64)
-	}
-
-	id, dbErr := insertRun(db, r, z, truncFTS(stripANSI(raw)))
-	if dbErr != nil {
-		fmt.Fprintf(os.Stderr, "[iz] RECORD FAILED: %v\n", dbErr)
-		return exit
-	}
-	fmt.Fprintf(os.Stderr, "[iz] #%d saved · exit=%d · %.1fs · %s\n",
-		id, exit, time.Since(start).Seconds(), humanBytes(int64(r.Size.Int64)))
-	return exit
+	return saveRun(db, args, start, capture.Bytes(), exitStatus(waitErr, cmd.ProcessState))
 }
 
-// runPipeRecord runs the command without a PTY when stdin or stdout is piped,
-// mirroring stdout/stderr cleanly while recording the combined output.
+// drainTimeout bounds how long output is still collected after the child
+// exits (only a lingering grandchild can make it matter).
+const drainTimeout = 500 * time.Millisecond
+
+// runPipeRecord runs the command without a PTY when stdin or stdout is piped
+// (or iz runs in the background), mirroring stdout/stderr cleanly while
+// recording the combined output.
 func runPipeRecord(db *sql.DB, args []string) int {
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Stdin = os.Stdin
 	start := time.Now()
 
-	var mu sync.Mutex
-	var buf bytes.Buffer
-	syncWrite := func(w io.Writer, p []byte) (int, error) {
-		mu.Lock()
-		buf.Write(p)
-		mu.Unlock()
-		return w.Write(p)
+	// The capture comes first: it never fails, while a write to a closed
+	// stdout (`iz -- cmd | head`) stops the copy, and the chunk is kept.
+	capture := newCapture()
+	cmd.Stdout = io.MultiWriter(capture, os.Stdout)
+	cmd.Stderr = io.MultiWriter(capture, os.Stderr)
+	// Output goes through pipes; a daemonized grandchild keeping them open
+	// must not make Wait block after the child itself has exited.
+	cmd.WaitDelay = drainTimeout
+
+	// Signals iz must survive without acting on them, caught (not ignored)
+	// so the child still starts with default dispositions:
+	//   - SIGPIPE: a closed downstream pipe must not kill iz before the run
+	//     is saved (Go dies on EPIPE to fd 1/2 unless SIGPIPE is handled);
+	//   - SIGINT/SIGQUIT in the foreground: the child shares our process group
+	//     and gets the terminal's signal itself; relaying it would deliver
+	//     Ctrl-C twice (many scanners treat a second one as "abort now").
+	// Without a controlling terminal, iz relays SIGINT/SIGQUIT instead.
+	swallow := []os.Signal{syscall.SIGPIPE}
+	relay := []os.Signal{syscall.SIGTERM, syscall.SIGHUP}
+	if foreground() {
+		swallow = append(swallow, syscall.SIGINT, syscall.SIGQUIT)
+	} else {
+		relay = append(relay, syscall.SIGINT, syscall.SIGQUIT)
 	}
-	cmd.Stdout = writerFunc(func(p []byte) (int, error) { return syncWrite(os.Stdout, p) })
-	cmd.Stderr = writerFunc(func(p []byte) (int, error) { return syncWrite(os.Stderr, p) })
+	quiet := make(chan os.Signal, 1)
+	signal.Notify(quiet, swallow...)
+	defer signal.Stop(quiet)
 
-	sigCh := make(chan os.Signal, 2)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(sigCh)
-	go func() {
-		for sig := range sigCh {
-			if cmd.Process != nil {
-				_ = cmd.Process.Signal(sig)
-			}
-		}
-	}()
-
-	exit := 0
-	if err := cmd.Run(); err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
-			if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
-				exit = 128 + int(ws.Signal())
-			} else {
-				exit = ee.ExitCode()
-			}
-		} else {
-			fmt.Fprintln(os.Stderr, "iz:", err)
-			return 2
-		}
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintln(os.Stderr, "iz:", err)
+		return startFailure(err)
 	}
+	defer forwardSignals(cmd.Process, false, relay...)()
 
-	raw := tidyRaw(buf.Bytes())
+	waitErr := cmd.Wait()
+	return saveRun(db, args, start, capture.Bytes(), exitStatus(waitErr, cmd.ProcessState))
+}
+
+// saveRun stores a finished run and reports it on stderr; it returns exit.
+func saveRun(db *sql.DB, args []string, start time.Time, out []byte, exit int) int {
+	raw := tidyRaw(out)
 	z := gz(raw)
 	r := Run{
 		Ts:       float64(start.UnixNano()) / 1e9,
@@ -212,32 +223,211 @@ func runPipeRecord(db *sql.DB, args []string) int {
 		Dur:      ni(int64(time.Since(start) / time.Millisecond)),
 		Size:     ni(int64(len(z))),
 	}
-	id, dbErr := insertRun(db, r, z, truncFTS(stripANSI(raw)))
-	if dbErr != nil {
-		fmt.Fprintf(os.Stderr, "[iz] RECORD FAILED: %v\n", dbErr)
+	id, err := insertRun(db, r, z, truncFTS(stripANSI(raw)))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[iz] RECORD FAILED: %v\n", err)
 		return exit
 	}
 	fmt.Fprintf(os.Stderr, "[iz] #%d saved · exit=%d · %.1fs · %s\n",
-		id, exit, time.Since(start).Seconds(), humanBytes(int64(r.Size.Int64)))
+		id, exit, time.Since(start).Seconds(), humanBytes(r.Size.Int64))
 	return exit
 }
 
-type writerFunc func([]byte) (int, error)
+// exitStatus maps a finished child to a shell-style exit code: its status,
+// or 128+N when it was killed by signal N.
+func exitStatus(waitErr error, ps *os.ProcessState) int {
+	if ps == nil {
+		if waitErr != nil {
+			return 1
+		}
+		return 0
+	}
+	if ws, ok := ps.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+		return 128 + int(ws.Signal())
+	}
+	return ps.ExitCode()
+}
 
-func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
+// startFailure is the shell's exit code for a command that could not start.
+func startFailure(err error) int {
+	if errors.Is(err, exec.ErrNotFound) || errors.Is(err, fs.ErrNotExist) {
+		return 127
+	}
+	return 126
+}
+
+// forwardSignals relays sigs to the started child p — to its whole process
+// group when it leads one — until the returned stop function is called.
+func forwardSignals(p *os.Process, group bool, sigs ...os.Signal) (stop func()) {
+	ch := make(chan os.Signal, 4)
+	signal.Notify(ch, sigs...)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for sig := range ch {
+			if s, ok := sig.(syscall.Signal); ok && group {
+				_ = syscall.Kill(-p.Pid, s)
+			} else {
+				_ = p.Signal(sig)
+			}
+		}
+	}()
+	return func() {
+		signal.Stop(ch)
+		close(ch)
+		<-done
+	}
+}
+
+// foreground reports whether iz runs in the foreground process group of its
+// controlling terminal (false without one).
+func foreground() bool {
+	for _, fd := range []int{0, 1, 2} {
+		if term.IsTerminal(fd) {
+			pg, err := unix.IoctlGetInt(fd, unix.TIOCGPGRP)
+			return err == nil && pg == unix.Getpgrp()
+		}
+	}
+	return false
+}
+
+// forwardStdin copies stdin to dst until stop is called; done is closed once
+// the copier has exited. It waits for input with select(2) (poll(2) does not
+// support ttys on macOS) and reads only what is already there, so keystrokes
+// typed after the command exits stay in the terminal for the shell instead
+// of being eaten by a read left blocking on stdin. stop never blocks: the
+// copier may be stuck writing to dst.
+func forwardStdin(dst io.Writer) (stop func(), done <-chan struct{}) {
+	in := int(os.Stdin.Fd())
+	exited := make(chan struct{})
+	r, w, err := os.Pipe()
+	if err != nil || in >= unix.FD_SETSIZE || int(r.Fd()) >= unix.FD_SETSIZE {
+		if err == nil {
+			r.Close()
+			w.Close()
+		}
+		go io.Copy(dst, os.Stdin) //nolint — best effort
+		close(exited)
+		return func() {}, exited
+	}
+	cancel := int(r.Fd())
+	go func() {
+		defer close(exited)
+		defer r.Close() // only once select(2) no longer watches it
+		buf := make([]byte, 32<<10)
+		for {
+			var set unix.FdSet
+			set.Set(in)
+			set.Set(cancel)
+			if _, err := unix.Select(max(in, cancel)+1, &set, nil, nil, nil); err != nil {
+				if err == unix.EINTR {
+					continue
+				}
+				return
+			}
+			if set.IsSet(cancel) {
+				return
+			}
+			n, err := unix.Read(in, buf)
+			if n > 0 {
+				if _, werr := dst.Write(buf[:n]); werr != nil {
+					return
+				}
+			}
+			if n == 0 || err != nil && err != unix.EINTR && err != unix.EAGAIN {
+				return // EOF or a real error
+			}
+		}
+	}()
+	return func() { w.Close() }, exited
+}
+
+// Captured output is bounded so a tool running for hours (tshark, responder)
+// cannot exhaust memory: the first captureHead bytes and the last captureTail
+// bytes are kept, with a marker in between saying how much was dropped.
+const (
+	maxCapture  = 32 << 20
+	captureTail = 4 << 20
+	captureHead = maxCapture - 2*captureTail // tail buffer peaks at 2×captureTail
+)
+
+// capture is a concurrency-safe, bounded io.Writer.
+type capture struct {
+	mu         sync.Mutex
+	head, tail []byte
+	total      int64
+}
+
+func newCapture() *capture { return &capture{} }
+
+func (c *capture) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := len(p)
+	c.total += int64(n)
+	if room := captureHead - len(c.head); room > 0 {
+		k := min(room, len(p))
+		c.head, p = append(c.head, p[:k]...), p[k:]
+	}
+	if len(p) > 0 {
+		c.tail = append(c.tail, p...)
+		if len(c.tail) > 2*captureTail { // amortized: trim back to captureTail
+			c.tail = append(c.tail[:0:0], c.tail[len(c.tail)-captureTail:]...)
+		}
+	}
+	return n, nil
+}
+
+// Bytes returns the captured output; when some was dropped, a marker line
+// replaces the gap: the head ends and the tail starts at a full line (so no
+// UTF-8 sequence or escape is cut), and colors are reset before the marker.
+func (c *capture) Bytes() []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	head, tail := c.head, c.tail[max(0, len(c.tail)-captureTail):]
+	dropped := c.total - int64(len(head)) - int64(len(tail))
+	if dropped == 0 {
+		return append(append([]byte{}, head...), tail...)
+	}
+	if i := bytes.LastIndexByte(head, '\n'); i >= 0 {
+		head = head[:i+1]
+	} else { // one huge line: at least end on a whole character
+		head = head[:len(head)-partialRune(head)]
+	}
+	if i := bytes.IndexByte(tail, '\n'); i >= 0 {
+		tail = tail[i+1:]
+	}
+	dropped = c.total - int64(len(head)) - int64(len(tail))
+	out := append([]byte{}, head...)
+	if len(head) > 0 && head[len(head)-1] != '\n' {
+		out = append(out, '\n')
+	}
+	out = fmt.Appendf(out, "\x1b[0m[iz] output truncated: %s not recorded\n", humanBytes(dropped))
+	return append(out, tail...)
+}
+
+// partialRune is the length of an incomplete UTF-8 sequence ending b.
+func partialRune(b []byte) int {
+	for k := 1; k <= min(utf8.UTFMax, len(b)); k++ {
+		if utf8.RuneStart(b[len(b)-k]) {
+			if utf8.FullRune(b[len(b)-k:]) {
+				return 0
+			}
+			return k
+		}
+	}
+	return 0
+}
 
 // passthrough runs the command directly, no PTY or recording.
 func passthrough(args []string) int {
 	c := exec.Command(args[0], args[1:]...)
 	c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
-	if err := c.Run(); err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
-			return ee.ExitCode()
-		}
+	if err := c.Start(); err != nil {
 		fmt.Fprintln(os.Stderr, "iz:", err)
-		return 2
+		return startFailure(err)
 	}
-	return 0
+	return exitStatus(c.Wait(), c.ProcessState)
 }
 
 // joinArgs renders args as a single shell-syntax command line.

@@ -1,9 +1,13 @@
 package main
 
 import (
+	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -172,5 +176,236 @@ func TestImportMarkdownCodeBlocksAndInlineSection(t *testing.T) {
 	}
 	if len(res) != 2 {
 		t.Fatalf("expected 2 sections (Setup + Second Section), got %d: %+v", len(res), res)
+	}
+}
+
+// noteByTarget loads a note by "ns:title" (fails the test when missing).
+func noteByTarget(t *testing.T, path, target string) Memory {
+	t.Helper()
+	db, err := openDBAt(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	id, err := resolveMemoryID(db, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := getMemory(db, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+// Flags after the content used to be saved as content ("foo -a").
+func TestNoteCmdTrailingFlags(t *testing.T) {
+	path := testDB(t)
+	t.Setenv("IZ", path)
+
+	steps := []struct {
+		args []string
+		code int
+	}{
+		{[]string{"x:y", "first"}, 0},
+		{[]string{"x:y", "second", "-a"}, 0},                    // trailing append
+		{[]string{"x:y", "third", "--append", "-t", "a, b"}, 0}, // trailing tags + append
+		{[]string{"x:y", "-t"}, 2},                              // -t without a value
+		{[]string{"x:z", "--", "-a", "-t", "x"}, 0},             // after --: content
+	}
+	for _, s := range steps {
+		if code := noteCmd(s.args); code != s.code {
+			t.Fatalf("noteCmd(%q) exit=%d, want %d", s.args, code, s.code)
+		}
+	}
+	m := noteByTarget(t, path, "x:y")
+	if m.Content != "first\nsecond\nthird" || m.Tags != "a,b" {
+		t.Errorf("x:y = %q tags %q", m.Content, m.Tags)
+	}
+	if m := noteByTarget(t, path, "x:z"); m.Content != "-a -t x" || m.Tags != "" {
+		t.Errorf("x:z = %q tags %q", m.Content, m.Tags)
+	}
+}
+
+// Concurrent writers (separate connections, like separate iz processes) all
+// succeed: read-then-write transactions take the write lock at BEGIN instead
+// of failing with SQLITE_BUSY on upgrade.
+func TestConcurrentUpsertMemory(t *testing.T) {
+	path := testDB(t)
+	const n = 10
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			db, err := openDBAt(path)
+			if err != nil {
+				errs <- err
+				return
+			}
+			defer db.Close()
+			m := Memory{Namespace: "race", Title: "same", Content: fmt.Sprintf("line %d", i)}
+			if _, _, err := upsertMemory(db, m, true); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Errorf("concurrent upsert: %v", err)
+	}
+	m := noteByTarget(t, path, "race:same")
+	if got := len(strings.Split(m.Content, "\n")); got != n {
+		t.Errorf("appended lines = %d, want %d: %q", got, n, m.Content)
+	}
+	db, _ := openDBAt(path)
+	defer db.Close()
+	var rows int
+	db.QueryRow(`SELECT count(*) FROM memories`).Scan(&rows) //nolint
+	if rows != 1 {
+		t.Errorf("notes = %d, want 1", rows)
+	}
+}
+
+// Namespaces from subdirectories ("projeler/aktif") and titles with colons
+// stay addressable, and an editor round trip keeps them unchanged.
+func TestImportSubdirNamespaceAddressable(t *testing.T) {
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "projeler")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "aktif.md"), []byte("# Faz 1: Setup\nkurulum\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	path := testDB(t)
+	t.Setenv("IZ", path)
+	if code := importNotes(dir); code != 0 {
+		t.Fatalf("import exit=%d", code)
+	}
+
+	const target = "projeler/aktif:Faz 1: Setup"
+	m := noteByTarget(t, path, target)
+	if m.Namespace != "projeler/aktif" || m.Title != "Faz 1: Setup" {
+		t.Fatalf("imported as %q:%q", m.Namespace, m.Title)
+	}
+	for _, args := range [][]string{{"show", target}, {target, "-a", "yeni satır"}} {
+		if code := noteCmd(args); code != 0 {
+			t.Errorf("noteCmd(%q) exit=%d", args, code)
+		}
+	}
+	if m := noteByTarget(t, path, target); m.Content != "kurulum\nyeni satır" {
+		t.Errorf("content after append = %q", m.Content)
+	}
+	// $EDITOR round trip: the header must parse back to the same note
+	ns, title, _, body, ok := parseNoteDoc(noteDoc(m))
+	if !ok || ns != m.Namespace || title != m.Title || body != m.Content {
+		t.Errorf("noteDoc round trip = %q %q %q", ns, title, body)
+	}
+	if ns, title := parseTarget("machines/kali"); ns != "machines" || title != "kali" {
+		t.Errorf("parseTarget(machines/kali) = %q %q", ns, title)
+	}
+	if ns, title := parseTarget(":bare [x]"); ns != "notes" || title != "bare [x]" {
+		t.Errorf("parseTarget(:bare [x]) = %q %q", ns, title)
+	}
+}
+
+// Repeated headings become numbered notes; fences of either kind (nested
+// too) never split; "§" splits only at marker lines; re-import updates.
+func TestImportDuplicateHeadingsAndFences(t *testing.T) {
+	md := strings.Join([]string{
+		"## Tekrar", "bir",
+		"## Tekrar", "iki",
+		"~~~", "```", "## not a heading", "```", "## still code", "~~~",
+		"§1.2 is a reference, not a marker",
+		"## Son", "son",
+	}, "\n")
+	dir := t.TempDir()
+	file := filepath.Join(dir, "doc.md")
+	if err := os.WriteFile(file, []byte(md), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	path := testDB(t)
+	t.Setenv("IZ", path)
+	for range 2 { // the second import must update, not duplicate
+		if code := importNotes(file); code != 0 {
+			t.Fatalf("import exit=%d", code)
+		}
+	}
+	db, _ := openDBAt(path)
+	defer db.Close()
+	res, err := queryMemories(db, "ns:doc", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, m := range res {
+		got[m.Title] = m.Content
+	}
+	if len(got) != 3 || got["Tekrar"] != "bir" || got["Son"] != "son" {
+		t.Fatalf("sections = %q", got)
+	}
+	if two := got["Tekrar (2)"]; !strings.HasPrefix(two, "iki\n~~~") ||
+		!strings.Contains(two, "## not a heading") || !strings.Contains(two, "## still code") ||
+		!strings.HasSuffix(two, "§1.2 is a reference, not a marker") {
+		t.Errorf("Tekrar (2) = %q", two)
+	}
+
+	// marker documents: a heading after "§" titles the section, plain text
+	// stays in the body
+	secs := splitMarkdown("§ İlk not\ngövde\n§\n## Başlık\ngövde 2\n", "def")
+	want := []mdSection{{"İlk not", "İlk not\ngövde"}, {"Başlık", "gövde 2"}}
+	if !slices.Equal(secs, want) {
+		t.Errorf("splitMarkdown(§) = %q, want %q", secs, want)
+	}
+}
+
+// Inline triple backticks do not open a code block (a backtick fence has no
+// backticks in its info string), and generated duplicate titles are unique.
+func TestImportInlineBackticksAndDuplicateTitles(t *testing.T) {
+	md := strings.Join([]string{
+		"## Run", "```nmap -sV``` first",
+		"## Foo", "one",
+		"## Foo (2)", "two",
+		"## Foo", "three",
+		"```bash", "## inside code", "```",
+	}, "\n")
+	file := filepath.Join(t.TempDir(), "doc.md")
+	if err := os.WriteFile(file, []byte(md), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	path := testDB(t)
+	t.Setenv("IZ", path)
+	if code := importNotes(file); code != 0 {
+		t.Fatalf("import exit=%d", code)
+	}
+	db, _ := openDBAt(path)
+	defer db.Close()
+	res, err := queryMemories(db, "ns:doc", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, m := range res {
+		got[m.Title] = m.Content
+	}
+	want := map[string]string{
+		"Run":     "```nmap -sV``` first",
+		"Foo":     "one",
+		"Foo (2)": "two",
+		"Foo (3)": "three\n```bash\n## inside code\n```",
+	}
+	if !maps.Equal(got, want) {
+		t.Errorf("sections = %q, want %q", got, want)
+	}
+
+	var f codeFence
+	for line, inside := range map[string]bool{"```inline``` text": false, "``` go": true} {
+		f = codeFence{}
+		if got := f.inside(line); got != inside {
+			t.Errorf("inside(%q) = %v, want %v", line, got, inside)
+		}
 	}
 }

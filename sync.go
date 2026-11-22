@@ -1,12 +1,17 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"maps"
+	"math"
 	"net/url"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"time"
 
@@ -20,6 +25,7 @@ import (
 //   - runs are immutable, identified by (hostname, ts, tool, cmd)
 //   - notes are identified by uid; the newer mtime wins (edits, renames)
 //   - tombstones travel first, so deletes propagate instead of being undone
+//   - notes travel before runs, so a failing (large) run never blocks them
 //
 // Only keys are read up front; output blobs are fetched for missing rows
 // only, and rows are written in multi-row chunks (few round trips per chunk).
@@ -28,16 +34,17 @@ import (
 // falling back to Atuin KV store if unset (e.g. across machines with atuin sync).
 func getSyncConfig() (remoteURL, authToken string) {
 	remoteURL = firstEnv("IZ_SYNC_URL", "IZ_URL", "TURSO_DATABASE_URL")
-	authToken = firstEnv("IZ_AUTH_TOKEN", "IZ_TOKEN", "TURSO_AUTH_TOKEN")
-
 	if remoteURL == "" {
 		remoteURL = atuinKVGet("IZ_SYNC_URL")
 	}
+	if remoteURL = strings.TrimSpace(remoteURL); remoteURL == "" {
+		return "", "" // no remote: a token lookup would only cost another atuin call
+	}
+	authToken = firstEnv("IZ_AUTH_TOKEN", "IZ_TOKEN", "TURSO_AUTH_TOKEN")
 	if authToken == "" {
 		authToken = atuinKVGet("IZ_AUTH_TOKEN")
 	}
-
-	return strings.TrimSpace(remoteURL), strings.TrimSpace(authToken)
+	return remoteURL, strings.TrimSpace(authToken)
 }
 
 func firstEnv(keys ...string) string {
@@ -76,23 +83,31 @@ func buildLibsqlURL(rawURL, token string) string {
 // LibSQL/Turso database: IZ_SYNC_URL (or TURSO_DATABASE_URL), IZ_AUTH_TOKEN,
 // optional IZ_SYNC_TIMEOUT (Go duration, default 5m).
 func syncCmd(args []string) int {
-	resetTombs := false
+	resetTombs, prune := false, false
 	for _, a := range args {
 		switch a {
 		case "-h", "--help":
 			fmt.Println(`iz sync — two-way sync with Turso / LibSQL
 
 Usage:
-  iz sync                     Sync runs, notes and deletes with remote
-  iz sync --reset-tombstones  Clear all tombstones on local and remote before syncing
+  iz sync                     Sync notes, runs and deletes with remote
+  iz sync --prune             Also report the expired tombstones (older than 30 days)
+                              pruned after a complete sync
+  iz sync --reset-tombstones  Clear ALL tombstones on local and remote before syncing
+                              (deleted rows still present elsewhere come back)
 
 Environment:
   IZ_SYNC_URL     Remote LibSQL URL (e.g. libsql://your-db.turso.io)
   IZ_AUTH_TOKEN   Auth token (falls back to atuin kv if unset)
   IZ_SYNC_TIMEOUT Sync timeout duration (default 5m)`)
 			return 0
-		case "--reset-tombstones", "--prune":
+		case "--reset-tombstones":
 			resetTombs = true
+		case "--prune":
+			prune = true
+		default:
+			fmt.Fprintf(os.Stderr, "iz sync: unknown argument %q (see 'iz sync --help')\n", a)
+			return 2
 		}
 	}
 
@@ -151,35 +166,66 @@ Environment:
 	}
 
 	up, down, err := syncPair(ctx, localDB, remoteDB)
+	status := "complete"
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "iz sync:", err)
+		status = "incomplete"
+	}
+	fmt.Fprintf(os.Stderr, "[iz] sync %s · notes: ↑%d ↓%d · runs: ↑%d ↓%d · deletes: ↑%d ↓%d\n",
+		status, up.notes, down.notes, up.runs, down.runs, up.dels, down.dels)
+	if prune {
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "[iz] expired tombstones kept: sync incomplete")
+		} else {
+			fmt.Fprintf(os.Stderr, "[iz] expired tombstones pruned · local %d · remote %d\n", down.pruned, up.pruned)
+		}
+	}
+	if err != nil {
 		return 1
 	}
-	fmt.Fprintf(os.Stderr, "[iz] sync complete · notes: ↑%d ↓%d · runs: ↑%d ↓%d · deletes: ↑%d ↓%d\n",
-		up.notes, down.notes, up.runs, down.runs, up.dels, down.dels)
 	return 0
 }
 
 // syncPair performs a single-pass bidirectional sync between local and remote.
+// Notes and runs are attempted independently, so either can fail alone.
+// Expired tombstones are pruned only after everything synced: a tombstone
+// dropped earlier would let the other side resurrect the row it deletes.
+// In the stats, up is what changed on remote, down what changed locally.
 func syncPair(ctx context.Context, local, remote *sql.DB) (up, down repStats, err error) {
-	tomb, upDels, downDels, err := syncTombstones(ctx, local, remote)
+	tomb, stale, upDels, downDels, err := syncTombstones(ctx, local, remote)
 	if err != nil {
 		return up, down, fmt.Errorf("tombstones: %w", err)
 	}
 	up.dels, down.dels = upDels, downDels
 
-	if up.runs, down.runs, err = syncRunsBidirectional(ctx, local, remote, tomb); err != nil {
-		return up, down, fmt.Errorf("runs: %w", err)
-	}
+	var errs []error
 	if up.notes, down.notes, err = syncMemoriesBidirectional(ctx, local, remote, tomb); err != nil {
-		return up, down, fmt.Errorf("notes: %w", err)
+		errs = append(errs, fmt.Errorf("notes: %w", err))
 	}
-	pruneTombstones(ctx, local, tombstoneTTL)  //nolint
-	pruneTombstones(ctx, remote, tombstoneTTL) //nolint
+	if up.runs, down.runs, err = syncRunsBidirectional(ctx, local, remote, tomb); err != nil {
+		errs = append(errs, fmt.Errorf("runs: %w", err))
+	}
+	if len(errs) > 0 {
+		return up, down, errors.Join(errs...)
+	}
+	for _, s := range []struct {
+		db     *sql.DB
+		stale  bool
+		pruned *int
+	}{{local, stale[0], &down.pruned}, {remote, stale[1], &up.pruned}} {
+		if !s.stale {
+			continue // nothing undated or expired: skip the write round trips
+		}
+		n, err := pruneTombstones(ctx, s.db, tombstoneTTL)
+		if err != nil {
+			return up, down, fmt.Errorf("prune tombstones: %w", err)
+		}
+		*s.pruned = int(n)
+	}
 	return up, down, nil
 }
 
-type repStats struct{ runs, skipped, notes, dels int }
+type repStats struct{ runs, skipped, notes, dels, pruned int }
 
 // replicate copies tombstones, runs and notes one-way from src into dst (used by iz merge).
 func replicate(ctx context.Context, src, dst *sql.DB) (st repStats, err error) {
@@ -188,73 +234,51 @@ func replicate(ctx context.Context, src, dst *sql.DB) (st repStats, err error) {
 		return st, fmt.Errorf("tombstones: %w", err)
 	}
 	st.dels = dels
-	if st.runs, st.skipped, err = copyRuns(ctx, src, dst, tomb); err != nil {
-		return st, fmt.Errorf("runs: %w", err)
-	}
 	if st.notes, err = copyMemories(ctx, src, dst, tomb); err != nil {
 		return st, fmt.Errorf("notes: %w", err)
+	}
+	if st.runs, st.skipped, err = copyRuns(ctx, src, dst, tomb); err != nil {
+		return st, fmt.Errorf("runs: %w", err)
 	}
 	return st, nil
 }
 
 const tombstoneTTL = 30 * 24 * time.Hour
 
-// syncTombstones reads tombstones once from each side and propagates differences
-// both ways. Expired tombstones are pruned at the end of syncPair.
-func syncTombstones(ctx context.Context, local, remote *sql.DB) (map[string]bool, int, int, error) {
-	localTombs := map[string]float64{}
-	if err := each(ctx, local, `SELECT key, ts FROM tombstones`, func(r *sql.Rows) error {
-		var k string
-		var ts float64
-		if err := r.Scan(&k, &ts); err != nil {
-			return err
+// syncTombstones reads tombstones once from each side and propagates
+// differences both ways. stale reports per side (local, remote) whether it
+// now holds undated or expired tombstones, i.e. whether pruning has work.
+func syncTombstones(ctx context.Context, local, remote *sql.DB) (union map[string]bool, stale [2]bool, up, down int, err error) {
+	var tombs [2]map[string]float64
+	for i, db := range []*sql.DB{local, remote} {
+		if tombs[i], err = readTombs(ctx, db); err != nil {
+			return nil, stale, 0, 0, err
 		}
-		localTombs[k] = ts
-		return nil
-	}); err != nil {
-		return nil, 0, 0, err
 	}
-
-	remoteTombs := map[string]float64{}
-	if err := each(ctx, remote, `SELECT key, ts FROM tombstones`, func(r *sql.Rows) error {
-		var k string
-		var ts float64
-		if err := r.Scan(&k, &ts); err != nil {
-			return err
-		}
-		remoteTombs[k] = ts
-		return nil
-	}); err != nil {
-		return nil, 0, 0, err
-	}
-
-	var push, pull []any
-	union := make(map[string]bool, len(localTombs)+len(remoteTombs))
-	for k, ts := range localTombs {
-		union[k] = true
-		if _, ok := remoteTombs[k]; !ok {
-			if ts == 0 {
-				ts = now()
+	cutoff := float64(time.Now().Add(-tombstoneTTL).Unix())
+	union = make(map[string]bool, len(tombs[0])+len(tombs[1]))
+	var missing [2][]any // tombstones side i lacks
+	for i, own := range tombs {
+		other := tombs[1-i]
+		for k, ts := range own {
+			union[k] = true
+			stale[i] = stale[i] || ts < cutoff // includes undated (0)
+			if _, ok := other[k]; !ok {
+				if ts == 0 {
+					ts = now()
+				}
+				stale[1-i] = stale[1-i] || ts < cutoff
+				missing[1-i] = append(missing[1-i], k, ts)
 			}
-			push = append(push, k, ts)
 		}
 	}
-	for k, ts := range remoteTombs {
-		union[k] = true
-		if _, ok := localTombs[k]; !ok {
-			if ts == 0 {
-				ts = now()
-			}
-			pull = append(pull, k, ts)
-		}
+	if err := insertTombstonesBatch(ctx, remote, missing[1]); err != nil {
+		return nil, stale, 0, 0, err
 	}
-	if err := insertTombstonesBatch(ctx, remote, push); err != nil {
-		return nil, 0, 0, err
+	if err := insertTombstonesBatch(ctx, local, missing[0]); err != nil {
+		return nil, stale, 0, 0, err
 	}
-	if err := insertTombstonesBatch(ctx, local, pull); err != nil {
-		return nil, 0, 0, err
-	}
-	return union, len(push) / 2, len(pull) / 2, nil
+	return union, stale, len(missing[1]) / 2, len(missing[0]) / 2, nil
 }
 
 func insertTombstonesBatch(ctx context.Context, db *sql.DB, kts []any) error {
@@ -266,17 +290,34 @@ func insertTombstonesBatch(ctx context.Context, db *sql.DB, kts []any) error {
 	return nil
 }
 
+// readTombs reads a database's tombstones (key → deletion time), keys
+// normalized by tombKey.
+func readTombs(ctx context.Context, db *sql.DB) (map[string]float64, error) {
+	tombs := map[string]float64{}
+	err := each(ctx, db, `SELECT key, ts FROM tombstones`, func(r *sql.Rows) error {
+		var k string
+		var ts float64
+		if err := r.Scan(&k, &ts); err != nil {
+			return err
+		}
+		if k, ok := tombKey(k); ok {
+			tombs[k] = max(tombs[k], ts)
+		}
+		return nil
+	})
+	return tombs, err
+}
+
 // copyTombstones adds src's tombstones to dst and returns the union.
 func copyTombstones(ctx context.Context, src, dst *sql.DB) (map[string]bool, int, error) {
 	have := map[string]bool{}
 	var fresh []any
 	for i, db := range []*sql.DB{dst, src} {
-		err := each(ctx, db, `SELECT key, ts FROM tombstones`, func(r *sql.Rows) error {
-			var k string
-			var ts float64
-			if err := r.Scan(&k, &ts); err != nil {
-				return err
-			}
+		tombs, err := readTombs(ctx, db)
+		if err != nil {
+			return nil, 0, err
+		}
+		for k, ts := range tombs {
 			if i == 1 && !have[k] {
 				if ts == 0 {
 					ts = now()
@@ -284,10 +325,6 @@ func copyTombstones(ctx context.Context, src, dst *sql.DB) (map[string]bool, int
 				fresh = append(fresh, k, ts)
 			}
 			have[k] = true
-			return nil
-		})
-		if err != nil {
-			return nil, 0, err
 		}
 	}
 	if err := insertTombstonesBatch(ctx, dst, fresh); err != nil {
@@ -330,12 +367,11 @@ func syncRunsBidirectional(ctx context.Context, local, remote *sql.DB, tomb map[
 	if err != nil {
 		return 0, 0, err
 	}
-	if err := purgeChunked(ctx, local, "runs", "outputs_fts", localDead); err != nil {
-		return 0, 0, err
-	}
-	if err := purgeChunked(ctx, remote, "runs", "outputs_fts", remoteDead); err != nil {
-		return 0, 0, err
-	}
+	// Dead rows are left out of the transfers either way, so a failed purge
+	// does not stop them.
+	purgeErr := errors.Join(
+		purgeChunked(ctx, local, "runs", "outputs_fts", localDead),
+		purgeChunked(ctx, remote, "runs", "outputs_fts", remoteDead))
 
 	var wantPush, wantPull []any
 	for k, id := range localHave {
@@ -349,17 +385,19 @@ func syncRunsBidirectional(ctx context.Context, local, remote *sql.DB, tomb map[
 		}
 	}
 
-	if pushed, err = transferRuns(ctx, local, remote, wantPush); err != nil {
-		return pushed, pulled, err
-	}
-	if pulled, err = transferRuns(ctx, remote, local, wantPull); err != nil {
-		return pushed, pulled, err
-	}
-	return pushed, pulled, nil
+	// Both directions run even if one fails: a run the remote rejects must
+	// not keep the other machines' runs from arriving.
+	pushed, pushErr := transferRuns(ctx, local, remote, wantPush)
+	pulled, pullErr := transferRuns(ctx, remote, local, wantPull)
+	return pushed, pulled, errors.Join(purgeErr, pushErr, pullErr)
 }
 
+// transferRuns copies runs by id from src to dst in chunks. A chunk the
+// destination rejects (e.g. a request too large for the remote) is retried
+// row by row, so one oversized output does not block the others.
 func transferRuns(ctx context.Context, src, dst *sql.DB, ids []any) (int, error) {
 	added := 0
+	var failed []error
 	for c := range chunks(ids, runChunk) {
 		var rows, fts [][]any
 		err := each(ctx, src, `SELECT r.ts,r.hostname,r.tool,r.cmd,r.cwd,r.exit_code,r.duration_ms,r.size,r.raw,f.text
@@ -380,11 +418,30 @@ func transferRuns(ctx context.Context, src, dst *sql.DB, ids []any) (int, error)
 		if err != nil {
 			return added, err
 		}
-		if err := insertBatch(ctx, dst, "runs", "ts,hostname,tool,cmd,cwd,exit_code,duration_ms,size,raw",
-			"outputs_fts", "text", rows, fts); err != nil {
-			return added, err
+		insert := func(rows, fts [][]any) error {
+			return insertBatch(ctx, dst, "runs", "ts,hostname,tool,cmd,cwd,exit_code,duration_ms,size,raw",
+				"outputs_fts", "text", rows, fts)
 		}
-		added += len(rows)
+		if err := insert(rows, fts); err == nil {
+			added += len(rows)
+			continue
+		} else if len(rows) == 1 {
+			failed = append(failed, err)
+			continue
+		}
+		for i := range rows {
+			if ctx.Err() != nil { // canceled or timed out: no point retrying each row
+				return added, ctx.Err()
+			}
+			if err := insert(rows[i:i+1], fts[i:i+1]); err != nil {
+				failed = append(failed, err)
+			} else {
+				added++
+			}
+		}
+	}
+	if len(failed) > 0 {
+		return added, fmt.Errorf("%d run(s) not copied (first error: %w)", len(failed), failed[0])
 	}
 	return added, nil
 }
@@ -445,10 +502,31 @@ type memMeta struct {
 
 func nsKey(ns, title string) string { return ns + "\x00" + title }
 
-func readMemMeta(ctx context.Context, db *sql.DB, tomb map[string]bool) (byUID map[string]memMeta, byNS map[string]memMeta, dead []any, err error) {
-	byUID = map[string]memMeta{}
-	byNS = map[string]memMeta{}
-	err = each(ctx, db, `SELECT id,uid,max(mtime,ts),namespace,title FROM memories`, func(r *sql.Rows) error {
+// slot is the note's (namespace, title) key, unique per database.
+func (m memMeta) slot() string { return nsKey(m.ns, m.title) }
+
+// sameTime treats timestamps within 1e-5s as equal so JSON/HTTP float
+// round-tripping on remote databases (e.g. Turso losing a trailing digit)
+// cannot trigger endless re-uploads.
+func sameTime(a, b float64) bool { return math.Abs(a-b) <= 1e-5 }
+
+// newer orders notes for last-write-wins: later mtime, then smaller uid.
+func (m memMeta) newer(o memMeta) bool {
+	if !sameTime(m.mtime, o.mtime) {
+		return m.mtime > o.mtime
+	}
+	return m.uid < o.uid
+}
+
+// memSide indexes one database's live (not tombstoned) notes.
+type memSide struct {
+	byUID map[string]memMeta
+	byNS  map[string]memMeta
+}
+
+func readMemMeta(ctx context.Context, db *sql.DB, tomb map[string]bool) (side memSide, dead []any, err error) {
+	side = memSide{byUID: map[string]memMeta{}, byNS: map[string]memMeta{}}
+	err = each(ctx, db, `SELECT id,`+uidCol+`,max(mtime,ts),namespace,title FROM memories`, func(r *sql.Rows) error {
 		var m memMeta
 		if err := r.Scan(&m.id, &m.uid, &m.mtime, &m.ns, &m.title); err != nil {
 			return err
@@ -457,122 +535,217 @@ func readMemMeta(ctx context.Context, db *sql.DB, tomb map[string]bool) (byUID m
 			dead = append(dead, m.id)
 			return nil
 		}
-		byUID[m.uid] = m
-		byNS[nsKey(m.ns, m.title)] = m
+		side.byUID[m.uid] = m
+		side.byNS[m.slot()] = m
 		return nil
 	})
-	return byUID, byNS, dead, err
+	return side, dead, err
 }
 
-// syncMemoriesBidirectional fetches only metadata first, resolves tombstones and
-// (namespace, title) LWW conflicts, and transfers content only for changed/missing notes.
+// memNote is a note as both sides hold it after the merge.
+type memNote struct {
+	memMeta         // final slot and mtime; id is its row on side `from`
+	from    int     // side holding the winning content
+	ver     float64 // mtime of that content (before a conflict rename)
+}
+
+// memMerge is the outcome of merging two sides' notes.
+type memMerge struct {
+	sides    [2]memSide
+	notes    map[string]memNote    // uid → final note
+	replaced [2]map[string]memMeta // per side: surviving uid → the row it overwrites
+}
+
+// mergeMemories decides which notes both sides end with:
+//
+//  1. a note both sides know (uid) takes the newer copy — edits and renames;
+//  2. two notes on the same (namespace, title), each known to one side only,
+//     are the same note created on two machines (older syncs had no uids):
+//     the newer survives and overwrites the other's row;
+//  3. (namespace, title) stays unique: of notes wanting one slot the newer
+//     keeps it, the others are renamed "title (uid8)" with an mtime just past
+//     the winner's, so the rename wins the next sync everywhere.
+//
+// The result depends only on the union of both sides' notes — not on which
+// side is which — so every direction and machine reaches the same state.
+func mergeMemories(a, b memSide) memMerge {
+	g := memMerge{sides: [2]memSide{a, b}, notes: map[string]memNote{}}
+	for i, s := range g.sides {
+		for uid, m := range s.byUID {
+			n, ok := g.notes[uid]
+			eq := ok && sameTime(m.mtime, n.mtime)
+			if !ok || (!eq && m.mtime > n.mtime) || (eq && m.slot() < n.slot()) {
+				g.notes[uid] = memNote{m, i, m.mtime}
+			}
+		}
+	}
+	for i := range g.replaced {
+		g.replaced[i] = map[string]memMeta{}
+	}
+	for slot, x := range a.byNS {
+		y, ok := b.byNS[slot]
+		if !ok || x.uid == y.uid {
+			continue
+		}
+		if _, known := b.byUID[x.uid]; known {
+			continue
+		}
+		if _, known := a.byUID[y.uid]; known {
+			continue
+		}
+		win, lose, loser := x, y, 1
+		if y.newer(x) {
+			win, lose, loser = y, x, 0
+		}
+		delete(g.notes, lose.uid)
+		g.replaced[loser][win.uid] = lose
+	}
+
+	owner := map[string]memMeta{} // slot → note keeping it
+	var losers []memNote
+	for _, uid := range slices.Sorted(maps.Keys(g.notes)) {
+		n := g.notes[uid]
+		o, taken := owner[n.slot()]
+		switch {
+		case !taken:
+			owner[n.slot()] = n.memMeta
+		case n.newer(o):
+			owner[n.slot()] = n.memMeta
+			losers = append(losers, g.notes[o.uid])
+		default:
+			losers = append(losers, n)
+		}
+	}
+	slices.SortFunc(losers, func(x, y memNote) int { return cmp.Compare(x.uid, y.uid) })
+	for _, n := range losers {
+		win := owner[n.slot()]
+		n.title = conflictTitle(n.memMeta, owner)
+		n.mtime = max(win.mtime, n.mtime) + 0.001
+		owner[n.slot()] = n.memMeta
+		g.notes[n.uid] = n
+	}
+	return g
+}
+
+// conflictTitle is m's title made unique among owner's slots: "title (uid8)".
+func conflictTitle(m memMeta, owner map[string]memMeta) string {
+	base := m.title + " (" + m.uid[:min(8, len(m.uid))] + ")"
+	t := base
+	for n := 2; ; n++ {
+		if _, taken := owner[nsKey(m.ns, t)]; !taken {
+			return t
+		}
+		t = numbered(base, n)
+	}
+}
+
+// memPlan is what side dst writes to reach the merged notes.
+type memPlan struct {
+	ids     []any              // rows of the other side whose content dst needs
+	final   map[string]memMeta // uid → slot and mtime it ends with
+	targets map[string]memMeta // uid → dst row it overwrites (else: insert)
+	renames []memMeta          // dst rows keeping their content, moving slot (final values)
+}
+
+// plan lists what side dst must write.
+func (g memMerge) plan(dst int) memPlan {
+	p := memPlan{final: map[string]memMeta{}, targets: map[string]memMeta{}}
+	side := g.sides[dst]
+	for uid, n := range g.notes {
+		cur, has := side.byUID[uid]
+		if has && (cur.mtime >= n.ver || sameTime(cur.mtime, n.ver)) { // dst holds this content
+			if cur.slot() != n.slot() || !sameTime(cur.mtime, n.mtime) {
+				r := n.memMeta
+				r.id = cur.id
+				p.renames = append(p.renames, r)
+			}
+			continue
+		}
+		// the content comes from the other side (n.from != dst)
+		if !has {
+			cur, has = g.replaced[dst][uid]
+		}
+		if has {
+			p.targets[uid] = cur
+		}
+		p.ids = append(p.ids, n.id)
+		p.final[uid] = n.memMeta
+	}
+	return p
+}
+
+// syncMemoriesBidirectional fetches only metadata first, merges both sides
+// once, and transfers content only for changed/missing notes. Both
+// directions run even if one fails.
 func syncMemoriesBidirectional(ctx context.Context, local, remote *sql.DB, tomb map[string]bool) (pushed, pulled int, err error) {
-	lByUID, lByNS, lDead, err := readMemMeta(ctx, local, tomb)
+	l, lDead, err := readMemMeta(ctx, local, tomb)
 	if err != nil {
 		return 0, 0, err
 	}
-	rByUID, rByNS, rDead, err := readMemMeta(ctx, remote, tomb)
+	r, rDead, err := readMemMeta(ctx, remote, tomb)
 	if err != nil {
 		return 0, 0, err
 	}
+	// a dead row still holds its slot: no point writing around it
 	if err := purgeChunked(ctx, local, "memories", "memories_fts", lDead); err != nil {
 		return 0, 0, err
 	}
 	if err := purgeChunked(ctx, remote, "memories", "memories_fts", rDead); err != nil {
 		return 0, 0, err
 	}
-
-	var pushIDs, pullIDs []any
-	// Track update targets on dst when matched by uid or (namespace, title)
-	pushTargets := map[string]int64{} // src uid -> dst id
-	pullTargets := map[string]int64{} // src uid -> dst id
-	claimedRemote := map[int64]bool{}
-	claimedLocal := map[int64]bool{}
-
-	// Pass 1: match by UID first so renames claim their own remote row before
-	// another note with the old (namespace, title) can collide with it.
-	for uid, lm := range lByUID {
-		if rm, ok := rByUID[uid]; ok {
-			if lm.mtime > rm.mtime {
-				// Avoid UNIQUE(namespace, title) collision if a different UID owns target ns:title on remote
-				if rm2, occ := rByNS[nsKey(lm.ns, lm.title)]; occ && rm2.id != rm.id {
-					continue
-				}
-				claimedRemote[rm.id] = true
-				pushIDs = append(pushIDs, lm.id)
-				pushTargets[uid] = rm.id
-			}
-		}
-	}
-	for uid, lm := range lByUID {
-		if _, ok := rByUID[uid]; ok {
-			continue
-		}
-		if rm, ok := rByNS[nsKey(lm.ns, lm.title)]; ok && !claimedRemote[rm.id] {
-			claimedRemote[rm.id] = true
-			if lm.mtime >= rm.mtime {
-				pushIDs = append(pushIDs, lm.id)
-				pushTargets[uid] = rm.id
-			}
-			continue
-		}
-		pushIDs = append(pushIDs, lm.id)
-	}
-
-	for uid, rm := range rByUID {
-		if lm, ok := lByUID[uid]; ok {
-			if rm.mtime > lm.mtime {
-				if lm2, occ := lByNS[nsKey(rm.ns, rm.title)]; occ && lm2.id != lm.id {
-					continue
-				}
-				claimedLocal[lm.id] = true
-				pullIDs = append(pullIDs, rm.id)
-				pullTargets[uid] = lm.id
-			}
-		}
-	}
-	for uid, rm := range rByUID {
-		if _, ok := lByUID[uid]; ok {
-			continue
-		}
-		if lm, ok := lByNS[nsKey(rm.ns, rm.title)]; ok && !claimedLocal[lm.id] {
-			claimedLocal[lm.id] = true
-			if rm.mtime > lm.mtime {
-				pullIDs = append(pullIDs, rm.id)
-				pullTargets[uid] = lm.id
-			}
-			continue
-		}
-		pullIDs = append(pullIDs, rm.id)
-	}
-
-	if pushed, err = transferMemories(ctx, local, remote, pushIDs, pushTargets); err != nil {
-		return pushed, pulled, err
-	}
-	if pulled, err = transferMemories(ctx, remote, local, pullIDs, pullTargets); err != nil {
-		return pushed, pulled, err
-	}
-	return pushed, pulled, nil
+	g := mergeMemories(l, r)
+	pushed, pushErr := transferMemories(ctx, local, remote, g.plan(1))
+	pulled, pullErr := transferMemories(ctx, remote, local, g.plan(0))
+	return pushed, pulled, errors.Join(pushErr, pullErr)
 }
 
-func transferMemories(ctx context.Context, src, dst *sql.DB, ids []any, targets map[string]int64) (int, error) {
-	if len(ids) == 0 {
-		return 0, nil
+// copyMemories merges src's notes into dst (dst's half of the same merge).
+func copyMemories(ctx context.Context, src, dst *sql.DB, tomb map[string]bool) (int, error) {
+	if err := fixMemFTS(ctx, dst); err != nil {
+		return 0, err
 	}
-	var rows, fts [][]any
-	var upd []Memory
-	for c := range chunks(ids, 100) {
-		err := each(ctx, src, `SELECT uid,ts,max(mtime,ts),hostname,namespace,title,content,author,tags FROM memories WHERE id IN `+inList(len(c)), func(r *sql.Rows) error {
+	s, _, err := readMemMeta(ctx, src, tomb)
+	if err != nil {
+		return 0, err
+	}
+	d, dead, err := readMemMeta(ctx, dst, tomb)
+	if err != nil {
+		return 0, err
+	}
+	if err := purgeChunked(ctx, dst, "memories", "memories_fts", dead); err != nil {
+		return 0, err
+	}
+	return transferMemories(ctx, src, dst, mergeMemories(s, d).plan(1))
+}
+
+// memUpdateChunk bounds the rows one note UPDATE statement writes.
+const memUpdateChunk = 50
+
+// transferMemories fetches the planned notes from src and writes them to
+// dst in an order that never breaks UNIQUE(namespace, title): first, in one
+// transaction, every row changing slot (renames, moves) is parked on a
+// unique temporary title and then set to its final slot, so swaps and
+// rename chains work; then content-only updates; then inserts, whose slots
+// are free by now. Updates are multi-row statements, so round trips grow
+// with chunks, not notes. It returns how many notes it copied from src.
+func transferMemories(ctx context.Context, src, dst *sql.DB, p memPlan) (int, error) {
+	var moves, updates, rows, fts [][]any
+	for c := range chunks(p.ids, 100) {
+		err := each(ctx, src, `SELECT `+uidCol+`,ts,hostname,content,author,tags FROM memories WHERE id IN `+inList(len(c)), func(r *sql.Rows) error {
 			var m Memory
-			if err := r.Scan(&m.UID, &m.Ts, &m.Mtime, &m.Hostname, &m.Namespace, &m.Title, &m.Content, &m.Author, &m.Tags); err != nil {
+			if err := r.Scan(&m.UID, &m.Ts, &m.Hostname, &m.Content, &m.Author, &m.Tags); err != nil {
 				return err
 			}
-			if dstID, ok := targets[m.UID]; ok {
-				m.ID = dstID
-				upd = append(upd, m)
-			} else {
-				rows = append(rows, []any{m.UID, m.Ts, m.Mtime, m.Hostname, m.Namespace, m.Title, m.Content, m.Author, m.Tags})
-				fts = append(fts, []any{m.Title, m.Content, m.Namespace, m.Tags})
+			f := p.final[m.UID]
+			d, ok := p.targets[m.UID]
+			switch {
+			case !ok:
+				rows = append(rows, []any{m.UID, m.Ts, f.mtime, m.Hostname, f.ns, f.title, m.Content, m.Author, m.Tags})
+				fts = append(fts, []any{f.title, m.Content, f.ns, m.Tags})
+			case d.slot() == f.slot():
+				updates = append(updates, []any{d.id, m.UID, m.Hostname, f.ns, f.title, m.Content, m.Author, m.Tags, f.mtime})
+			default:
+				moves = append(moves, []any{d.id, m.UID, m.Hostname, f.ns, f.title, m.Content, m.Author, m.Tags, f.mtime})
 			}
 			return nil
 		}, c...)
@@ -581,113 +754,75 @@ func transferMemories(ctx context.Context, src, dst *sql.DB, ids []any, targets 
 		}
 	}
 
-	n := 0
-	// Apply updates/renames before inserts so renamed notes free their old
-	// (namespace, title) slot before new notes with that name are inserted.
-	if len(upd) > 0 {
-		tx, err := dst.BeginTx(ctx, nil)
-		if err != nil {
-			return n, err
+	full := []string{"uid", "hostname", "namespace", "title", "content", "author", "tags", "mtime"}
+	if len(p.renames)+len(moves) > 0 {
+		renames := make([][]any, len(p.renames))
+		for i, r := range p.renames {
+			// uid too: a pre-uid row's derived uid would change with its title
+			renames[i] = []any{r.id, r.uid, r.ns, r.title, r.mtime}
 		}
-		defer tx.Rollback() //nolint
-		for _, m := range upd {
-			if err := updateMemoryFullTx(tx, m); err != nil {
-				return n, err
+		parked := make([]any, 0, len(renames)+len(moves))
+		for _, r := range slices.Concat(renames, moves) {
+			parked = append(parked, r[0])
+		}
+		err := inTx(ctx, dst, func(tx *sql.Tx) error {
+			for c := range chunks(parked, 500) {
+				if _, err := tx.ExecContext(ctx, `UPDATE memories SET title = 'iz-park:' || id || ':' || coalesce(uid, '') WHERE id IN `+inList(len(c)), c...); err != nil {
+					return err
+				}
 			}
+			if err := setNotes(ctx, tx, []string{"uid", "namespace", "title", "mtime"}, renames); err != nil {
+				return err
+			}
+			return setNotes(ctx, tx, full, moves)
+		})
+		if err != nil {
+			return 0, err
 		}
-		if err := tx.Commit(); err != nil {
-			return n, err
-		}
-		n += len(upd)
 	}
-	for i := 0; i < len(rows); i += 100 {
-		j := min(i+100, len(rows))
-		if err := insertBatch(ctx, dst, "memories", "uid,ts,mtime,hostname,namespace,title,content,author,tags",
-			"memories_fts", "title,content,namespace,tags", rows[i:j], fts[i:j]); err != nil {
+	n := len(moves)
+	for c := range chunks(updates, memUpdateChunk) {
+		if err := inTx(ctx, dst, func(tx *sql.Tx) error { return setNotes(ctx, tx, full, c) }); err != nil {
 			return n, err
 		}
-		n += j - i
+		n += len(c)
+	}
+	for c := range chunks(rows, 100) {
+		if err := insertBatch(ctx, dst, "memories", "uid,ts,mtime,hostname,namespace,title,content,author,tags",
+			"memories_fts", "title,content,namespace,tags", c, fts[:len(c)]); err != nil {
+			return n, err
+		}
+		fts = fts[len(c):]
+		n += len(c)
 	}
 	return n, nil
 }
 
-func copyMemories(ctx context.Context, src, dst *sql.DB, tomb map[string]bool) (n int, err error) {
-	if err := fixMemFTS(ctx, dst); err != nil {
-		return 0, err
+// setNotes updates notes from (id, values of cols...) tuples, memUpdateChunk
+// rows per statement, and rebuilds their index rows.
+func setNotes(ctx context.Context, tx *sql.Tx, cols []string, rows [][]any) error {
+	set := make([]string, len(cols))
+	for i, c := range cols {
+		set[i] = fmt.Sprintf("%s = v.column%d", c, i+2)
 	}
-
-	have, haveNS, dead, err := readMemMeta(ctx, dst, tomb)
-	if err != nil {
-		return 0, err
-	}
-	if err := purgeChunked(ctx, dst, "memories", "memories_fts", dead); err != nil {
-		return 0, err
-	}
-
-	var rows, fts [][]any
-	var upd []Memory
-	err = each(ctx, src, `SELECT uid,ts,max(mtime,ts),hostname,namespace,title,content,author,tags FROM memories`, func(r *sql.Rows) error {
-		var m Memory
-		if err := r.Scan(&m.UID, &m.Ts, &m.Mtime, &m.Hostname, &m.Namespace, &m.Title, &m.Content, &m.Author, &m.Tags); err != nil {
+	for c := range chunks(rows, memUpdateChunk) {
+		args, ids := make([]any, 0, len(c)*(len(cols)+1)), make([]any, len(c))
+		for i, r := range c {
+			args, ids[i] = append(args, r...), r[0]
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE memories SET `+strings.Join(set, ", ")+
+			` FROM (VALUES `+ph(len(c), len(cols)+1)+`) AS v WHERE memories.id = v.column1`, args...); err != nil {
 			return err
 		}
-		if tomb[memTomb(m.UID)] {
-			return nil
+		if _, err := tx.ExecContext(ctx, `DELETE FROM memories_fts WHERE rowid IN `+inList(len(ids)), ids...); err != nil {
+			return err
 		}
-		v, ok := have[m.UID]
-		byUID := ok
-		if !ok {
-			v, ok = haveNS[nsKey(m.Namespace, m.Title)]
+		if _, err := tx.ExecContext(ctx, `INSERT INTO memories_fts(rowid, title, content, namespace, tags)
+			SELECT id, title, content, namespace, tags FROM memories WHERE id IN `+inList(len(ids)), ids...); err != nil {
+			return err
 		}
-		switch {
-		case !ok:
-			rows = append(rows, []any{m.UID, m.Ts, m.Mtime, m.Hostname, m.Namespace, m.Title, m.Content, m.Author, m.Tags})
-			fts = append(fts, []any{m.Title, m.Content, m.Namespace, m.Tags})
-		case m.Mtime > v.mtime: // last write wins
-			if byUID {
-				if v2, occ := haveNS[nsKey(m.Namespace, m.Title)]; occ && v2.id != v.id {
-					return nil
-				}
-				delete(haveNS, nsKey(v.ns, v.title))
-			}
-			m.ID = v.id
-			upd = append(upd, m)
-		default:
-			return nil
-		}
-		have[m.UID] = memMeta{v.id, m.UID, m.Mtime, m.Namespace, m.Title}
-		haveNS[nsKey(m.Namespace, m.Title)] = have[m.UID]
-		return nil
-	})
-	if err != nil {
-		return 0, err
 	}
-
-	if len(upd) > 0 {
-		tx, err := dst.BeginTx(ctx, nil)
-		if err != nil {
-			return n, err
-		}
-		defer tx.Rollback() //nolint
-		for _, m := range upd {
-			if err := updateMemoryFullTx(tx, m); err != nil {
-				return n, err
-			}
-		}
-		if err := tx.Commit(); err != nil {
-			return n, err
-		}
-		n += len(upd)
-	}
-	for i := 0; i < len(rows); i += 100 {
-		j := min(i+100, len(rows))
-		if err := insertBatch(ctx, dst, "memories", "uid,ts,mtime,hostname,namespace,title,content,author,tags",
-			"memories_fts", "title,content,namespace,tags", rows[i:j], fts[i:j]); err != nil {
-			return n, err
-		}
-		n += j - i
-	}
-	return n, nil
+	return nil
 }
 
 // fixMemFTS rebuilds memories_fts when it no longer mirrors memories (older
@@ -701,19 +836,14 @@ func fixMemFTS(ctx context.Context, db *sql.DB) error {
 	if err != nil || bad == 0 {
 		return err
 	}
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
+	return inTx(ctx, db, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM memories_fts`); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `INSERT INTO memories_fts(rowid,title,content,namespace,tags)
+		                               SELECT id,title,content,namespace,tags FROM memories`)
 		return err
-	}
-	defer tx.Rollback() //nolint
-	if _, err := tx.ExecContext(ctx, `DELETE FROM memories_fts`); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO memories_fts(rowid,title,content,namespace,tags)
-	                                  SELECT id,title,content,namespace,tags FROM memories`); err != nil {
-		return err
-	}
-	return tx.Commit()
+	})
 }
 
 // insertBatch writes rows into table and their FTS entries with two multi-row
@@ -723,44 +853,49 @@ func insertBatch(ctx context.Context, db *sql.DB, table, cols, fts, ftsCols stri
 	if len(rows) == 0 {
 		return nil
 	}
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
+	return inTx(ctx, db, func(tx *sql.Tx) error {
+		var next int64
+		if err := tx.QueryRowContext(ctx, `SELECT max(coalesce((SELECT max(id) FROM `+table+`),0),
+		    coalesce((SELECT rowid FROM `+fts+` ORDER BY rowid DESC LIMIT 1),0)) + 1`).Scan(&next); err != nil {
+			return err
+		}
+		var a, b []any
+		for i := range rows {
+			id := next + int64(i)
+			a = append(append(a, id), rows[i]...)
+			b = append(append(b, id), ftsRows[i]...)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO `+table+`(id,`+cols+`) VALUES`+ph(len(rows), len(rows[0])+1), a...); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `INSERT INTO `+fts+`(rowid,`+ftsCols+`) VALUES`+ph(len(rows), len(ftsRows[0])+1), b...)
 		return err
-	}
-	defer tx.Rollback() //nolint
-	var next int64
-	if err := tx.QueryRowContext(ctx, `SELECT max(coalesce((SELECT max(id) FROM `+table+`),0),
-	    coalesce((SELECT rowid FROM `+fts+` ORDER BY rowid DESC LIMIT 1),0)) + 1`).Scan(&next); err != nil {
-		return err
-	}
-	var a, b []any
-	for i := range rows {
-		id := next + int64(i)
-		a = append(append(a, id), rows[i]...)
-		b = append(append(b, id), ftsRows[i]...)
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO `+table+`(id,`+cols+`) VALUES`+ph(len(rows), len(rows[0])+1), a...); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO `+fts+`(rowid,`+ftsCols+`) VALUES`+ph(len(rows), len(ftsRows[0])+1), b...); err != nil {
-		return err
-	}
-	return tx.Commit()
+	})
 }
 
 func purgeChunked(ctx context.Context, db *sql.DB, table, fts string, ids []any) error {
 	if len(ids) == 0 {
 		return nil
 	}
+	return inTx(ctx, db, func(tx *sql.Tx) error {
+		for c := range chunks(ids, 500) {
+			if err := purge(ctx, tx, table, fts, c); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// inTx runs fn in a transaction on db and commits when fn succeeds.
+func inTx(ctx context.Context, db *sql.DB, fn func(*sql.Tx) error) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback() //nolint
-	for c := range chunks(ids, 500) {
-		if err := purge(ctx, tx, table, fts, c); err != nil {
-			return err
-		}
+	if err := fn(tx); err != nil {
+		return err
 	}
 	return tx.Commit()
 }
@@ -781,8 +916,8 @@ func each(ctx context.Context, db dbtx, q string, fn func(*sql.Rows) error, args
 }
 
 // chunks yields consecutive slices of at most n elements.
-func chunks(s []any, n int) func(func([]any) bool) {
-	return func(yield func([]any) bool) {
+func chunks[T any](s []T, n int) func(func([]T) bool) {
+	return func(yield func([]T) bool) {
 		for i := 0; i < len(s); i += n {
 			if !yield(s[i:min(i+n, len(s))]) {
 				return

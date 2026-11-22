@@ -7,6 +7,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -21,7 +22,8 @@ import (
 var (
 	reClear = regexp.MustCompile(`\x1b\[(2J|3J|H)|\f`)
 	// CSI / OSC / single-character escape sequences (colors, cursor, titles...).
-	reANSI = regexp.MustCompile("\x1b\\[[0-9;?]*[ -/]*[@-~]|\x1b\\][^\x07\x1b]*(\x07|\x1b\\\\)|\x1b[@-Z\\\\-_]")
+	// CSI parameter bytes are 0x30-0x3F, which includes ':' (truecolor "38:2:r:g:b").
+	reANSI = regexp.MustCompile("\x1b\\[[0-?]*[ -/]*[@-~]|\x1b\\][^\x07\x1b]*(\x07|\x1b\\\\)|\x1b[@-Z\\\\-_]")
 )
 
 // tidyRaw removes clear-screen sequences and collapses progress-bar redraws.
@@ -57,21 +59,28 @@ func gz(b []byte) []byte {
 	return buf.Bytes()
 }
 
-func ungz(b []byte) []byte {
+// maxUngz bounds decompressed output: stored runs are capped at maxCapture
+// plus a marker, so anything larger is corrupt or a gzip bomb from a merge/sync.
+const maxUngz = 2 * maxCapture
+
+func ungz(b []byte) []byte { return ungzLimit(b, maxUngz) }
+
+// ungzLimit decompresses b to at most limit bytes; b is returned as-is when
+// it is not valid gzip.
+func ungzLimit(b []byte, limit int64) []byte {
 	r, err := gzip.NewReader(bytes.NewReader(b))
 	if err != nil { // not gzip: return as-is
 		return b
 	}
 	defer r.Close()
-	out, err := io.ReadAll(r)
+	out, err := io.ReadAll(io.LimitReader(r, limit))
 	if err != nil {
 		return b
 	}
 	return out
 }
 
-// asciiLower folds A-Z only, so byte offsets stay valid for the original
-// (unicode.ToLower changes lengths, e.g. 'İ' is 2 bytes, 'i' is 1).
+// asciiLower folds A-Z only, so byte offsets stay valid for the original.
 func asciiLower(b []byte) []byte {
 	out := make([]byte, len(b))
 	for i, c := range b {
@@ -81,6 +90,59 @@ func asciiLower(b []byte) []byte {
 		out[i] = c
 	}
 	return out
+}
+
+// foldRune is a 1:1 case fold for search: Unicode lower-casing plus the
+// Turkish dotted/dotless i family (İ, I, ı → i), so "ışık" finds "IŞIK" and
+// "istanbul" finds "İSTANBUL".
+func foldRune(r rune) rune {
+	switch r {
+	case 'İ', 'I', 'ı':
+		return 'i'
+	}
+	if r < utf8.RuneSelf {
+		if 'A' <= r && r <= 'Z' {
+			r += 'a' - 'A'
+		}
+		return r
+	}
+	return unicode.ToLower(r)
+}
+
+// fold case-folds s with foldRune.
+func fold(s string) string { return strings.Map(foldRune, s) }
+
+// foldMap folds b for case-insensitive matching. Folding can change byte
+// lengths ('İ' is 2 bytes, 'i' is 1), so off maps every byte offset of the
+// folded text back to b (off[len(folded)] == len(b)); off is nil when the
+// offsets are identical (ASCII fast path).
+func foldMap(b []byte) (folded []byte, off []int) {
+	ascii := true
+	for _, c := range b {
+		if c >= utf8.RuneSelf {
+			ascii = false
+			break
+		}
+	}
+	if ascii {
+		return asciiLower(b), nil
+	}
+	folded = make([]byte, 0, len(b))
+	off = make([]int, 0, len(b)+1)
+	for i := 0; i < len(b); {
+		r, w := utf8.DecodeRune(b[i:])
+		n := len(folded)
+		if r == utf8.RuneError && w == 1 {
+			folded = append(folded, b[i]) // keep invalid bytes as-is
+		} else {
+			folded = utf8.AppendRune(folded, foldRune(r))
+		}
+		for range len(folded) - n {
+			off = append(off, i)
+		}
+		i += w
+	}
+	return folded, append(off, len(b))
 }
 
 // trunc cuts s to at most n runes (never inside a UTF-8 sequence) without
@@ -131,11 +193,13 @@ func truncFTS(b []byte) []byte {
 	if len(b) <= maxFTSBytes {
 		return b
 	}
-	b = b[:maxFTSBytes]
-	for len(b) > 0 && !utf8.Valid(b[max(0, len(b)-4):]) {
-		b = b[:len(b)-1]
+	// b[cut] is the first dropped byte: back up (at most one rune) until it
+	// starts a rune, so the kept prefix never ends inside a sequence.
+	cut := maxFTSBytes
+	for cut > maxFTSBytes-utf8.UTFMax && !utf8.RuneStart(b[cut]) {
+		cut--
 	}
-	return b
+	return b[:cut]
 }
 
 // oneLine collapses all whitespace (newlines included) to single spaces.

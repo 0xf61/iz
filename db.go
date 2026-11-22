@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
@@ -9,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	_ "modernc.org/sqlite" // pure-Go SQLite driver (no cgo → static binaries)
 )
@@ -43,7 +46,11 @@ func openDBAt(p string) (*sql.DB, error) {
 	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite", p+"?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)")
+	// busy_timeout comes first so the WAL switch already waits on a busy file.
+	// _txlock=immediate: write transactions take the lock at BEGIN, so a
+	// read-then-write transaction never fails with an instant SQLITE_BUSY
+	// (SQLite skips the busy handler when a deferred reader must upgrade).
+	db, err := sql.Open("sqlite", p+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_txlock=immediate")
 	if err != nil {
 		return nil, err
 	}
@@ -102,10 +109,7 @@ var schema = []string{
 	`ALTER TABLE memories ADD COLUMN uid TEXT`,
 	`ALTER TABLE memories ADD COLUMN mtime REAL NOT NULL DEFAULT 0`,
 	`ALTER TABLE tombstones ADD COLUMN ts REAL NOT NULL DEFAULT 0`,
-	// v4: reset legacy NUL-delimited or truncated 1-byte tombstones
-	`DELETE FROM tombstones WHERE instr(key, char(0)) > 0 OR length(key) <= 1`,
 	`CREATE INDEX IF NOT EXISTS memories_uid ON memories(uid)`,
-	`CREATE INDEX IF NOT EXISTS memories_ns ON memories(namespace, title)`,
 	backfillUID,
 	seedDefaultTools,
 }
@@ -137,11 +141,16 @@ const seedDefaultTools = `INSERT OR IGNORE INTO tools(name) VALUES
 ('chisel'),('ligolo-ng'),('bettercap'),
 ('hashcat'),('radare2'),('tshark'),('meg'),('qsreplace'),('gf'),('unew')`
 
-// backfillUID gives legacy notes a deterministic uid, so copies of the same
+// legacyUID is the deterministic uid of a pre-uid note, so copies of the same
 // note on two machines (made by older syncs) still match each other.
-const backfillUID = `UPDATE memories SET uid = hostname||'|'||ts||'|'||namespace||'|'||title WHERE uid IS NULL`
+// uidCol reads a uid even from rows an older client inserted without one.
+const (
+	legacyUID   = `hostname||'|'||ts||'|'||namespace||'|'||title`
+	backfillUID = `UPDATE memories SET uid = ` + legacyUID + ` WHERE uid IS NULL`
+	uidCol      = `coalesce(uid, ` + legacyUID + `)`
+)
 
-const schemaVersion = 4
+const schemaVersion = 5 // 5: memories_ns dropped (memories_ns_title covers it)
 
 // ensureSchema creates/migrates the schema. Local databases skip the work
 // once PRAGMA user_version says they are current; force always runs it
@@ -156,13 +165,49 @@ func ensureSchema(ctx context.Context, db dbtx, force bool) error {
 			return err
 		}
 	}
+	if err := fixLegacyTombs(ctx, db); err != nil {
+		return err
+	}
 	if err := dedupMemories(ctx, db); err != nil {
 		return err
 	}
-	if _, err := db.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS memories_ns_title ON memories(namespace, title)`); err != nil {
-		return err
+	for _, s := range []string{
+		`CREATE UNIQUE INDEX IF NOT EXISTS memories_ns_title ON memories(namespace, title)`,
+		`DROP INDEX IF EXISTS memories_ns`, // redundant with the unique index
+	} {
+		if _, err := db.ExecContext(ctx, s); err != nil {
+			return err
+		}
 	}
 	db.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version=%d`, schemaVersion)) //nolint — optional on remotes
+	return nil
+}
+
+// fixLegacyTombs rewrites pre-v4 tombstone keys (NUL-delimited, which
+// length() sees as 1 character) to the ':' form, keeping their deletes; keys
+// tombKey rejects are dropped. Done in Go: SQL replace() treats a NUL pattern
+// as empty.
+func fixLegacyTombs(ctx context.Context, db dbtx) error {
+	var old []string
+	err := each(ctx, db, `SELECT key FROM tombstones WHERE length(key) <= 1 OR instr(key, char(0)) > 0`, func(r *sql.Rows) error {
+		var k string
+		err := r.Scan(&k)
+		old = append(old, k)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	for _, k := range old {
+		if nk, ok := tombKey(k); ok {
+			if _, err := db.ExecContext(ctx, `INSERT OR IGNORE INTO tombstones(key, ts) SELECT ?, ts FROM tombstones WHERE key = ?`, nk, k); err != nil {
+				return err
+			}
+		}
+		if _, err := db.ExecContext(ctx, `DELETE FROM tombstones WHERE key = ?`, k); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -193,7 +238,12 @@ func dedupMemories(ctx context.Context, db dbtx) error {
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	return purge(ctx, db, "memories", "memories_fts", ids)
+	for c := range chunks(ids, 500) {
+		if err := purge(ctx, db, "memories", "memories_fts", c); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Run is one recorded command execution.
@@ -218,6 +268,16 @@ func runKey(host string, ts float64, tool, cmd string) string {
 	return "r:" + host + ":" + strconv.FormatFloat(ts, 'f', -1, 64) + ":" + tool + ":" + cmd
 }
 func memTomb(uid string) string { return "m:" + uid }
+
+// tombKey normalizes a stored tombstone key: legacy NUL-delimited keys, which
+// older clients (or a merged pre-v4 database) may still carry, map to the
+// current ':' form so their deletes still apply; truncated keys are rejected.
+// Since v4 these are rewritten at migration (fixLegacyTombs); sync still
+// normalizes because older clients may keep writing them to a shared remote.
+func tombKey(k string) (string, bool) {
+	k = strings.ReplaceAll(k, "\x00", ":")
+	return k, len(k) > 2
+}
 
 // ftsPrefix is prepended to the indexed output so one MATCH searches
 // hostname, tool and command line as well.
@@ -285,9 +345,15 @@ func tombstone(ex dbtx, key string) error {
 	return err
 }
 
+// pruneTombstones deletes tombstones older than maxAge. Undated ones (ts=0,
+// written by pre-TTL clients) are stamped first, so they expire maxAge after
+// they were first seen instead of never (or instantly).
 func pruneTombstones(ctx context.Context, ex dbtx, maxAge time.Duration) (int64, error) {
+	if _, err := ex.ExecContext(ctx, `UPDATE tombstones SET ts = ? WHERE ts = 0`, now()); err != nil {
+		return 0, err
+	}
 	cutoff := float64(time.Now().Add(-maxAge).Unix())
-	res, err := ex.ExecContext(ctx, `DELETE FROM tombstones WHERE ts > 0 AND ts < ?`, cutoff)
+	res, err := ex.ExecContext(ctx, `DELETE FROM tombstones WHERE ts < ?`, cutoff)
 	if err != nil {
 		return 0, err
 	}
@@ -335,29 +401,60 @@ func isFilter(t string) bool {
 	return strings.HasPrefix(t, "host:") || hasPrefixAny(t, runFilters) || hasPrefixAny(t, memFilters)
 }
 
-// freeTerms drops filter tokens, leaving what should be highlighted.
-func freeTerms(fields []string) []string {
+// isFTSOp reports FTS5 boolean operators: query syntax, not words.
+func isFTSOp(t string) bool { return t == "AND" || t == "OR" || t == "NOT" || t == "NEAR" }
+
+// cleanTerm strips FTS syntax around a word: quotes, parens and the prefix
+// star (`("ESC*` → "ESC").
+func cleanTerm(t string) string { return strings.Trim(t, `"'()*`) }
+
+func hasUpper(s string) bool { return strings.IndexFunc(s, unicode.IsUpper) >= 0 }
+
+// searchWords returns the plain words of a query — operators and filters
+// dropped, FTS syntax stripped — i.e. what highlighting should look for.
+func searchWords(terms []string) []string {
 	var out []string
-	for _, t := range fields {
-		if !isFilter(t) {
-			out = append(out, t)
+	for _, t := range terms {
+		if isFTSOp(t) || isFilter(t) {
+			continue
+		}
+		if w := cleanTerm(t); w != "" {
+			out = append(out, w)
 		}
 	}
 	return out
 }
 
-// ftsQuoteQuery wraps each search term in double quotes so punctuation like
-// '-', '.', ':', '/' is treated as literal tokens by FTS5 instead of syntax
-// operators. op should be " " (AND) or " OR ".
-func ftsQuoteQuery(terms []string, op string) string {
-	if len(terms) == 0 {
+// ftsTerm quotes one term so punctuation ('-', '.', ':', '/') is literal for
+// FTS5; a trailing '*' stays a prefix query outside the quotes.
+func ftsTerm(t string) string {
+	w := cleanTerm(t)
+	if w == "" {
 		return ""
 	}
-	quoted := make([]string, len(terms))
-	for i, t := range terms {
-		quoted[i] = `"` + strings.ReplaceAll(t, `"`, `""`) + `"`
+	q := `"` + strings.ReplaceAll(w, `"`, `""`) + `"`
+	if strings.HasSuffix(strings.TrimRight(t, `"')`), "*") {
+		q += "*"
 	}
-	return strings.Join(quoted, op)
+	return q
+}
+
+// ftsQuoteQuery quotes every term (see ftsTerm) and joins them with op: " "
+// (AND) or " OR ". Boolean operators pass through unquoted in AND joins.
+func ftsQuoteQuery(terms []string, op string) string {
+	var parts []string
+	for _, t := range terms {
+		if isFTSOp(t) {
+			if op == " " {
+				parts = append(parts, t)
+			}
+			continue
+		}
+		if q := ftsTerm(t); q != "" {
+			parts = append(parts, q)
+		}
+	}
+	return strings.Join(parts, op)
 }
 
 // ftsValid probes MATCH syntax: through a JOIN, invalid FTS syntax (e.g.
@@ -367,12 +464,148 @@ func ftsValid(db *sql.DB, table, q string) bool {
 	return err == nil || err == sql.ErrNoRows
 }
 
+// matchFTS picks the free-text condition for terms: the raw query when it is
+// valid FTS5 syntax, else every term quoted, else likeCond (n placeholders,
+// each bound to "%query%"); fts reports a MATCH condition.
+func matchFTS(db *sql.DB, table string, terms []string, likeCond string, n int) (cond string, args []any, fts bool) {
+	q := strings.Join(terms, " ")
+	if ftsValid(db, table, q) {
+		return table + " MATCH ?", []any{q}, true
+	}
+	if fq := ftsQuoteQuery(terms, " "); ftsValid(db, table, fq) {
+		return table + " MATCH ?", []any{fq}, true
+	}
+	args = make([]any, n)
+	for i := range args {
+		args[i] = "%" + likeEsc(q) + "%"
+	}
+	return likeCond, args, false
+}
+
+// orFallback returns the relaxed query (any word, quoted) used when a plain
+// multi-word query (no operators) found nothing, or "" when it does not apply.
+func orFallback(db *sql.DB, table string, terms []string) string {
+	if len(terms) < 2 {
+		return ""
+	}
+	for _, t := range terms {
+		if isFTSOp(t) {
+			return ""
+		}
+	}
+	if q := ftsQuoteQuery(terms, " OR "); ftsValid(db, table, q) {
+		return q
+	}
+	return ""
+}
+
+// orWords returns the words of a pure "a OR b OR c" query.
+func orWords(terms []string) ([]string, bool) {
+	if len(terms) < 3 || len(terms)%2 == 0 {
+		return nil, false
+	}
+	var ws []string
+	for i, t := range terms {
+		if i%2 == 1 {
+			if t != "OR" {
+				return nil, false
+			}
+		} else if isFTSOp(t) {
+			return nil, false
+		} else {
+			ws = append(ws, t)
+		}
+	}
+	return ws, true
+}
+
+// smartCase is the run search case rule: all-lowercase words match
+// case-insensitively via FTS; words with any uppercase letter must also occur
+// verbatim (instr compares BINARY). A pure OR query applies the rule per
+// alternative; mixed AND/OR (FTS precedence) gets no case conditions.
+func smartCase(terms []string) (string, []any) {
+	if ws, ok := orWords(terms); ok {
+		return caseCond(ws, true)
+	}
+	var ws []string
+	for i, t := range terms {
+		switch {
+		case t == "OR":
+			return "", nil
+		case isFTSOp(t), i > 0 && terms[i-1] == "NOT":
+		default:
+			ws = append(ws, t)
+		}
+	}
+	return caseCond(ws, false)
+}
+
+// caseCond builds the smartCase SQL for words, joined with AND, or with OR
+// where a lowercase alternative is tested through its own FTS match.
+func caseCond(words []string, or bool) (string, []any) {
+	var conds []string
+	var args []any
+	upper := false
+	for _, w := range words {
+		c := cleanTerm(w)
+		switch {
+		case c == "":
+		case hasUpper(c):
+			upper = true
+			conds = append(conds, "instr(f.text, ?) > 0")
+			args = append(args, c)
+		case or:
+			conds = append(conds, "f.rowid IN (SELECT rowid FROM outputs_fts WHERE outputs_fts MATCH ?)")
+			args = append(args, ftsTerm(w))
+		}
+	}
+	if !upper {
+		return "", nil
+	}
+	if or {
+		return " AND (" + strings.Join(conds, " OR ") + ")", args
+	}
+	return " AND " + strings.Join(conds, " AND "), args
+}
+
+// LIKE filters: values are escaped so '%' and '_' match literally.
+var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+
+func likeEsc(s string) string { return likeEscaper.Replace(s) }
+
+// likePrefix filters col on a literal prefix.
+func likePrefix(col, v string) (string, any) {
+	return " AND " + col + ` LIKE ? ESCAPE '\'`, likeEsc(v) + "%"
+}
+
+// dirCond matches the cwd by whole path components: "dir:eng" is any
+// directory named eng (or below it), "dir:a/b" that pair of components,
+// "dir:/abs" or "dir:~/x" that subtree ("dir:/" is everything).
+func dirCond(v string) (string, []any) {
+	if home, err := os.UserHomeDir(); err == nil && (v == "~" || strings.HasPrefix(v, "~/")) {
+		v = home + v[1:]
+	}
+	if strings.HasPrefix(v, "/") {
+		v = strings.TrimRight(v, "/")
+		if v == "" {
+			return ` AND r.cwd LIKE '/%'`, nil
+		}
+		return ` AND (r.cwd = ? OR r.cwd LIKE ? ESCAPE '\')`, []any{v, likeEsc(v) + "/%"}
+	}
+	if v = strings.Trim(v, "/"); v == "" {
+		return "", nil
+	}
+	e := "%/" + likeEsc(v)
+	return ` AND (r.cwd LIKE ? ESCAPE '\' OR r.cwd LIKE ? ESCAPE '\')`, []any{e, e + "/%"}
+}
+
 // queryRuns parses "failed host:build01 tool:cargo": free terms go to FTS5 MATCH
 // (output text is indexed), host:/dir:/tool:/size: become SQL filters.
 func queryRuns(db *sql.DB, query string) ([]Run, error) { return searchRuns(db, query, 1000, false) }
 
 // searchRuns is queryRuns with a limit; withText also loads the indexed text
-// and keeps the first matching line in Snippet (recall).
+// and keeps the first matching line in Snippet (recall). Note filters (ns:,
+// tag:...) belong to the other side of recall and are ignored.
 func searchRuns(db *sql.DB, query string, limit int, withText bool) ([]Run, error) {
 	var conds string
 	var args []any
@@ -380,107 +613,96 @@ func searchRuns(db *sql.DB, query string, limit int, withText bool) ([]Run, erro
 	for _, t := range strings.Fields(query) {
 		switch {
 		case strings.HasPrefix(t, "host:"):
-			conds += " AND r.hostname LIKE ?"
-			args = append(args, strings.TrimPrefix(t, "host:")+"%")
+			c, a := likePrefix("r.hostname", strings.TrimPrefix(t, "host:"))
+			conds, args = conds+c, append(args, a)
 		case strings.HasPrefix(t, "dir:"):
-			// directory name only (the cwd column holds full paths)
-			conds += " AND r.cwd LIKE ?"
-			args = append(args, "%/"+strings.TrimPrefix(t, "dir:")+"%")
+			c, a := dirCond(strings.TrimPrefix(t, "dir:"))
+			conds, args = conds+c, append(args, a...)
 		case strings.HasPrefix(t, "cmd:"), strings.HasPrefix(t, "tool:"):
-			conds += " AND r.tool LIKE ?"
-			args = append(args, t[strings.Index(t, ":")+1:]+"%")
+			c, a := likePrefix("r.tool", t[strings.Index(t, ":")+1:])
+			conds, args = conds+c, append(args, a)
 		case strings.HasPrefix(t, "size:"):
 			if op, n, ok := parseSize(strings.TrimPrefix(t, "size:")); ok {
 				conds += fmt.Sprintf(" AND r.size %s ?", op)
 				args = append(args, n)
 			}
+		case hasPrefixAny(t, memFilters):
 		default:
 			terms = append(terms, t)
 		}
 	}
-	q := strings.Join(terms, " ")
 
 	text := "''"
 	joinFTS := ""
 	if withText {
 		text = "f.text"
 		joinFTS = " JOIN outputs_fts f ON f.rowid = r.id"
-	} else if q != "" {
+	} else if len(terms) > 0 {
 		joinFTS = " JOIN outputs_fts f ON f.rowid = r.id"
 	}
 	selectSQL := `SELECT r.id,r.ts,r.hostname,r.tool,r.cmd,r.cwd,r.exit_code,r.duration_ms,r.size,` + text + `
 	              FROM runs r` + joinFTS
-	tail := fmt.Sprintf(" ORDER BY r.ts DESC LIMIT %d", limit)
-
-	// Case rule: all-lowercase terms match case-insensitively via FTS; terms
-	// with any uppercase must occur verbatim (instr compares BINARY).
-	// Skip caseConds when the query uses an explicit OR operator.
-	var caseConds string
-	var caseArgs []any
-	hasOR := false
-	for _, t := range terms {
-		if t == "OR" {
-			hasOR = true
-			break
-		}
-	}
-	if !hasOR {
-		for idx, t := range terms {
-			if idx > 0 && terms[idx-1] == "NOT" {
-				continue
-			}
-			clean := strings.Trim(t, `"'`)
-			if clean == "" || clean == "AND" || clean == "OR" || clean == "NOT" || clean == "NEAR" {
-				continue
-			}
-			if strings.ToLower(clean) != clean {
-				caseConds += " AND instr(f.text, ?) > 0"
-				caseArgs = append(caseArgs, clean)
-			}
-		}
-	}
+	order := fmt.Sprintf(" ORDER BY r.ts DESC LIMIT %d", limit)
 
 	var runs []Run
 	var err error
-	switch {
-	case q == "":
-		runs, err = scanRuns(db, selectSQL+" WHERE 1=1"+conds+tail, args)
-	default:
-		ftsQ := ftsQuoteQuery(terms, " ")
-		if ftsValid(db, "outputs_fts", q) {
-			runs, err = scanRuns(db, selectSQL+" WHERE outputs_fts MATCH ?"+conds+caseConds+tail, append(append([]any{q}, args...), caseArgs...))
-		} else if ftsValid(db, "outputs_fts", ftsQ) {
-			runs, err = scanRuns(db, selectSQL+" WHERE outputs_fts MATCH ?"+conds+caseConds+tail, append(append([]any{ftsQ}, args...), caseArgs...))
-		} else {
-			runs, err = scanRuns(db, selectSQL+" WHERE f.text LIKE ?"+conds+caseConds+tail, append(append([]any{"%" + q + "%"}, args...), caseArgs...))
-		}
-		// Multi-term fallback: if strict AND returned 0 rows, try OR ranked by bm25
-		if err == nil && len(runs) == 0 && len(terms) > 1 {
-			orQ := ftsQuoteQuery(terms, " OR ")
-			if ftsValid(db, "outputs_fts", orQ) {
-				orTail := fmt.Sprintf(" ORDER BY bm25(outputs_fts), r.ts DESC LIMIT %d", limit)
-				runs, err = scanRuns(db, selectSQL+" WHERE outputs_fts MATCH ?"+conds+orTail, append([]any{orQ}, args...))
+	if len(terms) == 0 {
+		runs, err = scanRuns(db, selectSQL+" WHERE 1=1"+conds+order, args)
+	} else {
+		where, wargs, _ := matchFTS(db, "outputs_fts", terms, `f.text LIKE ? ESCAPE '\'`, 1)
+		cc, cargs := smartCase(terms)
+		runs, err = scanRuns(db, selectSQL+" WHERE "+where+conds+cc+order, concat(wargs, args, cargs))
+		if err == nil && len(runs) == 0 {
+			if orQ := orFallback(db, "outputs_fts", terms); orQ != "" {
+				cc, cargs := caseCond(terms, true)
+				order := fmt.Sprintf(" ORDER BY bm25(outputs_fts), r.ts DESC LIMIT %d", limit)
+				runs, err = scanRuns(db, selectSQL+" WHERE outputs_fts MATCH ?"+conds+cc+order, concat([]any{orQ}, args, cargs))
 			}
 		}
 	}
 	if withText {
+		ns := needles(terms)
 		for i := range runs {
-			runs[i].Snippet = matchLine(strings.TrimPrefix(runs[i].Snippet, ftsPrefix(runs[i])), terms)
+			runs[i].Snippet = matchLine(strings.TrimPrefix(runs[i].Snippet, ftsPrefix(runs[i])), ns)
 		}
 	}
 	return runs, err
 }
 
-// matchLine returns the first line containing a term (Unicode case-insensitive),
-// or the first non-empty line when nothing matches.
-func matchLine(text string, terms []string) string {
-	first := ""
-	lowTerms := make([]string, 0, len(terms))
-	for _, t := range terms {
-		if len([]rune(t)) >= 2 {
-			lowTerms = append(lowTerms, strings.ToLower(t))
+func concat(parts ...[]any) []any {
+	var out []any
+	for _, p := range parts {
+		out = append(out, p...)
+	}
+	return out
+}
+
+// needles returns the case-folded search words worth matching (≥2 runes).
+func needles(terms []string) [][]byte {
+	var out [][]byte
+	for _, w := range searchWords(terms) {
+		if utf8.RuneCountInString(w) >= 2 {
+			out = append(out, []byte(fold(w)))
 		}
 	}
+	return out
+}
+
+// containsAny reports whether text (case-folded) contains any needle.
+func containsAny(text []byte, ns [][]byte) bool {
+	low, _ := foldMap(text)
+	for _, n := range ns {
+		if bytes.Contains(low, n) {
+			return true
+		}
+	}
+	return false
+}
+
+// matchLine returns the first line containing a needle (case-folded), or the
+// first non-empty line when nothing matches.
+func matchLine(text string, ns [][]byte) string {
+	first := ""
 	for _, l := range strings.Split(text, "\n") {
 		l = strings.TrimSpace(l)
 		if l == "" {
@@ -489,11 +711,8 @@ func matchLine(text string, terms []string) string {
 		if first == "" {
 			first = l
 		}
-		ll := strings.ToLower(l)
-		for _, lt := range lowTerms {
-			if strings.Contains(ll, lt) {
-				return l
-			}
+		if containsAny([]byte(l), ns) {
+			return l
 		}
 	}
 	return first
@@ -572,4 +791,4 @@ func fmtTsShort(ts float64) string {
 
 // inList renders "(?,?,?)"; ph renders n value tuples of k placeholders.
 func inList(n int) string { return "(" + strings.TrimSuffix(strings.Repeat("?,", n), ",") + ")" }
-func ph(n, k int) string     { return strings.TrimSuffix(strings.Repeat(inList(k)+",", n), ",") }
+func ph(n, k int) string  { return strings.TrimSuffix(strings.Repeat(inList(k)+",", n), ",") }

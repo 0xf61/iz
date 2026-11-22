@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -28,7 +29,7 @@ type Memory struct {
 	Content   string  `json:"content"`
 	Author    string  `json:"author"` // e.g. "user", "claude", "agent"
 	Tags      string  `json:"tags,omitempty"`
-	UID       string  `json:"-"` // identity across machines
+	UID       string  `json:"-"`               // identity across machines
 	Mtime     float64 `json:"mtime,omitempty"` // last edit (sync: last write wins)
 	TagsSet   bool    `json:"-"`
 }
@@ -65,29 +66,43 @@ func upsertMemory(db *sql.DB, m Memory, appendMode bool) (int64, bool, error) {
 }
 
 func upsertMemoryTx(ex dbtx, m Memory, appendMode bool) (int64, bool, error) {
-	var existingID int64
-	var oldContent, oldTags, oldAuthor string
-	err := ex.QueryRowContext(bg,
-		`SELECT id, content, tags, author FROM memories WHERE namespace=? AND title=?`,
-		m.Namespace, m.Title).Scan(&existingID, &oldContent, &oldTags, &oldAuthor)
-	if err == nil {
-		m.ID = existingID
-		if appendMode && oldContent != "" {
-			m.Content = strings.TrimRight(oldContent, "\n") + "\n" + m.Content
-		}
-		if m.Tags == "" && !m.TagsSet {
-			m.Tags = oldTags
-		}
-		if m.Mtime == 0 {
-			m.Mtime = now()
-		}
-		if err := updateMemoryTx(ex, m); err != nil {
-			return 0, false, err
-		}
-		return existingID, true, nil
+	var old Memory
+	err := ex.QueryRowContext(bg, `SELECT id, content, tags FROM memories WHERE namespace=? AND title=?`,
+		m.Namespace, m.Title).Scan(&old.ID, &old.Content, &old.Tags)
+	switch {
+	case err == sql.ErrNoRows:
+		id, err := insertMemoryTx(ex, m)
+		return id, false, err
+	case err != nil:
+		return 0, false, err
 	}
-	id, err := insertMemoryTx(ex, m)
-	return id, false, err
+	m.ID = old.ID
+	if appendMode && old.Content != "" {
+		m.Content = strings.TrimRight(old.Content, "\n") + "\n" + m.Content
+	}
+	if m.Tags == "" && !m.TagsSet {
+		m.Tags = old.Tags
+	}
+	return old.ID, true, updateMemoryTx(ex, m)
+}
+
+// defaultAuthor is who writes a note when no author is given.
+func defaultAuthor() string {
+	if u := os.Getenv("USER"); u != "" {
+		return u
+	}
+	return "user"
+}
+
+// normTags trims tags and drops empty ones: "a, b,," → "a,b".
+func normTags(s string) string {
+	var out []string
+	for _, t := range strings.Split(s, ",") {
+		if t = strings.TrimSpace(t); t != "" {
+			out = append(out, t)
+		}
+	}
+	return strings.Join(out, ",")
 }
 
 func insertMemoryTx(ex dbtx, m Memory) (int64, error) {
@@ -104,15 +119,12 @@ func insertMemoryTx(ex dbtx, m Memory) (int64, error) {
 		m.Hostname = hostname()
 	}
 	if m.Author == "" {
-		m.Author = os.Getenv("USER")
-		if m.Author == "" {
-			m.Author = "user"
-		}
+		m.Author = defaultAuthor()
 	}
 	res, err := ex.ExecContext(bg, `
 		INSERT INTO memories(uid, ts, mtime, hostname, namespace, title, content, author, tags)
 		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		m.UID, m.Ts, m.Mtime, m.Hostname, m.Namespace, m.Title, m.Content, m.Author, m.Tags)
+		m.UID, m.Ts, m.Mtime, m.Hostname, m.Namespace, m.Title, m.Content, m.Author, normTags(m.Tags))
 	if err != nil {
 		return 0, err
 	}
@@ -120,51 +132,40 @@ func insertMemoryTx(ex dbtx, m Memory) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	_, err = ex.ExecContext(bg, `INSERT INTO memories_fts(rowid, title, content, namespace, tags) VALUES(?, ?, ?, ?, ?)`,
-		id, m.Title, m.Content, m.Namespace, m.Tags)
-	return id, err
+	return id, reindexMemory(ex, id)
 }
 
 // updateMemoryTx rewrites a note's editable fields (namespace, title,
-// content, tags) and its FTS row; ts (creation) and uid never change.
+// content, tags, and author when given) and its FTS row; ts (creation) and
+// uid never change.
 func updateMemoryTx(ex dbtx, m Memory) error {
 	if m.Mtime == 0 {
 		m.Mtime = now()
 	}
-	res, err := ex.ExecContext(bg, `UPDATE memories SET namespace=?, title=?, content=?, tags=?, mtime=? WHERE id=?`,
-		m.Namespace, m.Title, m.Content, m.Tags, m.Mtime, m.ID)
-	if err != nil {
-		return err
-	}
-	if k, _ := res.RowsAffected(); k == 0 {
-		return fmt.Errorf("note #%d not found", m.ID)
-	}
-	if _, err := ex.ExecContext(bg, `DELETE FROM memories_fts WHERE rowid=?`, m.ID); err != nil {
-		return err
-	}
-	_, err = ex.ExecContext(bg, `INSERT INTO memories_fts(rowid, title, content, namespace, tags) VALUES(?, ?, ?, ?, ?)`,
-		m.ID, m.Title, m.Content, m.Namespace, m.Tags)
-	return err
+	return updateNoteRow(ex, m.ID, `UPDATE memories SET namespace=?, title=?, content=?, tags=?,
+		author=coalesce(nullif(?, ''), author), mtime=? WHERE id=?`,
+		m.Namespace, m.Title, m.Content, normTags(m.Tags), m.Author, m.Mtime, m.ID)
 }
 
-// updateMemoryFullTx is used by sync when LWW replaces a note including uid/author/hostname.
-func updateMemoryFullTx(ex dbtx, m Memory) error {
-	if m.Mtime == 0 {
-		m.Mtime = now()
-	}
-	res, err := ex.ExecContext(bg, `UPDATE memories SET uid=?, hostname=?, namespace=?, title=?, content=?, author=?, tags=?, mtime=? WHERE id=?`,
-		m.UID, m.Hostname, m.Namespace, m.Title, m.Content, m.Author, m.Tags, m.Mtime, m.ID)
+// updateNoteRow runs an UPDATE of note id and refreshes its FTS row.
+func updateNoteRow(ex dbtx, id int64, q string, args ...any) error {
+	res, err := ex.ExecContext(bg, q, args...)
 	if err != nil {
 		return err
 	}
 	if k, _ := res.RowsAffected(); k == 0 {
-		return fmt.Errorf("note #%d not found", m.ID)
+		return fmt.Errorf("note #%d not found", id)
 	}
-	if _, err := ex.ExecContext(bg, `DELETE FROM memories_fts WHERE rowid=?`, m.ID); err != nil {
+	return reindexMemory(ex, id)
+}
+
+// reindexMemory rebuilds the FTS row of note id from the table.
+func reindexMemory(ex dbtx, id int64) error {
+	if _, err := ex.ExecContext(bg, `DELETE FROM memories_fts WHERE rowid=?`, id); err != nil {
 		return err
 	}
-	_, err = ex.ExecContext(bg, `INSERT INTO memories_fts(rowid, title, content, namespace, tags) VALUES(?, ?, ?, ?, ?)`,
-		m.ID, m.Title, m.Content, m.Namespace, m.Tags)
+	_, err := ex.ExecContext(bg, `INSERT INTO memories_fts(rowid, title, content, namespace, tags)
+		SELECT id, title, content, namespace, tags FROM memories WHERE id=?`, id)
 	return err
 }
 
@@ -212,7 +213,7 @@ func resolveMemoryID(db *sql.DB, target string) (int64, error) {
 	if id, err := strconv.ParseInt(target, 10, 64); err == nil {
 		return id, nil
 	}
-	ns, title, _ := parseTarget(target)
+	ns, title := parseTarget(target)
 	if title == "" {
 		return 0, fmt.Errorf("invalid note target %q", target)
 	}
@@ -224,7 +225,8 @@ func resolveMemoryID(db *sql.DB, target string) (int64, error) {
 }
 
 // queryMemories searches the memories table via FTS5; ns:/author:/tag:/host:
-// filter on columns.
+// filter on columns. Run filters (cmd:, dir:...) belong to the other side of
+// recall and are ignored.
 func queryMemories(db *sql.DB, query string, limit int) ([]Memory, error) {
 	if limit <= 0 {
 		limit = 20
@@ -232,58 +234,45 @@ func queryMemories(db *sql.DB, query string, limit int) ([]Memory, error) {
 	var conds string
 	var args []any
 	var terms []string
-
 	for _, t := range strings.Fields(query) {
-		idx := strings.Index(t, ":")
-		if idx < 0 {
-			terms = append(terms, t)
-			continue
-		}
-		val := t[idx+1:]
+		val := t[strings.IndexByte(t, ':')+1:]
 		switch {
 		case strings.HasPrefix(t, "ns:"), strings.HasPrefix(t, "namespace:"):
-			conds += " AND m.namespace LIKE ?"
-			args = append(args, val+"%")
+			c, a := likePrefix("m.namespace", val)
+			conds, args = conds+c, append(args, a)
 		case strings.HasPrefix(t, "author:"):
-			conds += " AND m.author LIKE ?"
-			args = append(args, val+"%")
+			c, a := likePrefix("m.author", val)
+			conds, args = conds+c, append(args, a)
 		case strings.HasPrefix(t, "host:"):
-			conds += " AND m.hostname LIKE ?"
-			args = append(args, val+"%")
+			c, a := likePrefix("m.hostname", val)
+			conds, args = conds+c, append(args, a)
 		case strings.HasPrefix(t, "tag:"), strings.HasPrefix(t, "tags:"):
-			conds += " AND (',' || m.tags || ',') LIKE ?"
-			args = append(args, "%,"+val+",%")
+			// whole tag, tolerant of "a, b" lists written by older versions
+			conds += ` AND (',' || replace(m.tags, ' ', '') || ',') LIKE ? ESCAPE '\'`
+			args = append(args, "%,"+likeEsc(val)+",%")
+		case hasPrefixAny(t, runFilters):
 		default:
 			terms = append(terms, t)
 		}
 	}
-	q := strings.Join(terms, " ")
 	const cols = `SELECT m.id, m.ts, m.mtime, m.hostname, m.namespace, m.title, m.content, m.author, m.tags FROM memories m`
+	const join = ` JOIN memories_fts f ON f.rowid = m.id`
+	recent := ` ORDER BY max(m.mtime, m.ts) DESC, m.id DESC LIMIT ?`
 
-	if q == "" {
-		return scanMemories(db, cols+" WHERE 1=1"+conds+" ORDER BY max(m.mtime, m.ts) DESC, m.id DESC LIMIT ?", append(args, limit))
+	if len(terms) == 0 {
+		return scanMemories(db, cols+" WHERE 1=1"+conds+recent, append(args, limit))
 	}
-
-	ftsQ := ftsQuoteQuery(terms, " ")
-	var res []Memory
-	var err error
-	if ftsValid(db, "memories_fts", q) {
-		res, err = scanMemories(db, cols+` JOIN memories_fts f ON f.rowid = m.id WHERE memories_fts MATCH ?`+conds+
-			` ORDER BY rank LIMIT ?`, append(append([]any{q}, args...), limit))
-	} else if ftsValid(db, "memories_fts", ftsQ) {
-		res, err = scanMemories(db, cols+` JOIN memories_fts f ON f.rowid = m.id WHERE memories_fts MATCH ?`+conds+
-			` ORDER BY rank LIMIT ?`, append(append([]any{ftsQ}, args...), limit))
-	} else {
-		like := "%" + q + "%"
-		res, err = scanMemories(db, cols+` WHERE (m.title LIKE ? OR m.content LIKE ? OR m.tags LIKE ?)`+conds+
-			` ORDER BY max(m.mtime, m.ts) DESC LIMIT ?`, append(append([]any{like, like, like}, args...), limit))
+	where, wargs, fts := matchFTS(db, "memories_fts", terms,
+		`(m.title LIKE ? ESCAPE '\' OR m.content LIKE ? ESCAPE '\' OR m.tags LIKE ? ESCAPE '\')`, 3)
+	from, order := cols, recent
+	if fts {
+		from, order = cols+join, ` ORDER BY rank LIMIT ?`
 	}
-	// Multi-term fallback: if strict AND returned 0 rows, try OR ranked by bm25
-	if err == nil && len(res) == 0 && len(terms) > 1 {
-		orQ := ftsQuoteQuery(terms, " OR ")
-		if ftsValid(db, "memories_fts", orQ) {
-			res, err = scanMemories(db, cols+` JOIN memories_fts f ON f.rowid = m.id WHERE memories_fts MATCH ?`+conds+
-				` ORDER BY bm25(memories_fts) LIMIT ?`, append(append([]any{orQ}, args...), limit))
+	res, err := scanMemories(db, from+" WHERE "+where+conds+order, concat(wargs, args, []any{limit}))
+	if err == nil && len(res) == 0 {
+		if orQ := orFallback(db, "memories_fts", terms); orQ != "" {
+			res, err = scanMemories(db, cols+join+` WHERE memories_fts MATCH ?`+conds+` ORDER BY bm25(memories_fts) LIMIT ?`,
+				concat([]any{orQ}, args, []any{limit}))
 		}
 	}
 	return res, err
@@ -382,7 +371,7 @@ const noteHint = "# (First line above is namespace:title [tags]. Write note/cred
 
 func noteDoc(m Memory) string {
 	h := "# " + m.Namespace + ":" + m.Title
-	if m.Tags != "" {
+	if m.Tags != "" || strings.HasSuffix(m.Title, "]") { // "[]" keeps a title ending in ']' intact
 		h += " [" + m.Tags + "]"
 	}
 	return h + "\n\n" + m.Content + "\n"
@@ -398,7 +387,7 @@ func parseNoteDoc(text string) (ns, title, tags, body string, ok bool) {
 			continue
 		}
 		if !ok && len(rest) == 0 && strings.HasPrefix(t, "#") && i < len(lines) {
-			ns, title, tags = parseTarget(strings.TrimLeft(t, "# "))
+			ns, title, tags = parseHeader(strings.TrimLeft(t, "# "))
 			ok = true
 			continue
 		}
@@ -410,16 +399,34 @@ func parseNoteDoc(text string) (ns, title, tags, body string, ok bool) {
 	return ns, title, tags, strings.TrimSpace(strings.Join(rest, "\n")), ok
 }
 
-// parseTarget reads "ns:title [tags]" (also "ns/title"; bare title → notes).
-func parseTarget(s string) (ns, title, tags string) {
+// parseHeader reads a note document header: "ns:title [tags]".
+func parseHeader(h string) (ns, title, tags string) {
+	h = strings.TrimSpace(h)
+	if i := strings.LastIndex(h, " ["); i >= 0 && strings.HasSuffix(h, "]") {
+		h, tags = h[:i], normTags(h[i+2:len(h)-1])
+	}
+	ns, title = parseTarget(h)
+	return ns, title, tags
+}
+
+// parseTarget reads "ns:title". The first ':' splits, so titles may contain
+// colons ("guide:Faz 1: Setup") and namespaces slashes ("projeler/aktif:x").
+// Without a colon the last '/' splits ("machines/kali"). A bare title or an
+// empty namespace means "notes".
+func parseTarget(s string) (ns, title string) {
 	s = strings.TrimSpace(s)
-	if i := strings.LastIndex(s, " ["); i >= 0 && strings.HasSuffix(s, "]") {
-		s, tags = strings.TrimSpace(s[:i]), strings.TrimSpace(s[i+2:len(s)-1])
+	i := strings.IndexByte(s, ':')
+	if i < 0 {
+		i = strings.LastIndexByte(s, '/')
 	}
-	if i := strings.IndexAny(s, ":/"); i >= 0 {
-		return s[:i], s[i+1:], tags
+	title = s
+	if i >= 0 {
+		ns, title = strings.TrimSpace(s[:i]), strings.TrimSpace(s[i+1:])
 	}
-	return "notes", s, tags
+	if ns == "" {
+		ns = "notes"
+	}
+	return ns, title
 }
 
 func editNoteCmd(target string) int {
@@ -446,6 +453,7 @@ func editNoteCmd(target string) int {
 	}
 	text, err := editText(fmt.Sprintf("iz-note-%d-*.md", id), noteDoc(m))
 	if err != nil {
+		fmt.Fprintln(os.Stderr, "iz: editor:", err)
 		return 1
 	}
 	ns, title, tags, body, ok := parseNoteDoc(text)
@@ -490,8 +498,12 @@ func newNoteCmd() int {
 		fmt.Fprintln(os.Stderr, "iz n new: interactive editor requires a terminal (use 'iz n <ns:title> \"content\"' instead)")
 		return 2
 	}
-	text, err := editText("iz-new-note-*.md", "# pentest:target-creds\n"+noteHint+"\n\n")
+	// A fresh, dated default title: keeping the header unchanged must not
+	// land on (and overwrite) some existing note.
+	untitled := "note-" + time.Now().Format("20060102-150405")
+	text, err := editText("iz-new-note-*.md", "# notes:"+untitled+"\n"+noteHint+"\n\n")
 	if err != nil {
+		fmt.Fprintln(os.Stderr, "iz: editor:", err)
 		return 1
 	}
 	ns, title, tags, body, ok := parseNoteDoc(text)
@@ -500,18 +512,49 @@ func newNoteCmd() int {
 		return 0
 	}
 	if !ok || title == "" {
-		ns, title = "notes", "quick-note"
+		ns, title = "notes", untitled
 	}
-	return saveNote(Memory{Namespace: ns, Title: title, Tags: tags, Content: body}, false)
+	return saveNote(Memory{Namespace: ns, Title: title, Tags: tags, TagsSet: true, Content: body}, false, true)
 }
 
-func saveNote(m Memory, appendMode bool) int {
+// numbered renders the n-th (n ≥ 2) variant of a taken title: "x (2)".
+func numbered(title string, n int) string { return fmt.Sprintf("%s (%d)", title, n) }
+
+// freeTitle returns title, or its first numbered variant not yet used in ns.
+func freeTitle(db *sql.DB, ns, title string) (string, error) {
+	for n := 1; ; n++ {
+		t := title
+		if n > 1 {
+			t = numbered(title, n)
+		}
+		err := db.QueryRow(`SELECT 1 FROM memories WHERE namespace=? AND title=?`, ns, t).Scan(new(int))
+		if err == sql.ErrNoRows {
+			return t, nil
+		}
+		if err != nil {
+			return "", err
+		}
+	}
+}
+
+// saveNote upserts m by (namespace, title); appendMode appends the content to
+// an existing note, create never touches one (a taken title gets numbered).
+func saveNote(m Memory, appendMode, create bool) int {
 	db, err := openDB()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "iz:", err)
 		return 2
 	}
 	defer db.Close()
+	if create {
+		if m.Title, err = freeTitle(db, m.Namespace, m.Title); err != nil {
+			fmt.Fprintln(os.Stderr, "iz:", err)
+			return 1
+		}
+	}
+	if m.Author == "" {
+		m.Author = defaultAuthor()
+	}
 	id, updated, err := upsertMemory(db, m, appendMode)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "iz: failed to save note:", err)
@@ -623,46 +666,44 @@ Usage:
 			tags = " · " + m.Tags
 		}
 		fmt.Printf("\x1b[1;36m#%d %s:%s\x1b[0m \x1b[90m· @%s · %s · %s%s\x1b[0m\n%s\n",
-			m.ID, m.Namespace, m.Title, m.Author, m.Hostname, fmtTsShort(m.Ts), tags, m.Content)
+			m.ID, m.Namespace, m.Title, m.Author, m.Hostname, noteDates(m), tags, m.Content)
 		return 0
 	}
 
-	// Adding or updating a note: `iz n [-t tags] [-a] <target> [content...]`
-	var tagsFlag string
-	tagsSet := false
-	appendMode := false
+	// Adding or updating a note: `iz n [-t tags] [-a] <target> [content...]`.
+	// Flags are recognized anywhere ("x:y text -a" appends); after "--"
+	// everything is content.
+	var tags string
+	tagsSet, appendMode := false, false
 	var pos []string
-	stopFlags := false
+flags:
 	for i := 0; i < len(args); i++ {
-		if !stopFlags && len(pos) < 2 {
-			switch args[i] {
-			case "--":
-				stopFlags = true
-				continue
-			case "-t", "--tags":
-				if i+1 < len(args) {
-					tagsFlag = args[i+1]
-					tagsSet = true
-					i++
-					continue
-				}
-			case "-a", "--append":
-				appendMode = true
-				continue
+		switch args[i] {
+		case "--":
+			pos = append(pos, args[i+1:]...)
+			break flags
+		case "-t", "--tags":
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "iz n: -t needs a value (comma-separated tags)")
+				return 2
 			}
+			tags, tagsSet = args[i+1], true
+			i++
+		case "-a", "--append":
+			appendMode = true
+		default:
+			pos = append(pos, args[i])
 		}
-		pos = append(pos, args[i])
 	}
 	if len(pos) == 0 {
 		fmt.Fprintln(os.Stderr, "usage: iz n <ns:title> [-t tags] [-a] [content]")
 		return 2
 	}
 
-	m := Memory{}
-	m.Namespace, m.Title, m.Tags = parseTarget(pos[0])
-	if tagsSet {
-		m.Tags = tagsFlag
-		m.TagsSet = true
+	m := Memory{Tags: tags, TagsSet: tagsSet}
+	if m.Namespace, m.Title = parseTarget(pos[0]); m.Title == "" {
+		fmt.Fprintf(os.Stderr, "iz n: invalid note target %q (want namespace:title)\n", pos[0])
+		return 2
 	}
 	words := pos[1:]
 	content := strings.Join(words, " ")
@@ -679,10 +720,19 @@ Usage:
 		fmt.Fprintln(os.Stderr, "iz: note content cannot be empty (provide text or pipe via stdin)")
 		return 2
 	}
-	return saveNote(m, appendMode)
+	return saveNote(m, appendMode, false)
 }
 
-// listNotes prints one aligned line per note: id, ns:title, date, size.
+// noteDates renders when a note was created and, if later, last updated.
+func noteDates(m Memory) string {
+	d := fmtTsShort(m.Ts)
+	if m.Mtime > m.Ts+1 {
+		d += " · updated " + fmtTsShort(m.Mtime)
+	}
+	return d
+}
+
+// listNotes prints one aligned line per note: id, ns:title, last update, size.
 func listNotes(namespace string) int {
 	db, err := openDB()
 	if err != nil {
@@ -691,11 +741,11 @@ func listNotes(namespace string) int {
 	}
 	defer db.Close()
 
-	q := "SELECT id, ts, namespace, title, author, length(content) FROM memories"
+	q := "SELECT id, max(mtime, ts), namespace, title, author, length(content) FROM memories WHERE 1=1"
 	var args []any
 	if namespace != "" {
-		q += " WHERE namespace LIKE ?"
-		args = append(args, namespace+"%")
+		c, a := likePrefix("namespace", namespace)
+		q, args = q+c, append(args, a)
 	}
 	rows, err := db.Query(q+" ORDER BY namespace, title, ts DESC", args...)
 	if err != nil {
@@ -724,6 +774,10 @@ func listNotes(namespace string) int {
 		w = max(w, len([]rune(r.name)))
 		out = append(out, r)
 	}
+	if err := rows.Err(); err != nil {
+		fmt.Fprintln(os.Stderr, "iz:", err)
+		return 1
+	}
 	if len(out) == 0 {
 		fmt.Println("No notes found.")
 		return 0
@@ -735,12 +789,27 @@ func listNotes(namespace string) int {
 }
 
 // importNotes walks a file or directory and imports markdown sections as
-// memories, in one transaction.
+// memories, in one transaction: any error imports nothing.
 func importNotes(path string) int {
 	fi, err := os.Stat(path)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "iz:", err)
 		return 2
+	}
+
+	files := []string{path}
+	if fi.IsDir() {
+		files = nil
+		err := filepath.WalkDir(path, func(p string, d fs.DirEntry, err error) error {
+			if err == nil && !d.IsDir() && strings.HasSuffix(d.Name(), ".md") {
+				files = append(files, p)
+			}
+			return err
+		})
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "iz:", err)
+			return 1
+		}
 	}
 
 	db, err := openDB()
@@ -749,18 +818,6 @@ func importNotes(path string) int {
 		return 2
 	}
 	defer db.Close()
-
-	var files []string
-	if fi.IsDir() {
-		filepath.Walk(path, func(p string, info os.FileInfo, err error) error { //nolint
-			if err == nil && !info.IsDir() && strings.HasSuffix(info.Name(), ".md") {
-				files = append(files, p)
-			}
-			return nil
-		})
-	} else {
-		files = append(files, path)
-	}
 
 	tx, err := db.Begin()
 	if err != nil {
@@ -774,67 +831,37 @@ func importNotes(path string) int {
 	for _, f := range files {
 		data, err := os.ReadFile(f)
 		if err != nil {
-			continue
+			fmt.Fprintln(os.Stderr, "iz:", err)
+			return 1
 		}
-		text := string(data)
 		ns := strings.TrimSuffix(filepath.Base(f), ".md")
 		if fi.IsDir() {
 			if rel, err := filepath.Rel(path, f); err == nil {
 				ns = strings.TrimSuffix(filepath.ToSlash(rel), ".md")
 			}
 		}
-		add := func(title, body string) {
-			body = strings.TrimSpace(body)
-			title = strings.TrimSpace(title)
-			if body == "" || title == "" {
-				return
+		ns = strings.ReplaceAll(ns, ":", "-") // keep "ns:title" targets unambiguous
+		seen := map[string]bool{}
+		for _, sec := range splitMarkdown(string(data), ns) {
+			// a repeated heading in one file is its own note, not an overwrite;
+			// generated titles count too ("Foo", "Foo (2)", "Foo" → "Foo (3)")
+			title := sec.title
+			for n := 2; seen[title]; n++ {
+				title = numbered(sec.title, n)
 			}
-			m := Memory{Namespace: ns, Title: title, Content: body, Author: "import"}
-			if _, wasUpd, err := upsertMemoryTx(tx, m, false); err == nil {
-				if wasUpd {
-					updated++
-				} else {
-					imported++
-				}
+			seen[title] = true
+			m := Memory{Namespace: ns, Title: title, Content: sec.body, Author: "import"}
+			_, wasUpd, err := upsertMemoryTx(tx, m, false)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "iz: import %s [%s]: %v (nothing imported)\n", f, title, err)
+				return 1
+			}
+			if wasUpd {
+				updated++
+			} else {
+				imported++
 			}
 		}
-
-		// Split by line-start § only if the document actually uses § section markers
-		if strings.HasPrefix(strings.TrimSpace(text), "§") || strings.Contains(text, "\n§ ") {
-			for i, p := range strings.Split(text, "\n§") {
-				title := fmt.Sprintf("Section %d", i+1)
-				for _, l := range strings.Split(strings.TrimSpace(p), "\n") {
-					l = strings.TrimSpace(strings.TrimPrefix(l, "§"))
-					if strings.HasPrefix(l, "#") {
-						title = strings.TrimLeft(l, "# ")
-						break
-					} else if l != "" {
-						title = trunc(l, 40)
-						break
-					}
-				}
-				add(title, strings.TrimPrefix(p, "§"))
-			}
-			continue
-		}
-
-		// Split by Markdown headers (#, ##), ignoring headers inside fenced code blocks
-		currTitle := ns
-		var curr []string
-		inCode := false
-		for _, l := range strings.Split(text, "\n") {
-			trimmed := strings.TrimSpace(l)
-			if strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~") {
-				inCode = !inCode
-			}
-			if !inCode && (strings.HasPrefix(l, "## ") || strings.HasPrefix(l, "# ")) {
-				add(currTitle, strings.Join(curr, "\n"))
-				curr = nil
-				currTitle = strings.TrimLeft(l, "# ")
-			}
-			curr = append(curr, l)
-		}
-		add(currTitle, strings.Join(curr, "\n"))
 	}
 	if err := tx.Commit(); err != nil {
 		fmt.Fprintln(os.Stderr, "iz:", err)
@@ -842,6 +869,98 @@ func importNotes(path string) int {
 	}
 	fmt.Fprintf(os.Stderr, "[iz] imported %d new, updated %d notes from %s\n", imported, updated, path)
 	return 0
+}
+
+type mdSection struct{ title, body string }
+
+// splitMarkdown splits a markdown document into titled sections: at "§"
+// marker lines ("§" alone or "§ …") when the document has any, otherwise at
+// "#"/"##" headings. Lines inside fenced code blocks never split. A heading
+// becomes the title and is not repeated in the body; text before the first
+// heading is titled defTitle. A § section is titled by its first line: a
+// heading moves out of the body, plain text stays and is abbreviated.
+func splitMarkdown(text, defTitle string) []mdSection {
+	lines := strings.Split(text, "\n")
+	isMark := func(l string) bool { return strings.TrimRight(l, " \t\r") == "§" || strings.HasPrefix(l, "§ ") }
+	marks := false
+	var fence codeFence
+	for _, l := range lines {
+		if !fence.inside(l) && isMark(l) {
+			marks = true
+			break
+		}
+	}
+
+	var out []mdSection
+	title := defTitle
+	var body []string
+	flush := func() {
+		b := strings.TrimSpace(strings.Join(body, "\n"))
+		t := title
+		if marks {
+			first, rest, _ := strings.Cut(b, "\n")
+			if h, ok := headingText(first, 6); ok {
+				t, b = h, strings.TrimSpace(rest)
+			} else {
+				t = trunc(strings.TrimSpace(first), 40)
+			}
+		}
+		if t != "" && b != "" {
+			out = append(out, mdSection{t, b})
+		}
+		body = nil
+	}
+	fence = codeFence{}
+	for _, l := range lines {
+		if fence.inside(l) {
+			body = append(body, l)
+			continue
+		}
+		if marks && isMark(l) {
+			flush()
+			l = strings.TrimSpace(strings.TrimPrefix(l, "§")) // rest of the marker line is content
+		} else if h, ok := headingText(l, 2); ok && !marks {
+			flush()
+			title = h
+			continue
+		}
+		body = append(body, l)
+	}
+	flush()
+	return out
+}
+
+// headingText returns the text of an ATX heading ("## Title") of level ≤ max.
+func headingText(l string, max int) (string, bool) {
+	n := len(l) - len(strings.TrimLeft(l, "#"))
+	if n == 0 || n > max || n == len(l) || l[n] != ' ' && l[n] != '\t' {
+		return "", false
+	}
+	return strings.TrimSpace(l[n:]), true
+}
+
+// codeFence tracks fenced code blocks: ``` and ~~~ fences are independent,
+// and a block closes only with the same character, at least as long. As in
+// CommonMark, a backtick fence's info string has no backticks, so a line
+// like "```inline``` text" is not a fence.
+type codeFence struct{ open string }
+
+// inside reports whether line is a fence line or inside a code block.
+func (f *codeFence) inside(line string) bool {
+	t := strings.TrimSpace(line)
+	if f.open != "" {
+		if len(t) >= len(f.open) && strings.Trim(t, f.open[:1]) == "" {
+			f.open = ""
+		}
+		return true
+	}
+	for _, c := range []string{"`", "~"} {
+		if n := len(t) - len(strings.TrimLeft(t, c)); n >= 3 && !(c == "`" && strings.Contains(t[n:], "`")) {
+			f.open = strings.Repeat(c, n)
+			return true
+		}
+	}
+	return false
 }
 
 // recallCmd searches both memories and runs for AI agents or terminal queries:
@@ -877,12 +996,17 @@ func recallCmd(args []string) int {
 		case "--full", "-f":
 			full = true
 		case "-l", "--limit":
-			if i+1 < len(args) {
-				if n, err := strconv.Atoi(args[i+1]); err == nil && n > 0 {
-					limit = n
-				}
-				i++
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, usage)
+				return 2
 			}
+			n, err := strconv.Atoi(args[i+1])
+			if err != nil || n <= 0 {
+				fmt.Fprintf(os.Stderr, "iz recall: invalid limit %q\n", args[i+1])
+				return 2
+			}
+			limit = n
+			i++
 		default:
 			queryTerms = append(queryTerms, a)
 		}
@@ -893,9 +1017,13 @@ func recallCmd(args []string) int {
 		fmt.Fprintln(os.Stderr, "iz: empty recall query")
 		return 2
 	}
-	for _, t := range strings.Fields(query) {
-		runsOnly = runsOnly || hasPrefixAny(t, runFilters)
-		notesOnly = notesOnly || hasPrefixAny(t, memFilters)
+	// Explicit -n/-r win; otherwise a filter only one side understands
+	// (cmd:, size:… vs ns:, tag:…) limits the search to that side.
+	if !runsOnly && !notesOnly {
+		for _, t := range strings.Fields(query) {
+			runsOnly = runsOnly || hasPrefixAny(t, runFilters)
+			notesOnly = notesOnly || hasPrefixAny(t, memFilters)
+		}
 	}
 	if runsOnly && notesOnly {
 		runsOnly, notesOnly = false, false
@@ -910,7 +1038,10 @@ func recallCmd(args []string) int {
 
 	var memories []Memory
 	if !runsOnly {
-		memories, _ = queryMemories(db, query, limit)
+		if memories, err = queryMemories(db, query, limit); err != nil {
+			fmt.Fprintln(os.Stderr, "iz recall: notes:", err)
+			return 1
+		}
 	}
 	var runs []Run
 	if !notesOnly {
@@ -918,7 +1049,10 @@ func recallCmd(args []string) int {
 		if runsOnly {
 			runLimit = limit
 		}
-		runs, _ = searchRuns(db, query, runLimit, true)
+		if runs, err = searchRuns(db, query, runLimit, true); err != nil {
+			fmt.Fprintln(os.Stderr, "iz recall: runs:", err)
+			return 1
+		}
 	}
 
 	if jsonOutput {
@@ -971,7 +1105,7 @@ func recallCmd(args []string) int {
 			tags = " [" + m.Tags + "]"
 		}
 		fmt.Printf("\x1b[32m#%d %s:%s\x1b[0m\x1b[90m%s · %s\x1b[0m\n",
-			m.ID, m.Namespace, m.Title, tags, fmtTsShort(m.Ts))
+			m.ID, m.Namespace, m.Title, tags, noteDates(m))
 		body := strings.TrimSpace(m.Content)
 		if full {
 			fmt.Println(body)
@@ -1008,6 +1142,9 @@ func primeCmd(args []string) int {
 		case "-h", "--help":
 			fmt.Println("usage: iz prime [--json]   # compact memory namespace/title index for AI agents")
 			return 0
+		default:
+			fmt.Fprintf(os.Stderr, "iz prime: unknown argument %q (usage: iz prime [--json])\n", a)
+			return 2
 		}
 	}
 	db, err := openDB()

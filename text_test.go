@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestTidyRawKeepsCRLF(t *testing.T) {
@@ -72,5 +73,46 @@ func TestTruncUTF8Safe(t *testing.T) {
 	left := truncLeft("nmap -sV --script=vuln 10.0.0.1", 10)
 	if left != "… 10.0.0.1" {
 		t.Errorf("truncLeft = %q, want %q", left, "… 10.0.0.1")
+	}
+}
+
+func TestFoldTurkish(t *testing.T) {
+	if a, b := fold("İSTANBUL IŞIK"), fold("istanbul ışık"); a != b {
+		t.Errorf("fold mismatch: %q vs %q", a, b)
+	}
+	folded, off := foldMap([]byte("aİb"))
+	if string(folded) != "aib" || len(off) != len(folded)+1 || off[2] != 3 || off[3] != 4 {
+		t.Errorf("foldMap = %q %v", folded, off)
+	}
+	if _, off := foldMap([]byte("ascii")); off != nil {
+		t.Error("ASCII input must take the identity fast path")
+	}
+}
+
+// Truecolor SGR with ':' separators is an escape sequence too.
+func TestStripANSITruecolor(t *testing.T) {
+	if got := string(stripANSI([]byte("\x1b[38:2:255:0:0mred\x1b[0m"))); got != "red" {
+		t.Errorf("stripANSI = %q", got)
+	}
+}
+
+// truncFTS never cuts inside a rune and keeps as much as fits.
+func TestTruncFTSRuneBoundary(t *testing.T) {
+	b := append([]byte("x"), bytes.Repeat([]byte("ş"), maxFTSBytes)...) // odd offset: limit lands mid-rune
+	got := truncFTS(b)
+	if !utf8.Valid(got) || len(got) > maxFTSBytes || len(got) < maxFTSBytes-utf8.UTFMax {
+		t.Errorf("truncFTS: len=%d valid=%v", len(got), utf8.Valid(got))
+	}
+}
+
+// ungz caps decompressed size (a gzip bomb from a merged database).
+func TestUngzLimit(t *testing.T) {
+	const limit = 64 << 10
+	z := gz(make([]byte, 4*limit))
+	if got := len(ungzLimit(z, limit)); got != limit {
+		t.Errorf("ungzLimit = %d bytes, want cap %d", got, limit)
+	}
+	if got := len(ungzLimit(z, 8*limit)); got != 4*limit {
+		t.Errorf("ungzLimit under the cap = %d bytes, want %d", got, 4*limit)
 	}
 }

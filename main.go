@@ -14,7 +14,7 @@ Usage:
   iz [query]                 search TUI (fzf); query: free text + filters
                                  host:machine  cmd:tool  dir:name  size:>1mb
   iz -- <cmd> [args...]      run command under a PTY, record its colored output
-  iz sh <id> [id...] [query] print output(s) as-is; query terms get highlighted
+  iz sh <id> [id...] [--] [query]  print output(s) as-is; query terms get highlighted
   iz e <id>                  open output in $EDITOR
   iz a <tool>...             add tools to the auto-record list
   iz d <tool>...             remove tools from the auto-record list
@@ -93,9 +93,28 @@ func main() {
 }
 
 func oneArg(usageLine string, args []string, fn func(string) int) int {
+	if code, done := helpOrFlag("usage: "+usageLine, args); done {
+		return code
+	}
 	if len(args) != 1 {
 		fmt.Fprintln(os.Stderr, "usage:", usageLine)
 		return 2
 	}
 	return fn(args[0])
+}
+
+// helpOrFlag handles the options of a command that takes none but --help:
+// it prints usage and reports the exit code when args hold an option.
+func helpOrFlag(usage string, args []string) (code int, done bool) {
+	for _, a := range args {
+		switch {
+		case a == "-h" || a == "--help":
+			fmt.Println(usage)
+			return 0, true
+		case len(a) > 1 && a[0] == '-':
+			fmt.Fprintf(os.Stderr, "iz: unknown option %q\n%s\n", a, usage)
+			return 2, true
+		}
+	}
+	return 0, false
 }

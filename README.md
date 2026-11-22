@@ -91,6 +91,7 @@ iz a cargo make pytest            # record these tools automatically via wrapper
 iz init                           # auto-setup shell wrappers & AI assistants
 iz                                # search runs TUI
 iz sh 42                          # replay output #42, colors intact
+iz sh 42 -- 443                   # same, highlighting "443" (after -- a number is a query)
 iz e 42                           # open output #42 in $EDITOR
 iz i cargo build.log              # import a log file
 iz m laptop.db                    # merge a db from another machine (runs + notes)
@@ -108,6 +109,7 @@ iz prime [--json]                 # compact index of namespaces & note titles
 iz recall "kali"                  # hybrid search across notes + command runs
 iz recall --json "kali"           # compact JSON for AI agents (filters: ns:, tag:, author:, cmd:, host:, dir:, size:)
 iz sync                           # two-way sync with Turso/LibSQL ($IZ_SYNC_URL or atuin kv)
+iz sync --prune                   # same, reporting expired (30-day) tombstones pruned
 iz ai                             # print AI agent integration guide
 ```
 
@@ -130,6 +132,7 @@ iz 'deprecated'                   # exact phrase via FTS
 | `ctrl-e` | open output / note in `$EDITOR` |
 | `ctrl-n` | create a new note in `$EDITOR` (`iz n` TUI) |
 | `ctrl-y` | delete selected runs / note and reload |
+| `ctrl-o` | open the notes TUI (from the runs TUI) |
 | `'term` | fzf exact match (e.g. `'tool:make`) |
 
 ### Pausing recording
@@ -172,7 +175,7 @@ make linux     # static linux/amd64 + linux/arm64 into dist/
 |---|---|
 | `main.go` | CLI dispatch |
 | `db.go` | schema, migrations, CRUD, query parsing |
-| `record.go` | PTY capture, shell quoting |
+| `record.go` | PTY / pipe capture, bounded buffer, shell quoting |
 | `text.go` | ANSI cleanup, gzip, UTF-8 truncation |
 | `search.go` | fzf runs TUI |
 | `cmds.go` | add/del/list/rm/import/merge/show/edit |

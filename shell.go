@@ -9,9 +9,10 @@ import (
 	"strings"
 )
 
-// isToolName rejects anything that is not a plain binary name (injection guard).
+// isToolName rejects anything that is not a plain binary name (injection
+// guard); a leading '-' would read as an option ("iz a --help").
 func isToolName(s string) bool {
-	if s == "" {
+	if s == "" || s[0] == '-' {
 		return false
 	}
 	for _, c := range s {
@@ -21,6 +22,9 @@ func isToolName(s string) bool {
 	}
 	return true
 }
+
+// wrappable reports whether name may get a recording wrapper function.
+func wrappable(name string) bool { return name != "iz" && isToolName(name) && !isShellReserved(name) }
 
 // shellEnv emits shell integration code for fish, zsh, or bash.
 func shellEnv(sh string, db *sql.DB) (string, error) {
@@ -45,8 +49,10 @@ function __iz_widget --description 'iz: search commands + output'
     end
     commandline -f repaint
 end
-bind -M default $__iz_key __iz_widget
-bind -M insert  $__iz_key __iz_widget
+if status is-interactive
+    bind -M default $__iz_key __iz_widget
+    bind -M insert  $__iz_key __iz_widget
+end
 
 set -l __iz_notes_key \co
 if set -q IZ_NOTES_KEY
@@ -57,12 +63,14 @@ function __iz_notes_widget --description 'iz: interactive notes & pentest memory
     command iz n
     commandline -f repaint
 end
-bind -M default $__iz_notes_key __iz_notes_widget
-bind -M insert  $__iz_notes_key __iz_notes_widget
+if status is-interactive
+    bind -M default $__iz_notes_key __iz_notes_widget
+    bind -M insert  $__iz_notes_key __iz_notes_widget
+end
 
 `)
 		for _, name := range tools {
-			if name == "" || !isToolName(name) {
+			if !wrappable(name) {
 				continue
 			}
 			fmt.Fprintf(&b, `function %[1]s --wraps %[1]s --description 'iz: recorded %[1]s'
@@ -101,20 +109,7 @@ zle -N __iz_zsh_notes_widget
 bindkey "${IZ_NOTES_KEY:-^O}" __iz_zsh_notes_widget
 
 `)
-		for _, name := range tools {
-			if name == "" || !isToolName(name) {
-				continue
-			}
-			fmt.Fprintf(&b, `%[1]s() {
-    if [ -n "$IZ" ]; then
-        command iz -- %[1]s "$@"
-    else
-        command %[1]s "$@"
-    fi
-}
-`, name)
-		}
-		b.WriteString("\n# --- iz: end ---\n")
+		posixWrappers(&b, tools)
 
 	case "bash":
 		b.WriteString(`# --- iz: begin (eval "$(iz init bash)") ---
@@ -136,26 +131,36 @@ __iz_bash_notes_widget() {
 bind -x "\"${IZ_NOTES_KEY:-\\C-o}\": __iz_bash_notes_widget"
 
 `)
-		for _, name := range tools {
-			if name == "" || !isToolName(name) {
-				continue
-			}
-			fmt.Fprintf(&b, `%[1]s() {
-    if [ -n "$IZ" ]; then
-        command iz -- %[1]s "$@"
-    else
-        command %[1]s "$@"
-    fi
-}
-`, name)
-		}
-		b.WriteString("\n# --- iz: end ---\n")
+		posixWrappers(&b, tools)
 
 	default:
 		return "", fmt.Errorf("unsupported shell %q (supported: fish, zsh, bash)", sh)
 	}
 
 	return b.String(), nil
+}
+
+// posixWrappers writes the zsh/bash recording wrappers. `function name {`
+// keeps the name out of command position, so an alias of the same name
+// (oh-my-zsh: gau, gf) is not expanded while the code is parsed; such an
+// alias is the user's and wins, so no wrapper is defined for it.
+func posixWrappers(b *strings.Builder, tools []string) {
+	for _, name := range tools {
+		if !wrappable(name) {
+			continue
+		}
+		fmt.Fprintf(b, `if ! alias %[1]s >/dev/null 2>&1; then
+function %[1]s {
+    if [ -n "$IZ" ]; then
+        command iz -- %[1]s "$@"
+    else
+        command %[1]s "$@"
+    fi
+}
+fi
+`, name)
+	}
+	b.WriteString("\n# --- iz: end ---\n")
 }
 
 // fishCmd maintains backwards compatibility for `iz f` / `iz fish`.
@@ -188,6 +193,7 @@ iz is available on the PATH. It is your persistent second-brain memory and comma
     iz recall --full "<query>"      # full untruncated note contents
     iz n show <id|ns:title>         # inspect full note content
     iz sh <run_id>                  # view full recorded terminal output
+    iz sh <run_id> -- "<pattern>"   # same, with the pattern highlighted
 
 - Persist All Learnings Proactively:
     Whenever you discover user preferences, project architecture, credentials, bug fixes, or runbooks:
@@ -241,7 +247,7 @@ Before asking the user questions or assuming context is missing:
    ` + "```bash" + `
    iz n show <id|ns:title>          # View complete note in markdown
    iz sh <run_id>                   # Replay full colored terminal output of a past run
-   iz sh <run_id> "<pattern>"       # Replay and highlight matching text
+   iz sh <run_id> -- "<pattern>"    # Replay and highlight matching text
    ` + "```" + `
 
 ## Recording Learnings (Proactive Knowledge Persistence)
@@ -288,11 +294,12 @@ NEVER execute interactive commands that launch a TTY/fzf interface or ` + "`$EDI
 `
 
 // initCmd handles `iz init`:
-//   iz init                     (detects shell, auto-installs hooks to shell rc + agents)
-//   iz init <fish|zsh|bash>     (prints shell integration script to stdout)
-//   iz init --shell [fish|zsh]  (installs hook into shell rc)
-//   iz init --agent [claude|..] (installs instructions into AI assistant config)
-//   iz init --show              (displays detected shells and agents)
+//
+//	iz init                     (detects shell, auto-installs hooks to shell rc + agents)
+//	iz init <fish|zsh|bash>     (prints shell integration script to stdout)
+//	iz init --shell [fish|zsh]  (installs hook into shell rc)
+//	iz init --agent [claude|..] (installs instructions into AI assistant config)
+//	iz init --show              (displays detected shells and agents)
 func initCmd(args []string) int {
 	if len(args) == 1 {
 		sh := args[0]
@@ -357,6 +364,7 @@ Usage:
 	}
 
 	autoMode := targetShell == "" && targetAgent == ""
+	failed := false
 
 	// 1. Configure Shells
 	installedShells := 0
@@ -376,7 +384,11 @@ Usage:
 		// Detect default shell
 		detected := detectShell()
 		if detected != "" {
-			if changed, err := installShellHook(home, detected); err == nil && changed {
+			changed, err := installShellHook(home, detected)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "[iz] shell install (%s): %v\n", detected, err)
+				failed = true
+			} else if changed {
 				fmt.Fprintf(os.Stderr, "[iz] configured shell hook in %s\n", detected)
 				installedShells++
 			}
@@ -403,7 +415,11 @@ Usage:
 	} else if autoMode {
 		for _, ag := range []string{"claude", "opencode", "antigravity", "cursor"} {
 			if isAgentInstalled(home, ag) {
-				if changed, err := installAgentInstructions(home, ag); err == nil && changed {
+				changed, err := installAgentInstructions(home, ag)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "[iz] agent install (%s): %v\n", ag, err)
+					failed = true
+				} else if changed {
 					fmt.Fprintf(os.Stderr, "[iz] configured memory instructions for %s\n", ag)
 					installedAgents++
 				}
@@ -411,10 +427,12 @@ Usage:
 		}
 	}
 
+	if failed {
+		return 1
+	}
 	if installedShells == 0 && installedAgents == 0 && autoMode {
 		fmt.Fprintln(os.Stderr, "[iz] nothing needed update (already configured). Run 'iz init --show' to check.")
 	}
-
 	return 0
 }
 
@@ -432,7 +450,7 @@ func installShellHook(home, sh string) (bool, error) {
 	switch sh {
 	case "fish":
 		rcPath = filepath.Join(home, ".config", "fish", "config.fish")
-		hookLine = "if type -q iz; iz init fish | source; end"
+		hookLine = "if status is-interactive; and type -q iz; iz init fish | source; end"
 	case "zsh":
 		rcPath = filepath.Join(home, ".zshrc")
 		hookLine = `if command -v iz >/dev/null 2>&1; then eval "$(iz init zsh)"; fi`
@@ -464,7 +482,9 @@ func isAgentInstalled(home, agent string) bool {
 	return false
 }
 
-func installAgentInstructions(home, agent string) (bool, error) {
+// installAgentInstructions installs the iz memory instructions for agent;
+// changed reports whether any file was written or removed.
+func installAgentInstructions(home, agent string) (changed bool, err error) {
 	var targetPath string
 	switch agent {
 	case "claude":
@@ -472,23 +492,20 @@ func installAgentInstructions(home, agent string) (bool, error) {
 	case "opencode":
 		targetPath = filepath.Join(home, ".config", "opencode", "AGENTS.md")
 	case "antigravity", "gemini":
-		pluginDir := filepath.Join(home, ".gemini", "config", "plugins", "iz")
-		_ = os.MkdirAll(filepath.Join(pluginDir, "rules"), 0o755)
-		_ = os.MkdirAll(filepath.Join(pluginDir, "skills", "iz"), 0o755)
-		pluginJSON := filepath.Join(pluginDir, "plugin.json")
-		if _, err := os.Stat(pluginJSON); os.IsNotExist(err) {
-			_ = os.WriteFile(pluginJSON, []byte(`{
-  "name": "iz",
-  "version": "1.0.0",
-  "description": "Antigravity plugin for persistent agent memory, recall, and terminal execution ledger via iz"
-}
-`), 0o644)
+		config := filepath.Join(home, ".gemini", "config")
+		pluginDir := filepath.Join(config, "plugins", "iz")
+		if changed, err = installAntigravityPlugin(pluginDir); err != nil {
+			return false, err
 		}
-		skillPath := filepath.Join(pluginDir, "skills", "iz", "SKILL.md")
-		_ = os.WriteFile(skillPath, []byte(antigravitySkillMD), 0o644)
-		// Remove legacy duplicate rule/skill files if present
-		_ = os.Remove(filepath.Join(home, ".gemini", "config", "rules", "IZ.md"))
-		_ = os.RemoveAll(filepath.Join(home, ".gemini", "config", "skills", "iz"))
+		// Remove legacy duplicate rule/skill files, but only when iz wrote
+		// them; the skills/iz directory is ours too, the rules directory is not.
+		if removeIfOurs(filepath.Join(config, "rules", "IZ.md")) {
+			changed = true
+		}
+		if legacySkill := filepath.Join(config, "skills", "iz"); removeIfOurs(filepath.Join(legacySkill, "SKILL.md")) {
+			changed = true
+			os.Remove(legacySkill) //nolint — fails unless empty
+		}
 		targetPath = filepath.Join(pluginDir, "rules", "AGENTS.md")
 	case "cursor":
 		targetPath = filepath.Join(home, ".cursorrules")
@@ -496,9 +513,50 @@ func installAgentInstructions(home, agent string) (bool, error) {
 		return false, fmt.Errorf("unknown agent %s", agent)
 	}
 
-	return patchManagedBlock(targetPath, "<!-- iz-memory:begin -->", "<!-- iz-memory:end -->", aiPromptSnippet)
+	patched, err := patchManagedBlock(targetPath, "<!-- iz-memory:begin -->", "<!-- iz-memory:end -->", aiPromptSnippet)
+	return changed || patched, err
 }
 
+// installAntigravityPlugin writes the plugin manifest (kept when present)
+// and the iz skill into pluginDir; changed reports whether it wrote either.
+func installAntigravityPlugin(pluginDir string) (changed bool, err error) {
+	for _, d := range []string{"rules", filepath.Join("skills", "iz")} {
+		if err := os.MkdirAll(filepath.Join(pluginDir, d), 0o755); err != nil {
+			return false, err
+		}
+	}
+	pluginJSON := filepath.Join(pluginDir, "plugin.json")
+	if _, err := os.Stat(pluginJSON); os.IsNotExist(err) {
+		if err := os.WriteFile(pluginJSON, []byte(`{
+  "name": "iz",
+  "version": "1.0.0",
+  "description": "Antigravity plugin for persistent agent memory, recall, and terminal execution ledger via iz"
+}
+`), 0o644); err != nil {
+			return false, err
+		}
+		changed = true
+	}
+	skill := filepath.Join(pluginDir, "skills", "iz", "SKILL.md")
+	if old, err := os.ReadFile(skill); err == nil && string(old) == antigravitySkillMD {
+		return changed, nil
+	}
+	return true, os.WriteFile(skill, []byte(antigravitySkillMD), 0o644)
+}
+
+// removeIfOurs deletes a legacy file iz generated (it mentions `iz recall`);
+// user files are left alone. It reports whether the file was removed.
+func removeIfOurs(path string) bool {
+	if b, err := os.ReadFile(path); err != nil || !strings.Contains(string(b), "iz recall") {
+		return false
+	}
+	return os.Remove(path) == nil
+}
+
+// patchManagedBlock replaces the startMark…endMark block in path with block,
+// or appends block when there is none. A start marker without an end marker
+// is an error: appending a second block would make the next run delete the
+// user's text between the old start and the new end.
 func patchManagedBlock(path, startMark, endMark, block string) (bool, error) {
 	data, err := os.ReadFile(path)
 	if err != nil && !os.IsNotExist(err) {
@@ -506,11 +564,12 @@ func patchManagedBlock(path, startMark, endMark, block string) (bool, error) {
 	}
 
 	content := string(data)
-	start := strings.Index(content, startMark)
-	end := strings.Index(content, endMark)
-
-	if start >= 0 && end > start {
-		// Replace existing block
+	if start := strings.Index(content, startMark); start >= 0 {
+		end := strings.Index(content[start:], endMark)
+		if end < 0 {
+			return false, fmt.Errorf("%s: %q has no matching %q; fix or remove it by hand", path, startMark, endMark)
+		}
+		end += start
 		newContent := strings.TrimSpace(content[:start]+strings.TrimSpace(block)+content[end+len(endMark):]) + "\n"
 		if newContent == content {
 			return false, nil
@@ -524,7 +583,9 @@ func patchManagedBlock(path, startMark, endMark, block string) (bool, error) {
 		sep = ""
 	}
 	newContent := strings.TrimSpace(content) + sep + strings.TrimSpace(block) + "\n"
-	os.MkdirAll(filepath.Dir(path), 0o755) //nolint
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return false, err
+	}
 	return true, os.WriteFile(path, []byte(newContent), 0o644)
 }
 
@@ -540,7 +601,9 @@ func appendLineIfMissing(path, line, comment string) (bool, error) {
 	}
 
 	entry := "\n" + comment + "\n" + line + "\n"
-	os.MkdirAll(filepath.Dir(path), 0o755) //nolint
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return false, err
+	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return false, err
