@@ -89,7 +89,7 @@ func TestShellEnvParses(t *testing.T) {
 	}{
 		{"zsh", []string{"-f", "-n"}, []string{"-f", "-c", aliases + `source "$1" && alias gau && whence -w nmap`}},
 		{"bash", []string{"--norc", "--noprofile", "-n"}, []string{"--norc", "--noprofile", "-c",
-			"shopt -s expand_aliases\n" + aliases + `source "$1" 2>/dev/null; alias gau && declare -F nmap`}},
+			"shopt -s expand_aliases\n" + aliases + `source "$1" && alias gau && declare -F nmap`}},
 		{"fish", []string{"--no-config", "--no-execute"}, nil},
 	} {
 		t.Run(c.sh, func(t *testing.T) {
@@ -117,6 +117,10 @@ func TestShellEnvParses(t *testing.T) {
 			}
 			if !strings.Contains(string(out), "user-gau") || !strings.Contains(string(out), "nmap") {
 				t.Errorf("%s: alias lost or wrapper missing:\n%s", c.sh, out)
+			}
+			// a non-interactive shell loads it silently (no "line editing not enabled")
+			if strings.Contains(string(out), "warning") || strings.Contains(string(out), "bind") {
+				t.Errorf("%s: noisy load:\n%s", c.sh, out)
 			}
 		})
 	}
@@ -201,5 +205,19 @@ func TestInstallAntigravityPluginAndRemoveIfOurs(t *testing.T) {
 	}
 	if !exists(filepath.Join(config, "rules")) {
 		t.Error("user's rules directory removed")
+	}
+}
+
+// A whitespace-only file gets the block alone, without leading blank lines.
+func TestPatchManagedBlockBlankFile(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "AGENTS.md")
+	if err := os.WriteFile(p, []byte(" \n\n\t\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := patchManagedBlock(p, "<!-- b -->", "<!-- e -->", "<!-- b -->\nx\n<!-- e -->"); err != nil {
+		t.Fatal(err)
+	}
+	if data, _ := osReadFile(p); data != "<!-- b -->\nx\n<!-- e -->\n" {
+		t.Errorf("file = %q", data)
 	}
 }

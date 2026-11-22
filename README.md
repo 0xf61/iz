@@ -57,7 +57,7 @@ Or build from source:
 ```fish
 git clone https://github.com/0xf61/iz && cd iz
 go build -o ~/.local/bin/iz .
-echo 'iz f | source' >> ~/.config/fish/config.fish
+iz init                           # hook your shell (fish, zsh or bash) and AI assistants
 ```
 
 Cross-compiling for another machine (a server, a VM, a container) is a single
@@ -98,9 +98,10 @@ iz m laptop.db                    # merge a db from another machine (runs + note
 iz d less                         # remove a wrapper
 
 # Memory, notes & cloud sync
-iz n                              # interactive notes TUI (ctrl-o in fish)
+iz n                              # interactive notes TUI (ctrl-o in the shell)
 iz n machines:kali -t vpn "10.42.13.37"        # save a structured note (upsert)
 iz n -a machines:kali "SSH port 2222"          # append to an existing note
+iz n tools:ffuf -- ffuf -u URL -t 50           # after --, flags are content too
 iz n show machines:kali           # print full note content
 iz n list [namespace]             # list saved notes (alias: iz nl)
 iz n edit 1                       # edit note #1 in $EDITOR
@@ -119,7 +120,7 @@ Search examples:
 iz "warning: unused" cmd:cargo    # cargo runs mentioning a warning
 iz timeout host:build01           # runs on a specific machine
 iz size:>1mb                      # only large outputs (kb/mb/gb, > < >= <=)
-iz 'deprecated'                   # exact phrase via FTS
+iz '"is deprecated"'              # exact phrase (FTS5 quotes inside shell quotes)
 ```
 
 ### TUI keys
@@ -133,7 +134,7 @@ iz 'deprecated'                   # exact phrase via FTS
 | `ctrl-n` | create a new note in `$EDITOR` (`iz n` TUI) |
 | `ctrl-y` | delete selected runs / note and reload |
 | `ctrl-o` | open the notes TUI (from the runs TUI) |
-| `'term` | fzf exact match (e.g. `'tool:make`) |
+| typing | re-runs the search: filters and FTS syntax apply (`tool:make "exact phrase"`) |
 
 ### Pausing recording
 

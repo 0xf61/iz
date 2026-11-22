@@ -6,18 +6,26 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
-	"time"
 )
 
 // toolsCmd manages the auto-record list: iz a <tool> / iz d <tool> / iz l.
 func toolsCmd(sub string, args []string) int {
+	if sub != "list" {
+		if len(args) == 0 {
+			fmt.Fprintf(os.Stderr, "usage: iz %c <tool>...\n", sub[0])
+			return 2
+		}
+		if args[0] == "-h" || args[0] == "--help" {
+			fmt.Printf("usage: iz %c <tool>...\n", sub[0])
+			return 0
+		}
+	}
 	db, err := openDB()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "iz:", err)
@@ -25,13 +33,6 @@ func toolsCmd(sub string, args []string) int {
 	}
 	defer db.Close()
 
-	if sub != "list" && (len(args) == 0 || args[0] == "-h" || args[0] == "--help") {
-		fmt.Fprintf(os.Stderr, "usage: iz %c <tool>...\n", sub[0])
-		if len(args) == 0 {
-			return 2
-		}
-		return 0
-	}
 	switch sub {
 	case "add":
 		added := 0
@@ -82,7 +83,12 @@ func delRuns(args []string) int {
 		return 2
 	}
 	defer db.Close()
-	fmt.Fprintf(os.Stderr, "[iz] %d deleted\n", deleteRuns(db, ids))
+	n, err := deleteRuns(db, ids)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "iz: delete:", err)
+		return 1
+	}
+	fmt.Fprintf(os.Stderr, "[iz] %d deleted\n", n)
 	return 0
 }
 
@@ -134,10 +140,10 @@ func importCmd(args []string) int {
 		abs = file
 	}
 	r := Run{
-		Ts:       float64(time.Now().UnixNano()) / 1e9,
+		Ts:       now(),
 		Hostname: hostname(),
 		Tool:     tool,
-		Cmd:      "import " + file,
+		Cmd:      joinArgs([]string{"import", file}),
 		Cwd:      filepath.Dir(abs), // dir of the imported file, not the caller's cwd
 		Size:     ni(int64(len(z))),
 	}
@@ -163,6 +169,7 @@ func isShellReserved(s string) bool {
 		"bg", "kill", "pwd", "pushd", "popd", "dirs", "true", "false",
 		"local", "declare", "typeset", "readonly", "which", "type", "hash",
 		"ulimit", "times", "getopts", "let", "break", "continue",
+		"bind", "bindkey", "zle", "commandline", // used by the iz init widgets
 		// keywords
 		"if", "then", "else", "elif", "fi", "case", "esac", "for", "select",
 		"while", "until", "do", "done", "in", "function", "time", "coproc",
@@ -212,13 +219,7 @@ func openSnapshot(path string) (*sql.DB, func(), error) {
 		return nil, nil, err
 	}
 	tmp := filepath.Join(dir, "src.db")
-	abs, err := filepath.Abs(path)
-	var src *sql.DB
-	if err == nil {
-		// a URI path is percent-encoded: '?', '#' and '%' are literal in file names
-		u := url.URL{Scheme: "file", Path: filepath.ToSlash(abs), RawQuery: "mode=ro&_pragma=busy_timeout(5000)"}
-		src, err = sql.Open("sqlite", u.String())
-	}
+	src, err := sql.Open("sqlite", sqliteDSN(path, "mode=ro&_pragma=busy_timeout(5000)"))
 	if err == nil {
 		_, err = src.Exec(`VACUUM INTO ?`, tmp) // consistent copy, WAL included
 		src.Close()

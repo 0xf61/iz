@@ -5,6 +5,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -50,11 +52,11 @@ func openDBAt(p string) (*sql.DB, error) {
 	// _txlock=immediate: write transactions take the lock at BEGIN, so a
 	// read-then-write transaction never fails with an instant SQLITE_BUSY
 	// (SQLite skips the busy handler when a deferred reader must upgrade).
-	db, err := sql.Open("sqlite", p+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_txlock=immediate")
+	db, err := sql.Open("sqlite", sqliteDSN(p, "_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_txlock=immediate"))
 	if err != nil {
 		return nil, err
 	}
-	if err := ensureSchema(bg, db, false); err != nil {
+	if err := ensureSchema(bg, db); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -64,6 +66,22 @@ func openDBAt(p string) (*sql.DB, error) {
 		_ = os.Chmod(p+"-shm", 0o600)
 	}
 	return db, nil
+}
+
+// sqliteDSN joins a database path and driver parameters. A plain path
+// becomes a percent-encoded file: URI, so '?', '#' and '%' in it stay part
+// of the file name instead of starting the query (and dropping the pragmas).
+func sqliteDSN(p, query string) string {
+	if p == ":memory:" || strings.HasPrefix(p, "file:") {
+		if strings.Contains(p, "?") {
+			return p + "&" + query
+		}
+		return p + "?" + query
+	}
+	if abs, err := filepath.Abs(p); err == nil {
+		p = abs
+	}
+	return (&url.URL{Scheme: "file", Path: filepath.ToSlash(p), RawQuery: query}).String()
 }
 
 // Schema shared by local databases and the sync remote. One statement per
@@ -111,7 +129,7 @@ var schema = []string{
 	`ALTER TABLE tombstones ADD COLUMN ts REAL NOT NULL DEFAULT 0`,
 	`CREATE INDEX IF NOT EXISTS memories_uid ON memories(uid)`,
 	backfillUID,
-	seedDefaultTools,
+	seedDefaultTools(),
 }
 
 // defaultTools is the list of penetration testing and security assessment tools
@@ -132,14 +150,10 @@ var defaultTools = []string{
 	"hashcat", "radare2", "tshark", "meg", "qsreplace", "gf", "unew",
 }
 
-const seedDefaultTools = `INSERT OR IGNORE INTO tools(name) VALUES
-('nmap'),('masscan'),('rustscan'),('naabu'),
-('httpx'),('httprobe'),('subfinder'),('assetfinder'),('waybackurls'),('gau'),
-('ffuf'),('feroxbuster'),('gobuster'),('dirsearch'),('nuclei'),('shortscan'),('wpscan'),('sqlmap'),
-('nxc'),('crackmapexec'),('certipy'),('bloodyad'),('coercer'),('kerbrute'),
-('evil-winrm'),('responder'),('mitm6'),('smbclient'),('enum4linux-ng'),
-('chisel'),('ligolo-ng'),('bettercap'),
-('hashcat'),('radare2'),('tshark'),('meg'),('qsreplace'),('gf'),('unew')`
+// seedDefaultTools registers defaultTools (plain names: safe to inline).
+func seedDefaultTools() string {
+	return `INSERT OR IGNORE INTO tools(name) VALUES ('` + strings.Join(defaultTools, `'),('`) + `')`
+}
 
 // legacyUID is the deterministic uid of a pre-uid note, so copies of the same
 // note on two machines (made by older syncs) still match each other.
@@ -152,12 +166,12 @@ const (
 
 const schemaVersion = 5 // 5: memories_ns dropped (memories_ns_title covers it)
 
-// ensureSchema creates/migrates the schema. Local databases skip the work
-// once PRAGMA user_version says they are current; force always runs it
-// (the remote may be shared with older clients).
-func ensureSchema(ctx context.Context, db dbtx, force bool) error {
+// ensureSchema creates/migrates the schema, skipped once PRAGMA user_version
+// says it is current. That holds for a sync remote too: rows older clients
+// still write to it are handled by sync itself (tombKey, uidCol, fixMemFTS).
+func ensureSchema(ctx context.Context, db dbtx) error {
 	var v int
-	if !force && db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&v) == nil && v >= schemaVersion {
+	if db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&v) == nil && v >= schemaVersion {
 		return nil
 	}
 	for _, s := range schema {
@@ -316,28 +330,35 @@ func insertRunTx(tx *sql.Tx, r Run, raw, text []byte) (int64, error) {
 }
 
 // deleteRuns removes runs and their FTS rows in one transaction, leaving
-// tombstones; returns how many were deleted.
-func deleteRuns(db *sql.DB, ids []int64) int {
+// tombstones; returns how many were deleted (ids not found are skipped).
+func deleteRuns(db *sql.DB, ids []int64) (int, error) {
 	tx, err := db.Begin()
 	if err != nil {
-		return 0
+		return 0, err
 	}
 	defer tx.Rollback() //nolint
 	n := 0
 	for _, id := range ids {
 		var r Run
-		if tx.QueryRow(`SELECT hostname,ts,tool,cmd FROM runs WHERE id=?`, id).Scan(&r.Hostname, &r.Ts, &r.Tool, &r.Cmd) != nil {
+		err := tx.QueryRow(`SELECT hostname,ts,tool,cmd FROM runs WHERE id=?`, id).Scan(&r.Hostname, &r.Ts, &r.Tool, &r.Cmd)
+		if err == sql.ErrNoRows {
 			continue
 		}
-		if tombstone(tx, runKey(r.Hostname, r.Ts, r.Tool, r.Cmd)) != nil || purge(bg, tx, "runs", "outputs_fts", []any{id}) != nil {
-			return 0
+		if err == nil {
+			err = tombstone(tx, runKey(r.Hostname, r.Ts, r.Tool, r.Cmd))
+		}
+		if err == nil {
+			err = purge(bg, tx, "runs", "outputs_fts", []any{id})
+		}
+		if err != nil {
+			return 0, err
 		}
 		n++
 	}
-	if tx.Commit() != nil {
-		return 0
+	if err := tx.Commit(); err != nil {
+		return 0, err
 	}
-	return n
+	return n, nil
 }
 
 func tombstone(ex dbtx, key string) error {
@@ -743,10 +764,13 @@ func parseSize(s string) (op string, n int64, ok bool) {
 		s = s[:len(s)-1]
 	}
 	v, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
-	if err != nil || v < 0 {
+	b := v * float64(unit)
+	// the negated range check also rejects NaN (it fails every comparison) and
+	// ±Inf; float64(MaxInt64) is 2^63, itself out of int64 range
+	if err != nil || !(b >= 0 && b < math.MaxInt64) {
 		return "", 0, false
 	}
-	return op, int64(v * float64(unit)), true
+	return op, int64(b), true
 }
 
 func scanRuns(db *sql.DB, q string, args []any) ([]Run, error) {

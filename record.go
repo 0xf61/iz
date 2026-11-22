@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -72,15 +73,20 @@ func runRecord(args []string) int {
 // progress bars, interactive prompts).
 func runPTYRecord(db *sql.DB, args []string) int {
 	cmd := exec.Command(args[0], args[1:]...)
-	// CLICOLOR/CLICOLOR_FORCE: keep BSD ls (macOS) colored even when a fish
-	// alias is bypassed; GNU ls is colored automatically inside a PTY.
-	cmd.Env = append(os.Environ(), "CLICOLOR=1", "CLICOLOR_FORCE=1")
+	cmd.Env = ptyEnv(args[0])
 	// `cmd 2>file`: keep the redirect (pty.Start only fills nil streams), so
 	// stderr goes to the file instead of being merged into the PTY output.
 	if !term.IsTerminal(int(os.Stderr.Fd())) {
 		cmd.Stderr = os.Stderr
 	}
 	start := time.Now()
+
+	// Signals are caught from before the child starts until iz returns, so
+	// none kills iz while the terminal is raw or the run unsaved; they reach
+	// the child (its whole process group: it leads its own session) only
+	// while it runs.
+	sigs := forwardSignals(true, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	defer sigs.release()
 
 	// Start with the current terminal size: fast tools (fastfetch!) would
 	// otherwise render against the default 80x24 before the resize poller runs.
@@ -96,6 +102,7 @@ func runPTYRecord(db *sql.DB, args []string) int {
 		return startFailure(err)
 	}
 	defer ptmx.Close()
+	sigs.to(cmd.Process)
 
 	// Put stdin into raw mode so interactive tools (ssh, sudo, fzf) receive
 	// keystrokes directly, passwords are not echoed by the outer TTY, and
@@ -112,8 +119,7 @@ func runPTYRecord(db *sql.DB, args []string) int {
 	}
 	defer restoreTerm()
 
-	// Forward terminal resizes and external signals to the child PTY (the
-	// child leads its own session, so its whole process group is signaled).
+	// Forward terminal resizes to the child PTY.
 	winch := make(chan os.Signal, 1)
 	signal.Notify(winch, syscall.SIGWINCH)
 	resized := make(chan struct{})
@@ -123,7 +129,6 @@ func runPTYRecord(db *sql.DB, args []string) int {
 			pty.InheritSize(os.Stdin, ptmx) //nolint
 		}
 	}()
-	defer forwardSignals(cmd.Process, true, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)()
 
 	stopStdin, stdinDone := forwardStdin(ptmx)
 
@@ -135,6 +140,7 @@ func runPTYRecord(db *sql.DB, args []string) int {
 		close(drained)
 	}()
 	waitErr := cmd.Wait()
+	sigs.stop() // the child is reaped: its pid (group) may be reused
 	// The child is gone. Stop reading stdin, so typeahead stays with the
 	// shell, and give the remaining output a moment to drain: a daemonized
 	// grandchild still holding the PTY slave would otherwise block us forever.
@@ -157,6 +163,18 @@ func runPTYRecord(db *sql.DB, args []string) int {
 	restoreTerm()
 
 	return saveRun(db, args, start, capture.Bytes(), exitStatus(waitErr, cmd.ProcessState))
+}
+
+// ptyEnv is the environment of a PTY child (nil: iz's own). CLICOLOR and
+// CLICOLOR_FORCE keep BSD ls (macOS) colored even when a fish alias is
+// bypassed; GNU ls is colored automatically inside a PTY. Only for ls
+// itself: inherited by anything else (`sh -c 'ls | xargs …'`), they would
+// force ANSI codes into the child's own pipes.
+func ptyEnv(name string) []string {
+	if filepath.Base(name) != "ls" {
+		return nil
+	}
+	return append(os.Environ(), "CLICOLOR=1", "CLICOLOR_FORCE=1")
 }
 
 // drainTimeout bounds how long output is still collected after the child
@@ -198,14 +216,17 @@ func runPipeRecord(db *sql.DB, args []string) int {
 	quiet := make(chan os.Signal, 1)
 	signal.Notify(quiet, swallow...)
 	defer signal.Stop(quiet)
+	sigs := forwardSignals(false, relay...)
+	defer sigs.release()
 
 	if err := cmd.Start(); err != nil {
 		fmt.Fprintln(os.Stderr, "iz:", err)
 		return startFailure(err)
 	}
-	defer forwardSignals(cmd.Process, false, relay...)()
+	sigs.to(cmd.Process)
 
 	waitErr := cmd.Wait()
+	sigs.stop()
 	return saveRun(db, args, start, capture.Bytes(), exitStatus(waitErr, cmd.ProcessState))
 }
 
@@ -214,7 +235,7 @@ func saveRun(db *sql.DB, args []string, start time.Time, out []byte, exit int) i
 	raw := tidyRaw(out)
 	z := gz(raw)
 	r := Run{
-		Ts:       float64(start.UnixNano()) / 1e9,
+		Ts:       unixTime(start),
 		Hostname: hostname(),
 		Tool:     filepath.Base(args[0]),
 		Cmd:      joinArgs(args),
@@ -256,28 +277,49 @@ func startFailure(err error) int {
 	return 126
 }
 
-// forwardSignals relays sigs to the started child p — to its whole process
-// group when it leads one — until the returned stop function is called.
-func forwardSignals(p *os.Process, group bool, sigs ...os.Signal) (stop func()) {
-	ch := make(chan os.Signal, 4)
-	signal.Notify(ch, sigs...)
-	done := make(chan struct{})
+// sigForwarder relays caught signals to a child process.
+type sigForwarder struct {
+	ch      chan os.Signal
+	p       atomic.Pointer[os.Process]
+	done    chan struct{}
+	release func() // restores the signals' default action (idempotent)
+}
+
+// forwardSignals catches sigs at once: from then on they no longer take
+// their default (fatal) action, but are relayed to the child named by to —
+// to its whole process group when group is set — until stop; signals caught
+// before to or after stop are dropped. release ends the catching.
+func forwardSignals(group bool, sigs ...os.Signal) *sigForwarder {
+	f := &sigForwarder{ch: make(chan os.Signal, 4), done: make(chan struct{})}
+	signal.Notify(f.ch, sigs...)
 	go func() {
-		defer close(done)
-		for sig := range ch {
-			if s, ok := sig.(syscall.Signal); ok && group {
+		defer close(f.done)
+		for sig := range f.ch {
+			p := f.p.Load()
+			switch s, ok := sig.(syscall.Signal); {
+			case p == nil:
+			case ok && group:
 				_ = syscall.Kill(-p.Pid, s)
-			} else {
+			default:
 				_ = p.Signal(sig)
 			}
 		}
 	}()
-	return func() {
-		signal.Stop(ch)
-		close(ch)
-		<-done
-	}
+	f.release = sync.OnceFunc(func() {
+		f.stop()
+		signal.Stop(f.ch)
+		close(f.ch)
+		<-f.done
+	})
+	return f
 }
+
+// to starts relaying to the started child p.
+func (f *sigForwarder) to(p *os.Process) { f.p.Store(p) }
+
+// stop ends the relaying, e.g. once the child is reaped (and its pid free
+// for reuse); signals are still caught until release.
+func (f *sigForwarder) stop() { f.p.Store(nil) }
 
 // foreground reports whether iz runs in the foreground process group of its
 // controlling terminal (false without one).
@@ -396,6 +438,10 @@ func (c *capture) Bytes() []byte {
 	}
 	if i := bytes.IndexByte(tail, '\n'); i >= 0 {
 		tail = tail[i+1:]
+	} else { // one huge line: at least start on a whole character
+		for k := 0; k < utf8.UTFMax-1 && len(tail) > 0 && !utf8.RuneStart(tail[0]); k++ {
+			tail = tail[1:]
+		}
 	}
 	dropped = c.total - int64(len(head)) - int64(len(tail))
 	out := append([]byte{}, head...)

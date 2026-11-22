@@ -41,12 +41,14 @@ Notes are unique by <namespace:title>. Writing to an existing <namespace:title> 
 
   iz n <namespace:title> [-t tag1,tag2] "<content>"
   iz n -a <namespace:title> "<additional content>"
+  iz n <namespace:title> [-t tags] -- <content with -flags>   # '--' ends iz's flags
 
 ### Examples:
   iz n user:preferences "Prefers concise responses, CLI-first workflows, dark mode."
   iz n pentest:target-creds "Host: 10.10.138.12 | MSSQL sa:P@ssword123 | Domain: CORP"
   iz n machines:kali -t vpn "Kali box IP 10.42.13.37"
   iz n -a machines:kali "SSH port 2222"
+  iz n tools:ffuf -t web -- ffuf -u URL -t 50
 
 ### Piped input:
   cat /path/to/findings.md | iz n pentest:recon-summary

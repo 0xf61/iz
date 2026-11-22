@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -34,7 +35,12 @@ type Memory struct {
 	TagsSet   bool    `json:"-"`
 }
 
-func now() float64 { return float64(time.Now().UnixNano()) / 1e9 }
+func now() float64 { return unixTime(time.Now()) }
+
+// unixTime is t in unix seconds at millisecond precision: at most 13
+// significant digits, which survive a remote's JSON float round trip intact
+// (nanoseconds would fill the mantissa, and lose its last digit there).
+func unixTime(t time.Time) float64 { return float64(t.UnixMilli()) / 1e3 }
 
 func isTTY() bool {
 	return term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stdout.Fd()))
@@ -335,7 +341,17 @@ func tuiNotes(query string) int {
 	c.Stderr = os.Stderr
 	c.Stdin = os.Stdin
 	c.Stdout = os.Stdout
-	_ = c.Run()
+	return fzfExit(c.Run())
+}
+
+// fzfExit is iz's exit code after fzf ran: fzf's own non-zero exits (esc,
+// no match) are normal, failing to run it at all is an error.
+func fzfExit(err error) int {
+	var ee *exec.ExitError
+	if err != nil && !errors.As(err, &ee) {
+		fmt.Fprintln(os.Stderr, "iz: fzf:", err)
+		return 2
+	}
 	return 0
 }
 
@@ -381,12 +397,12 @@ func noteDoc(m Memory) string {
 func parseNoteDoc(text string) (ns, title, tags, body string, ok bool) {
 	lines := strings.Split(text, "\n")
 	var rest []string
-	for i, l := range lines {
+	for _, l := range lines {
 		t := strings.TrimSpace(l)
 		if t == "" && !ok && len(rest) == 0 {
 			continue
 		}
-		if !ok && len(rest) == 0 && strings.HasPrefix(t, "#") && i < len(lines) {
+		if !ok && len(rest) == 0 && strings.HasPrefix(t, "#") {
 			ns, title, tags = parseHeader(strings.TrimLeft(t, "# "))
 			ok = true
 			continue
@@ -590,7 +606,11 @@ func noteCmd(args []string) int {
 
 Usage:
   iz n                                       interactive notes TUI (TTY only)
-  iz n <ns:title> [-t tags] [-a] [content]   create or update note (upsert by ns:title)
+  iz n <ns:title> [-t tags] [-a] [content]   create or update note (upsert by ns:title);
+                                             trailing -t/-a after one content arg apply
+                                             only when nothing else follows them; '--'
+                                             forces everything after it to be content:
+                                             iz n tools:ffuf -- ffuf -u URL -t 50
   iz n show <id|ns:title>                    print full note content
   iz n edit <id|ns:title>                    edit note in $EDITOR (TTY only)
   iz n del <id|ns:title>                     delete note
@@ -671,13 +691,23 @@ Usage:
 	}
 
 	// Adding or updating a note: `iz n [-t tags] [-a] <target> [content...]`.
-	// Flags are recognized anywhere ("x:y text -a" appends); after "--"
-	// everything is content.
+	// Flags are recognized before the content, and after a single content
+	// argument only when the remaining args are purely flags (`x:y "text" -a`).
+	// Unquoted commands (`tools:ffuf ffuf -t 50 -u URL`) stay verbatim, and
+	// "--" forces the rest to be content.
 	var tags string
 	tagsSet, appendMode := false, false
 	var pos []string
 flags:
 	for i := 0; i < len(args); i++ {
+		if len(pos) >= 3 {
+			pos = append(pos, args[i:]...)
+			break
+		}
+		if len(pos) == 2 && args[i] != "--" && !trailingFlagsOnly(args[i:]) {
+			pos = append(pos, args[i:]...)
+			break
+		}
 		switch args[i] {
 		case "--":
 			pos = append(pos, args[i+1:]...)
@@ -723,6 +753,19 @@ flags:
 	return saveNote(m, appendMode, false)
 }
 
+func trailingFlagsOnly(rest []string) bool {
+	for j := 0; j < len(rest); j++ {
+		switch rest[j] {
+		case "-a", "--append":
+		case "-t", "--tags":
+			j++
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // noteDates renders when a note was created and, if later, last updated.
 func noteDates(m Memory) string {
 	d := fmtTsShort(m.Ts)
@@ -743,9 +786,9 @@ func listNotes(namespace string) int {
 
 	q := "SELECT id, max(mtime, ts), namespace, title, author, length(content) FROM memories WHERE 1=1"
 	var args []any
-	if namespace != "" {
-		c, a := likePrefix("namespace", namespace)
-		q, args = q+c, append(args, a)
+	if namespace = strings.TrimRight(namespace, "/"); namespace != "" { // it and its sub-namespaces
+		q += ` AND (namespace = ? OR namespace LIKE ? ESCAPE '\')`
+		args = append(args, namespace, likeEsc(namespace)+"/%")
 	}
 	rows, err := db.Query(q+" ORDER BY namespace, title, ts DESC", args...)
 	if err != nil {
@@ -936,7 +979,8 @@ func headingText(l string, max int) (string, bool) {
 	if n == 0 || n > max || n == len(l) || l[n] != ' ' && l[n] != '\t' {
 		return "", false
 	}
-	return strings.TrimSpace(l[n:]), true
+	h := strings.TrimSpace(l[n:])
+	return h, h != "" // an empty heading would title (and so drop) the text after it
 }
 
 // codeFence tracks fenced code blocks: ``` and ~~~ fences are independent,
@@ -1174,6 +1218,10 @@ func primeCmd(args []string) int {
 		}
 		byNS[ns] = append(byNS[ns], title)
 		total++
+	}
+	if err := rows.Err(); err != nil {
+		fmt.Fprintln(os.Stderr, "iz:", err)
+		return 1
 	}
 	var runCount int
 	db.QueryRow(`SELECT count(*) FROM runs`).Scan(&runCount) //nolint

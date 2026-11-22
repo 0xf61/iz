@@ -123,12 +123,15 @@ __iz_bash_widget() {
         READLINE_POINT=$(( READLINE_POINT + ${#cmd} ))
     fi
 }
-bind -x "\"${IZ_KEY:-\\C-g}\": __iz_bash_widget"
 
 __iz_bash_notes_widget() {
     command iz n
 }
-bind -x "\"${IZ_NOTES_KEY:-\\C-o}\": __iz_bash_notes_widget"
+# bind needs line editing: only interactive shells have it
+if [[ $- == *i* ]]; then
+    bind -x "\"${IZ_KEY:-\\C-g}\": __iz_bash_widget"
+    bind -x "\"${IZ_NOTES_KEY:-\\C-o}\": __iz_bash_notes_widget"
+fi
 
 `)
 		posixWrappers(&b, tools)
@@ -199,6 +202,7 @@ iz is available on the PATH. It is your persistent second-brain memory and comma
     Whenever you discover user preferences, project architecture, credentials, bug fixes, or runbooks:
     iz n <namespace:title> [-t tags] "<content>"  # upsert note (no duplicates)
     iz n -a <namespace:title> "<extra>"            # append to existing note
+    iz n <namespace:title> -- <content with -flags> # '--' ends iz's flags (e.g. command lines)
 
 - Persistent Command Execution:
     iz -- <command> [args...]       # record command metadata and full output in SQLite FTS5
@@ -260,6 +264,9 @@ iz n <namespace:title> [-t tag1,tag2] "<content>"
 
 # Append to existing note
 iz n -a <namespace:title> "<additional lines>"
+
+# Content with its own -flags (command lines): '--' ends iz's flags
+iz n tools:ffuf -t web -- ffuf -u URL -t 50
 ` + "```" + `
 
 ### Recommended Namespaces:
@@ -456,7 +463,7 @@ func installShellHook(home, sh string) (bool, error) {
 		hookLine = `if command -v iz >/dev/null 2>&1; then eval "$(iz init zsh)"; fi`
 	case "bash":
 		rcPath = filepath.Join(home, ".bashrc")
-		hookLine = `if command -v iz >/dev/null 2>&1; then eval "$(iz init bash)"; fi`
+		hookLine = `if [[ $- == *i* ]] && command -v iz >/dev/null 2>&1; then eval "$(iz init bash)"; fi`
 	default:
 		return false, fmt.Errorf("unsupported shell %s", sh)
 	}
@@ -579,7 +586,7 @@ func patchManagedBlock(path, startMark, endMark, block string) (bool, error) {
 
 	// Append block
 	sep := "\n\n"
-	if len(content) == 0 {
+	if strings.TrimSpace(content) == "" {
 		sep = ""
 	}
 	newContent := strings.TrimSpace(content) + sep + strings.TrimSpace(block) + "\n"

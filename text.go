@@ -21,9 +21,11 @@ import (
 
 var (
 	reClear = regexp.MustCompile(`\x1b\[(2J|3J|H)|\f`)
-	// CSI / OSC / single-character escape sequences (colors, cursor, titles...).
-	// CSI parameter bytes are 0x30-0x3F, which includes ':' (truecolor "38:2:r:g:b").
-	reANSI = regexp.MustCompile("\x1b\\[[0-?]*[ -/]*[@-~]|\x1b\\][^\x07\x1b]*(\x07|\x1b\\\\)|\x1b[@-Z\\\\-_]")
+	// CSI / OSC / nF (charset "ESC ( B") / single-character escape sequences
+	// (colors, cursor, titles, "ESC 7"/"ESC 8" save/restore, "ESC ="/"ESC >"
+	// keypad...). CSI parameter bytes are 0x30-0x3F, which includes ':'
+	// (truecolor "38:2:r:g:b"); a lone "ESC [" is a broken CSI and kept.
+	reANSI = regexp.MustCompile("\x1b\\[[0-?]*[ -/]*[@-~]|\x1b\\][^\x07\x1b]*(\x07|\x1b\\\\)|\x1b[ -/]+[0-~]|\x1b[0-Z\\\\-~]")
 )
 
 // tidyRaw removes clear-screen sequences and collapses progress-bar redraws.
@@ -66,7 +68,7 @@ const maxUngz = 2 * maxCapture
 func ungz(b []byte) []byte { return ungzLimit(b, maxUngz) }
 
 // ungzLimit decompresses b to at most limit bytes; b is returned as-is when
-// it is not valid gzip.
+// it is not valid gzip, and what decoded when the stream breaks off midway.
 func ungzLimit(b []byte, limit int64) []byte {
 	r, err := gzip.NewReader(bytes.NewReader(b))
 	if err != nil { // not gzip: return as-is
@@ -74,7 +76,7 @@ func ungzLimit(b []byte, limit int64) []byte {
 	}
 	defer r.Close()
 	out, err := io.ReadAll(io.LimitReader(r, limit))
-	if err != nil {
+	if err != nil && len(out) == 0 {
 		return b
 	}
 	return out

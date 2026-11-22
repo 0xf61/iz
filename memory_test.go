@@ -3,12 +3,16 @@ package main
 import (
 	"fmt"
 	"maps"
+	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestMemoryCRUD(t *testing.T) {
@@ -407,5 +411,81 @@ func TestImportInlineBackticksAndDuplicateTitles(t *testing.T) {
 		if got := f.inside(line); got != inside {
 			t.Errorf("inside(%q) = %v, want %v", line, got, inside)
 		}
+	}
+}
+
+// Flags still follow a single quoted content argument, but from a second
+// content word on the rest is content: command lines keep their own flags.
+func TestNoteCmdMidContentFlags(t *testing.T) {
+	path := testDB(t)
+	t.Setenv("IZ", path)
+	for _, c := range []struct {
+		args                  []string
+		target, content, tags string
+	}{
+		{[]string{"tools:ffuf", "ffuf", "-u", "URL", "-t", "50"}, "tools:ffuf", "ffuf -u URL -t 50", ""},
+		{[]string{"tools:ffuf2", "ffuf", "-t", "50", "-u", "URL"}, "tools:ffuf2", "ffuf -t 50 -u URL", ""},
+		{[]string{"tools:hydra", "hydra", "-t", "4", "ssh://x"}, "tools:hydra", "hydra -t 4 ssh://x", ""},
+		{[]string{"tools:ls", "ls", "-a", "/tmp"}, "tools:ls", "ls -a /tmp", ""},
+		{[]string{"-t", "ad", "tools:nxc", "nxc", "smb", "-u", "a", "-a"}, "tools:nxc", "nxc smb -u a -a", "ad"},
+		{[]string{"x:q", "quoted content", "-t", "k"}, "x:q", "quoted content", "k"},
+		{[]string{"tools:sqlmap", "-t", "web", "--", "sqlmap", "-a"}, "tools:sqlmap", "sqlmap -a", "web"},
+	} {
+		if code := noteCmd(c.args); code != 0 {
+			t.Fatalf("noteCmd(%q) exit=%d", c.args, code)
+		}
+		if m := noteByTarget(t, path, c.target); m.Content != c.content || m.Tags != c.tags {
+			t.Errorf("noteCmd(%q): content %q tags %q, want %q / %q", c.args, m.Content, m.Tags, c.content, c.tags)
+		}
+	}
+}
+
+// An empty ATX heading ("##   ") is text, not a heading that would title
+// (and so drop) the paragraphs after it.
+func TestSplitMarkdownEmptyHeading(t *testing.T) {
+	if h, ok := headingText("##   ", 2); ok {
+		t.Errorf("headingText(empty) = %q, true", h)
+	}
+	got := splitMarkdown("## A\nx\n##   \ny\n", "doc")
+	want := []mdSection{{"A", "x\n##   \ny"}}
+	if !slices.Equal(got, want) {
+		t.Errorf("splitMarkdown = %q, want %q", got, want)
+	}
+}
+
+// iz n list <ns> lists that namespace and its sub-namespaces, not every
+// namespace sharing its prefix.
+func TestListNotesNamespace(t *testing.T) {
+	path := testDB(t)
+	t.Setenv("IZ", path)
+	for _, target := range []string{"pentest:a", "pentest/web:b", "pentest2:c"} {
+		if code := noteCmd([]string{target, "body"}); code != 0 {
+			t.Fatalf("noteCmd(%s) exit=%d", target, code)
+		}
+	}
+	out := captureStdout(t, func() { listNotes("pentest") })
+	if !strings.Contains(out, "pentest:a") || !strings.Contains(out, "pentest/web:b") || strings.Contains(out, "pentest2") {
+		t.Errorf("iz n list pentest:\n%s", out)
+	}
+}
+
+// New notes and runs carry millisecond timestamps (≤13 significant digits,
+// lossless through a remote's JSON floats).
+func TestUnixTimeMillis(t *testing.T) {
+	ts := unixTime(time.Unix(1795348751, 204460123))
+	if got := strconv.FormatFloat(ts, 'f', -1, 64); got != "1795348751.204" {
+		t.Errorf("unixTime = %s, want 1795348751.204", got)
+	}
+	if n := now(); n != math.Round(n*1e3)/1e3 {
+		t.Errorf("now() = %v, not millisecond precision", n)
+	}
+}
+
+func TestFzfExit(t *testing.T) {
+	if code := fzfExit(exec.Command("iz-no-such-fzf-4242").Run()); code != 2 {
+		t.Errorf("fzf missing: exit=%d, want 2", code)
+	}
+	if code := fzfExit(exec.Command("sh", "-c", "exit 130").Run()); code != 0 {
+		t.Errorf("fzf aborted (esc): exit=%d, want 0", code)
 	}
 }

@@ -116,3 +116,26 @@ func TestUngzLimit(t *testing.T) {
 		t.Errorf("ungzLimit under the cap = %d bytes, want %d", got, 4*limit)
 	}
 }
+
+// Charset (ESC ( B, as tput sgr0 emits), save/restore cursor and keypad
+// mode escapes are stripped from the indexed text too.
+func TestStripANSIShortEscapes(t *testing.T) {
+	in := "a\x1b(Bb\x1b7c\x1b8d\x1b=e\x1b>f\x1b[0mg\x1bch"
+	if got := string(stripANSI([]byte(in))); got != "abcdefgh" {
+		t.Errorf("stripANSI = %q, want %q", got, "abcdefgh")
+	}
+}
+
+// A gzip stream broken off midway yields the part that decoded, not the
+// compressed bytes.
+func TestUngzTruncatedStream(t *testing.T) {
+	var data []byte
+	for i := range 200000 {
+		data = append(data, byte('a'+(i*7919)%26), byte('A'+(i*104729)%26))
+	}
+	z := gz(data)
+	got := ungz(z[:len(z)/2])
+	if len(got) == 0 || !bytes.HasPrefix(data, got) {
+		t.Errorf("ungz(truncated) = %d bytes, not a prefix of the original", len(got))
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -291,5 +292,32 @@ func TestHelpAndUnknownOptions(t *testing.T) {
 func TestAIGuideCmd(t *testing.T) {
 	if code := aiGuideCmd(); code != 0 {
 		t.Errorf("aiGuideCmd() = %d, want 0", code)
+	}
+}
+
+// iz a/d help and usage need no database (a broken $IZ still answers).
+func TestToolsCmdHelpWithoutDB(t *testing.T) {
+	t.Setenv("IZ", filepath.Join(os.DevNull, "iz.db")) // cannot be created
+	if code := toolsCmd("add", []string{"--help"}); code != 0 {
+		t.Errorf("iz a --help exit=%d, want 0", code)
+	}
+	if code := toolsCmd("del", nil); code != 2 {
+		t.Errorf("iz d exit=%d, want 2", code)
+	}
+}
+
+// The recorded import command line quotes the file name like a shell would.
+func TestImportCmdQuotesFile(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "my scan.log")
+	if err := os.WriteFile(file, []byte("data\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	path := testDB(t)
+	t.Setenv("IZ", path)
+	if code := importCmd([]string{"nmap", file}); code != 0 {
+		t.Fatalf("importCmd exit=%d", code)
+	}
+	if r, _ := lastRun(t, path); r.Cmd != joinArgs([]string{"import", file}) || !strings.Contains(r.Cmd, "'") {
+		t.Errorf("cmd = %q", r.Cmd)
 	}
 }

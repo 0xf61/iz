@@ -3,6 +3,8 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -210,11 +212,11 @@ func TestDeleteRuns(t *testing.T) {
 	db, _ := openDBAt(path)
 	defer db.Close()
 
-	if n := deleteRuns(db, []int64{id}); n != 1 {
-		t.Errorf("deleteRuns → %d, want 1", n)
+	if n, err := deleteRuns(db, []int64{id}); n != 1 || err != nil {
+		t.Errorf("deleteRuns → %d (%v), want 1", n, err)
 	}
-	if n := deleteRuns(db, []int64{id}); n != 0 {
-		t.Errorf("double delete → %d, want 0", n)
+	if n, err := deleteRuns(db, []int64{id}); n != 0 || err != nil {
+		t.Errorf("double delete → %d (%v), want 0", n, err)
 	}
 	if runs, _ := queryRuns(db, ""); len(runs) != 0 {
 		t.Errorf("expected empty result after delete, got %d", len(runs))
@@ -454,5 +456,69 @@ func TestDirCondAndLikeEscaping(t *testing.T) {
 		if len(runs) != want {
 			t.Errorf("%-16q → %d runs, want %d", q, len(runs), want)
 		}
+	}
+}
+
+// $IZ paths with URI metacharacters open the file they name, pragmas intact.
+func TestOpenDBAtSpecialChars(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "a #1?x%20", "iz.db")
+	db, err := openDBAt(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var mode string
+	var timeout int
+	if err := db.QueryRow(`PRAGMA journal_mode`).Scan(&mode); err != nil || mode != "wal" {
+		t.Errorf("journal_mode = %q (%v), want wal", mode, err)
+	}
+	if err := db.QueryRow(`PRAGMA busy_timeout`).Scan(&timeout); err != nil || timeout != 5000 {
+		t.Errorf("busy_timeout = %d (%v), want 5000", timeout, err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("database not at its path: %v", err)
+	}
+}
+
+func TestParseSizeRejectsNonFinite(t *testing.T) {
+	for _, in := range []string{">inf", ">nan", "<-1kb", ">+Inf", ">1e300gb", ">9223372036854775807"} {
+		if op, n, ok := parseSize(in); ok {
+			t.Errorf("parseSize(%q) = %q,%d, want rejected", in, op, n)
+		}
+	}
+}
+
+// A failing delete is reported and leaves the runs in place.
+func TestDeleteRunsError(t *testing.T) {
+	path := testDB(t)
+	id := mustInsert(t, path, sampleRun("nmap", "nmap -sV", "x"), "x")
+	db, err := openDBAt(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`DROP TABLE tombstones`); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := deleteRuns(db, []int64{id}); err == nil || n != 0 {
+		t.Errorf("deleteRuns = %d, %v; want an error", n, err)
+	}
+	if runs, _ := queryRuns(db, ""); len(runs) != 1 {
+		t.Errorf("runs after a failed delete = %d, want 1", len(runs))
+	}
+	t.Setenv("IZ", path)
+	if code := delRuns([]string{strconv.FormatInt(id, 10)}); code != 1 {
+		t.Errorf("delRuns exit=%d, want 1", code)
+	}
+}
+
+func TestDefaultToolsSeeded(t *testing.T) {
+	db, err := openDBAt(testDB(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if got := queryNames(db, "tools"); !slices.Equal(got, slices.Sorted(slices.Values(defaultTools))) {
+		t.Errorf("tools = %q", got)
 	}
 }

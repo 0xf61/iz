@@ -2,12 +2,16 @@ package main
 
 import (
 	"bytes"
+	"math"
 	"os"
+	"os/exec"
 	"os/signal"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestJoinArgs(t *testing.T) {
@@ -55,7 +59,7 @@ func TestIsToolName(t *testing.T) {
 		}
 	}
 	// shell builtins/keywords (bash, zsh, fish) and iz itself are never wrapped
-	for _, bad := range []string{"iz", "cd", "if", "function", "end", "string", "status", "time"} {
+	for _, bad := range []string{"iz", "cd", "if", "function", "end", "string", "status", "time", "bind", "bindkey", "zle", "commandline"} {
 		if wrappable(bad) {
 			t.Errorf("wrappable(%q) should be false", bad)
 		}
@@ -202,5 +206,83 @@ func TestPartialRune(t *testing.T) {
 		if got := partialRune([]byte(in)); got != want {
 			t.Errorf("partialRune(%q) = %d, want %d", in, got, want)
 		}
+	}
+}
+
+// Once stopped (the child is reaped), the forwarder relays nothing — its pid
+// may already belong to another process — but still catches the signal.
+func TestForwardSignalsStop(t *testing.T) {
+	guard := make(chan os.Signal, 1) // the test binary never takes SIGUSR1's default action
+	signal.Notify(guard, syscall.SIGUSR1)
+	t.Cleanup(func() { signal.Stop(guard) })
+
+	f := forwardSignals(false, syscall.SIGUSR1)
+	defer f.release()
+	child := exec.Command("sleep", "10")
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer child.Process.Kill() //nolint
+	exited := make(chan struct{})
+	go func() { child.Wait(); close(exited) }() //nolint
+
+	f.to(child.Process)
+	f.stop()
+	syscall.Kill(os.Getpid(), syscall.SIGUSR1) //nolint
+	select {
+	case <-exited:
+		t.Fatal("signal relayed after stop")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	f.to(child.Process)
+	syscall.Kill(os.Getpid(), syscall.SIGUSR1) //nolint
+	select {
+	case <-exited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("signal not relayed while forwarding")
+	}
+	if ws, ok := child.ProcessState.Sys().(syscall.WaitStatus); !ok || ws.Signal() != syscall.SIGUSR1 {
+		t.Errorf("child state = %v", child.ProcessState)
+	}
+	f.release()
+	f.release() // idempotent (deferred again above)
+}
+
+// Runs get millisecond timestamps.
+func TestRunRecordMillisTimestamp(t *testing.T) {
+	path := testDB(t)
+	t.Setenv("IZ", path)
+	if code := runRecord([]string{"true"}); code != 0 {
+		t.Fatalf("exit=%d", code)
+	}
+	if r, _ := lastRun(t, path); r.Ts != math.Round(r.Ts*1e3)/1e3 {
+		t.Errorf("ts = %v, not millisecond precision", r.Ts)
+	}
+}
+
+// One huge line with nothing but multi-byte characters: the kept tail
+// starts on a whole character too.
+func TestCaptureTailRuneBoundary(t *testing.T) {
+	c := newCapture()
+	c.Write(bytes.Repeat([]byte("a"), captureHead))     //nolint
+	c.Write(bytes.Repeat([]byte("é"), 3*captureTail/2)) //nolint
+	c.Write([]byte("z"))                                // the kept tail is odd-sized: it would start mid-"é"
+	out := c.Bytes()
+	if !utf8.Valid(out) {
+		t.Error("captured output is not valid UTF-8")
+	}
+	if _, after, _ := bytes.Cut(out, []byte("not recorded\n")); !bytes.HasPrefix(after, []byte("é")) || !bytes.HasSuffix(after, []byte("éz")) {
+		t.Errorf("tail = %q…", after[:min(8, len(after))])
+	}
+}
+
+// Only ls gets the forced-color environment.
+func TestPTYEnv(t *testing.T) {
+	if env := ptyEnv("sh"); env != nil {
+		t.Errorf("ptyEnv(sh) = %d vars, want nil (inherit)", len(env))
+	}
+	if env := ptyEnv("/bin/ls"); !slices.Contains(env, "CLICOLOR_FORCE=1") {
+		t.Error("ptyEnv(ls) lacks CLICOLOR_FORCE=1")
 	}
 }

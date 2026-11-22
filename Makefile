@@ -4,7 +4,7 @@ build:
 	go build -o iz .
 
 test:
-	go test ./...
+	go test -race ./...
 
 install: build
 	cp iz ~/.local/bin/iz

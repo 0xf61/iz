@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,7 +23,7 @@ import (
 // copies to dst what it lacks; `iz sync` runs it both ways against a
 // LibSQL/Turso remote, `iz m` runs it once from another database file.
 //
-//   - runs are immutable, identified by (hostname, ts, tool, cmd)
+//   - runs are immutable, identified by (hostname, ts, tool, cmd), ts within sameTime
 //   - notes are identified by uid; the newer mtime wins (edits, renames)
 //   - tombstones travel first, so deletes propagate instead of being undone
 //   - notes travel before runs, so a failing (large) run never blocks them
@@ -56,14 +57,22 @@ func firstEnv(keys ...string) string {
 	return ""
 }
 
-// atuinKVGet retrieves a key from atuin's key-value store if atuin is installed.
+// atuinKVGet retrieves a key from atuin's key-value store if atuin is
+// installed; a hanging atuin cannot stall iz sync (it runs before the sync
+// timeout starts).
 func atuinKVGet(key string) string {
-	out, err := exec.Command("atuin", "kv", "get", key).Output()
+	ctx, cancel := context.WithTimeout(context.Background(), atuinTimeout)
+	defer cancel()
+	c := exec.CommandContext(ctx, "atuin", "kv", "get", key)
+	c.WaitDelay = time.Second // a killed atuin's children may hold stdout open
+	out, err := c.Output()
 	if err != nil {
 		return ""
 	}
 	return strings.TrimSpace(string(out))
 }
+
+var atuinTimeout = 5 * time.Second
 
 func buildLibsqlURL(rawURL, token string) string {
 	if rawURL == "" {
@@ -148,7 +157,7 @@ Environment:
 		fmt.Fprintln(os.Stderr, "iz sync: remote unreachable or authentication failed:", err)
 		return 1
 	}
-	if err := ensureSchema(ctx, remoteDB, false); err != nil {
+	if err := ensureSchema(ctx, remoteDB); err != nil {
 		fmt.Fprintln(os.Stderr, "iz sync: failed to verify remote schema:", err)
 		return 1
 	}
@@ -335,35 +344,105 @@ func copyTombstones(ctx context.Context, src, dst *sql.DB) (map[string]bool, int
 
 const runChunk = 32 // rows per round trip; outputs can be large
 
+// Runs have no uid: they match across machines on (hostname, tool, cmd) and
+// a start time within sameTime. A remote may hand a float back a digit short
+// (and older runs carry nanoseconds), so exact keys would copy such a run
+// again, and miss its tombstone, on every sync.
+type runSlot struct {
+	host, tool, cmd string
+	bucket          int64 // ts in 1e-4 s buckets, wider than the tolerance
+}
+
+type runSet map[runSlot][]float64
+
+func tsBucket(ts float64) int64 { return int64(math.Floor(ts * 1e4)) }
+
+func (s runSet) add(x Run) {
+	k := runSlot{x.Hostname, x.Tool, x.Cmd, tsBucket(x.Ts)}
+	s[k] = append(s[k], x.Ts)
+}
+
+// has reports whether s holds a run matching x; a match within the
+// tolerance lies in x's bucket or a neighbor.
+func (s runSet) has(x Run) bool {
+	for _, b := range []int64{tsBucket(x.Ts - timeTol), tsBucket(x.Ts + timeTol)} {
+		for _, ts := range s[runSlot{x.Hostname, x.Tool, x.Cmd, b}] {
+			if sameTime(ts, x.Ts) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// runTombs matches runs against the run tombstones among tomb.
+type runTombs struct {
+	keys map[string]bool
+	near runSet // "r:host:ts:tool:cmd" keys as (host, "", "tool:cmd", ts)
+}
+
+func newRunTombs(tomb map[string]bool) runTombs {
+	t := runTombs{keys: tomb, near: runSet{}}
+	for k := range tomb {
+		rest, ok := strings.CutPrefix(k, "r:")
+		host, rest, ok2 := strings.Cut(rest, ":")
+		ts, what, ok3 := strings.Cut(rest, ":")
+		if v, err := strconv.ParseFloat(ts, 64); ok && ok2 && ok3 && err == nil {
+			t.near.add(Run{Hostname: host, Cmd: what, Ts: v})
+		}
+	}
+	return t
+}
+
+// has reports whether a tombstone deletes x: by its exact key, or (the key's
+// timestamp drifted) by its fields and a time within the tolerance.
+func (t runTombs) has(x Run) bool {
+	return t.keys[runKey(x.Hostname, x.Ts, x.Tool, x.Cmd)] ||
+		t.near.has(Run{Hostname: x.Hostname, Cmd: x.Tool + ":" + x.Cmd, Ts: x.Ts})
+}
+
+// readRuns reads db's run identities: the live runs (ID and key fields) and
+// the ids of runs a tombstone deletes.
+func readRuns(ctx context.Context, db *sql.DB, dead runTombs) (live []Run, deadIDs []any, err error) {
+	err = each(ctx, db, `SELECT id,hostname,ts,tool,cmd FROM runs`, func(r *sql.Rows) error {
+		var x Run
+		if err := r.Scan(&x.ID, &x.Hostname, &x.Ts, &x.Tool, &x.Cmd); err != nil {
+			return err
+		}
+		if dead.has(x) {
+			deadIDs = append(deadIDs, x.ID)
+		} else {
+			live = append(live, x)
+		}
+		return nil
+	})
+	return live, deadIDs, err
+}
+
+// missingRuns returns the ids of runs that have lacks, each key once.
+func missingRuns(runs, have []Run) (ids []any) {
+	set := runSet{}
+	for _, x := range have {
+		set.add(x)
+	}
+	for _, x := range runs {
+		if !set.has(x) {
+			set.add(x)
+			ids = append(ids, x.ID)
+		}
+	}
+	return ids
+}
+
 // syncRunsBidirectional reads run keys once from local and remote, purges
 // tombstoned rows on both sides, and transfers only missing runs each way.
 func syncRunsBidirectional(ctx context.Context, local, remote *sql.DB, tomb map[string]bool) (pushed, pulled int, err error) {
-	const keysSQL = `SELECT id,hostname,ts,tool,cmd FROM runs`
-	readKeys := func(db *sql.DB) (map[string]int64, []any, error) {
-		have := map[string]int64{}
-		var dead []any
-		err := each(ctx, db, keysSQL, func(r *sql.Rows) error {
-			var id int64
-			var x Run
-			if err := r.Scan(&id, &x.Hostname, &x.Ts, &x.Tool, &x.Cmd); err != nil {
-				return err
-			}
-			k := runKey(x.Hostname, x.Ts, x.Tool, x.Cmd)
-			if tomb[k] {
-				dead = append(dead, id)
-				return nil
-			}
-			have[k] = id
-			return nil
-		})
-		return have, dead, err
-	}
-
-	localHave, localDead, err := readKeys(local)
+	dead := newRunTombs(tomb)
+	localRuns, localDead, err := readRuns(ctx, local, dead)
 	if err != nil {
 		return 0, 0, err
 	}
-	remoteHave, remoteDead, err := readKeys(remote)
+	remoteRuns, remoteDead, err := readRuns(ctx, remote, dead)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -373,22 +452,10 @@ func syncRunsBidirectional(ctx context.Context, local, remote *sql.DB, tomb map[
 		purgeChunked(ctx, local, "runs", "outputs_fts", localDead),
 		purgeChunked(ctx, remote, "runs", "outputs_fts", remoteDead))
 
-	var wantPush, wantPull []any
-	for k, id := range localHave {
-		if _, ok := remoteHave[k]; !ok {
-			wantPush = append(wantPush, id)
-		}
-	}
-	for k, id := range remoteHave {
-		if _, ok := localHave[k]; !ok {
-			wantPull = append(wantPull, id)
-		}
-	}
-
 	// Both directions run even if one fails: a run the remote rejects must
 	// not keep the other machines' runs from arriving.
-	pushed, pushErr := transferRuns(ctx, local, remote, wantPush)
-	pulled, pullErr := transferRuns(ctx, remote, local, wantPull)
+	pushed, pushErr := transferRuns(ctx, local, remote, missingRuns(localRuns, remoteRuns))
+	pulled, pullErr := transferRuns(ctx, remote, local, missingRuns(remoteRuns, localRuns))
 	return pushed, pulled, errors.Join(purgeErr, pushErr, pullErr)
 }
 
@@ -447,49 +514,21 @@ func transferRuns(ctx context.Context, src, dst *sql.DB, ids []any) (int, error)
 }
 
 func copyRuns(ctx context.Context, src, dst *sql.DB, tomb map[string]bool) (added, skipped int, err error) {
-	const keysSQL = `SELECT id,hostname,ts,tool,cmd FROM runs`
-	have := map[string]bool{}
-	var dead []any
-	err = each(ctx, dst, keysSQL, func(r *sql.Rows) error {
-		var id int64
-		var x Run
-		if err := r.Scan(&id, &x.Hostname, &x.Ts, &x.Tool, &x.Cmd); err != nil {
-			return err
-		}
-		k := runKey(x.Hostname, x.Ts, x.Tool, x.Cmd)
-		if tomb[k] {
-			dead = append(dead, id)
-		}
-		have[k] = true
-		return nil
-	})
+	dead := newRunTombs(tomb)
+	have, dstDead, err := readRuns(ctx, dst, dead)
 	if err != nil {
 		return 0, 0, err
 	}
-	if err := purgeChunked(ctx, dst, "runs", "outputs_fts", dead); err != nil {
+	if err := purgeChunked(ctx, dst, "runs", "outputs_fts", dstDead); err != nil {
 		return 0, 0, err
 	}
-
-	var want []any
-	err = each(ctx, src, keysSQL, func(r *sql.Rows) error {
-		var id int64
-		var x Run
-		if err := r.Scan(&id, &x.Hostname, &x.Ts, &x.Tool, &x.Cmd); err != nil {
-			return err
-		}
-		if k := runKey(x.Hostname, x.Ts, x.Tool, x.Cmd); have[k] || tomb[k] {
-			skipped++
-		} else {
-			have[k] = true
-			want = append(want, id)
-		}
-		return nil
-	})
+	runs, srcDead, err := readRuns(ctx, src, dead)
 	if err != nil {
 		return 0, 0, err
 	}
+	want := missingRuns(runs, have)
 	added, err = transferRuns(ctx, src, dst, want)
-	return added, skipped, err
+	return added, len(srcDead) + len(runs) - len(want), err
 }
 
 type memMeta struct {
@@ -505,10 +544,12 @@ func nsKey(ns, title string) string { return ns + "\x00" + title }
 // slot is the note's (namespace, title) key, unique per database.
 func (m memMeta) slot() string { return nsKey(m.ns, m.title) }
 
-// sameTime treats timestamps within 1e-5s as equal so JSON/HTTP float
+// sameTime treats timestamps within timeTol as equal so JSON/HTTP float
 // round-tripping on remote databases (e.g. Turso losing a trailing digit)
 // cannot trigger endless re-uploads.
-func sameTime(a, b float64) bool { return math.Abs(a-b) <= 1e-5 }
+func sameTime(a, b float64) bool { return math.Abs(a-b) <= timeTol }
+
+const timeTol = 1e-5 // seconds
 
 // newer orders notes for last-write-wins: later mtime, then smaller uid.
 func (m memMeta) newer(o memMeta) bool {
@@ -544,8 +585,7 @@ func readMemMeta(ctx context.Context, db *sql.DB, tomb map[string]bool) (side me
 
 // memNote is a note as both sides hold it after the merge.
 type memNote struct {
-	memMeta         // final slot and mtime; id is its row on side `from`
-	from    int     // side holding the winning content
+	memMeta         // final slot and mtime; id: its row on the side with the winning content
 	ver     float64 // mtime of that content (before a conflict rename)
 }
 
@@ -560,8 +600,10 @@ type memMerge struct {
 //
 //  1. a note both sides know (uid) takes the newer copy — edits and renames;
 //  2. two notes on the same (namespace, title), each known to one side only,
-//     are the same note created on two machines (older syncs had no uids):
-//     the newer survives and overwrites the other's row;
+//     at least one with a legacy uid, are the same note created on two
+//     machines (older syncs had no uids): the newer survives and overwrites
+//     the other's row; two uid'd notes are distinct (created offline on two
+//     machines) and both kept by step 3;
 //  3. (namespace, title) stays unique: of notes wanting one slot the newer
 //     keeps it, the others are renamed "title (uid8)" with an mtime just past
 //     the winner's, so the rename wins the next sync everywhere.
@@ -570,12 +612,12 @@ type memMerge struct {
 // side is which — so every direction and machine reaches the same state.
 func mergeMemories(a, b memSide) memMerge {
 	g := memMerge{sides: [2]memSide{a, b}, notes: map[string]memNote{}}
-	for i, s := range g.sides {
+	for _, s := range g.sides {
 		for uid, m := range s.byUID {
 			n, ok := g.notes[uid]
 			eq := ok && sameTime(m.mtime, n.mtime)
 			if !ok || (!eq && m.mtime > n.mtime) || (eq && m.slot() < n.slot()) {
-				g.notes[uid] = memNote{m, i, m.mtime}
+				g.notes[uid] = memNote{m, m.mtime}
 			}
 		}
 	}
@@ -584,7 +626,7 @@ func mergeMemories(a, b memSide) memMerge {
 	}
 	for slot, x := range a.byNS {
 		y, ok := b.byNS[slot]
-		if !ok || x.uid == y.uid {
+		if !ok || x.uid == y.uid || !isLegacyUID(x.uid) && !isLegacyUID(y.uid) {
 			continue
 		}
 		if _, known := b.byUID[x.uid]; known {
@@ -627,6 +669,10 @@ func mergeMemories(a, b memSide) memMerge {
 	return g
 }
 
+// isLegacyUID reports a uid derived by legacyUID ("host|ts|ns|title") for a
+// note written before notes had uids; newUID never contains '|'.
+func isLegacyUID(uid string) bool { return strings.Contains(uid, "|") }
+
 // conflictTitle is m's title made unique among owner's slots: "title (uid8)".
 func conflictTitle(m memMeta, owner map[string]memMeta) string {
 	base := m.title + " (" + m.uid[:min(8, len(m.uid))] + ")"
@@ -661,7 +707,7 @@ func (g memMerge) plan(dst int) memPlan {
 			}
 			continue
 		}
-		// the content comes from the other side (n.from != dst)
+		// the content comes from the other side
 		if !has {
 			cur, has = g.replaced[dst][uid]
 		}
@@ -678,6 +724,13 @@ func (g memMerge) plan(dst int) memPlan {
 // once, and transfers content only for changed/missing notes. Both
 // directions run even if one fails.
 func syncMemoriesBidirectional(ctx context.Context, local, remote *sql.DB, tomb map[string]bool) (pushed, pulled int, err error) {
+	// an index older clients left out of step (either side) is rebuilt first:
+	// setNotes/insertBatch rely on FTS rowid = note id
+	for _, db := range []*sql.DB{local, remote} {
+		if err := fixMemFTS(ctx, db); err != nil {
+			return 0, 0, err
+		}
+	}
 	l, lDead, err := readMemMeta(ctx, local, tomb)
 	if err != nil {
 		return 0, 0, err
@@ -831,7 +884,8 @@ func fixMemFTS(ctx context.Context, db *sql.DB) error {
 	var bad int
 	err := db.QueryRowContext(ctx, `SELECT
 	  (SELECT count(*) FROM memories m LEFT JOIN memories_fts f ON f.rowid = m.id
-	    WHERE f.rowid IS NULL OR f.title IS NOT m.title OR f.content IS NOT m.content)
+	    WHERE f.rowid IS NULL OR f.title IS NOT m.title OR f.content IS NOT m.content
+	       OR f.namespace IS NOT m.namespace OR f.tags IS NOT m.tags)
 	  + abs((SELECT count(*) FROM memories) - (SELECT count(*) FROM memories_fts))`).Scan(&bad)
 	if err != nil || bad == 0 {
 		return err
@@ -926,10 +980,12 @@ func chunks[T any](s []T, n int) func(func([]T) bool) {
 	}
 }
 
+// sanitizeURL hides credentials in a remote URL for display; an unparsable
+// URL is not shown at all (it may still carry a token).
 func sanitizeURL(u string) string {
 	parsed, err := url.Parse(u)
 	if err != nil {
-		return u
+		return "unparsable URL"
 	}
 	// Hide user info and sensitive query params
 	parsed.User = nil

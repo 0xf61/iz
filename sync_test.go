@@ -339,8 +339,9 @@ func TestSyncRenamesPreUIDRow(t *testing.T) {
 	}
 }
 
-// seedConflicts fills two databases with edits, renames, a slot collision
-// and the same note created on both (no shared uid).
+// seedConflicts fills two databases with edits, renames, a slot collision,
+// two notes created on one title offline, and the same pre-uid note on both
+// (different legacy uids).
 func seedConflicts(t *testing.T, a, b *sql.DB) {
 	t.Helper()
 	putNote(t, a, "U1", "ns", "A", 200)
@@ -351,6 +352,8 @@ func seedConflicts(t *testing.T, a, b *sql.DB) {
 	putNote(t, b, "U2", "ns", "A", 150)
 	putNote(t, b, "E1", "ns", "edited", 100)
 	putNote(t, b, "S2", "dup", "same", 120)
+	putNote(t, a, "h|1|old|n", "old", "n", 110)
+	putNote(t, b, "h|2|old|n", "old", "n", 130)
 }
 
 // Merging a into b gives what merging b into a gives.
@@ -369,8 +372,19 @@ func TestCopyMemoriesOrderIndependent(t *testing.T) {
 	if !slices.Equal(intoB, intoA) {
 		t.Fatalf("merge depends on direction:\na→b %q\nb→a %q", intoB, intoA)
 	}
-	if len(intoB) != 5 { // U1, U2, U4, E1, and one of S1/S2
-		t.Errorf("merged notes = %q", intoB)
+	// S1/S2 (separate notes created on one title offline) are both kept, the
+	// legacy-uid pair L1/L2 (one note from before uids) only once
+	want := []string{
+		"E1 ns:edited @300 body of E1",
+		"S1 dup:same @120 body of S1",
+		"S2 dup:same (S2) @120.001 body of S2",
+		"U1 ns:A @200 body of U1",
+		"U2 ns:A (U2) (2) @200.001 body of U2",
+		"U4 ns:A (U2) @50 body of U4",
+		"h|2|old|n old:n @130 body of h|2|old|n",
+	}
+	if !slices.Equal(intoB, want) {
+		t.Errorf("merged notes = %q, want %q", intoB, want)
 	}
 	// and a sync of the same pair converges to that state too
 	a3, b3 := syncDBs(t)
@@ -467,8 +481,8 @@ func TestPruneOnlyExpired(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if n := deleteRuns(local, []int64{1}); n != 1 {
-		t.Fatalf("deleted %d runs", n)
+	if n, err := deleteRuns(local, []int64{1}); n != 1 || err != nil {
+		t.Fatalf("deleted %d runs (%v)", n, err)
 	}
 	expired := float64(time.Now().Add(-31 * 24 * time.Hour).Unix())
 	runTomb := runKey("kali", 1700000000, "nmap", "nmap -sV")
@@ -576,5 +590,148 @@ func TestSyncFloatPrecisionIdempotent(t *testing.T) {
 	}
 	if up.notes != 0 || down.notes != 0 {
 		t.Errorf("got up=%d down=%d, want 0/0 despite 1e-7 float rounding", up.notes, down.notes)
+	}
+}
+
+// Run timestamps drifting by 1 ULP on a remote (.2044601 vs .20446) neither
+// duplicate the run nor let it escape its tombstone, in sync and in merge.
+func TestSyncRunFloatPrecisionIdempotent(t *testing.T) {
+	const ts, drifted = 1795348751.2044601, 1795348751.20446
+	put := func(t *testing.T, db *sql.DB, ts float64) int64 {
+		t.Helper()
+		r := sampleRun("nmap", "nmap -sV", "")
+		r.Ts = ts
+		id, err := insertRun(db, r, gz([]byte("out")), []byte("out"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	count := func(db *sql.DB) (n int) {
+		db.QueryRow(`SELECT count(*) FROM runs`).Scan(&n) //nolint
+		return n
+	}
+	syncQuiet := func(t *testing.T, local, remote *sql.DB) {
+		t.Helper()
+		for range 2 {
+			if up, down, err := syncPair(bg, local, remote); err != nil || up.runs+down.runs != 0 {
+				t.Fatalf("sync moved runs: up=%+v down=%+v err=%v", up, down, err)
+			}
+		}
+	}
+
+	t.Run("live runs", func(t *testing.T) {
+		local, remote := syncDBs(t)
+		put(t, local, ts)
+		put(t, remote, drifted)
+		syncQuiet(t, local, remote)
+		if count(local) != 1 || count(remote) != 1 {
+			t.Errorf("runs duplicated: local %d, remote %d", count(local), count(remote))
+		}
+		if added, skipped, err := copyRuns(bg, remote, local, nil); added != 0 || skipped != 1 || err != nil {
+			t.Errorf("merge: added %d, skipped %d, err %v", added, skipped, err)
+		}
+	})
+
+	t.Run("local tombstone, drifted remote row", func(t *testing.T) {
+		local, remote := syncDBs(t)
+		id := put(t, local, ts)
+		put(t, remote, drifted)
+		if n, err := deleteRuns(local, []int64{id}); n != 1 || err != nil {
+			t.Fatalf("deleteRuns = %d, %v", n, err)
+		}
+		syncQuiet(t, local, remote)
+		if count(local)+count(remote) != 0 {
+			t.Errorf("deleted run resurrected: local %d, remote %d", count(local), count(remote))
+		}
+	})
+
+	t.Run("drifted remote tombstone", func(t *testing.T) {
+		local, remote := syncDBs(t)
+		put(t, local, ts)
+		key := runKey("kali", drifted, "nmap", "nmap -sV")
+		if _, err := remote.Exec(`INSERT INTO tombstones(key, ts) VALUES(?, ?)`, key, now()); err != nil {
+			t.Fatal(err)
+		}
+		syncQuiet(t, local, remote)
+		if count(local)+count(remote) != 0 {
+			t.Errorf("tombstoned run survives: local %d, remote %d", count(local), count(remote))
+		}
+		src, dst := syncDBs(t)
+		put(t, src, ts)
+		if added, skipped, err := copyRuns(bg, src, dst, map[string]bool{key: true}); added != 0 || skipped != 1 || err != nil {
+			t.Errorf("merge past a drifted tombstone: added %d, skipped %d, err %v", added, skipped, err)
+		}
+	})
+
+	// matches straddling a bucket boundary are still found; distinct runs not
+	s := runSet{}
+	s.add(Run{Hostname: "h", Tool: "t", Cmd: "c", Ts: 1795348751.2045 - 2e-6})
+	if !s.has(Run{Hostname: "h", Tool: "t", Cmd: "c", Ts: 1795348751.2045 + 2e-6}) {
+		t.Error("match across a bucket boundary missed")
+	}
+	if s.has(Run{Hostname: "h", Tool: "t", Cmd: "c", Ts: 1795348751.2046}) || s.has(Run{Hostname: "h", Tool: "t", Cmd: "x", Ts: 1795348751.2045}) {
+		t.Error("distinct run matched")
+	}
+}
+
+// Two notes created offline on one title (different machines, real uids)
+// are both kept: the newer keeps the title, the older moves to "title (uid8)".
+func TestSyncOfflineSameTitlePreservesBoth(t *testing.T) {
+	local, remote := syncDBs(t)
+	putNote(t, local, "aaaa1111bbbb2222", "proj", "todo", 100)
+	putNote(t, remote, "cccc3333dddd4444", "proj", "todo", 200)
+	got := syncConverged(t, local, remote)
+	want := []string{
+		"aaaa1111bbbb2222 proj:todo (aaaa1111) @200.001 body of aaaa1111bbbb2222",
+		"cccc3333dddd4444 proj:todo @200 body of cccc3333dddd4444",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// iz sync rebuilds a note index an older client left out of step, on either
+// side (syncConverged fails on an index not mirroring the notes).
+func TestSyncRepairsNoteIndex(t *testing.T) {
+	local, remote := syncDBs(t)
+	putNote(t, local, "u1", "ns", "a", 100)
+	putNote(t, remote, "u2", "ns", "b", 100)
+	for _, db := range []*sql.DB{local, remote} {
+		if _, err := db.Exec(`DELETE FROM memories_fts`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	syncConverged(t, local, remote)
+	if ms, err := queryMemories(local, "body", 10); err != nil || len(ms) != 2 {
+		t.Errorf("search after repair: %d notes (%v)", len(ms), err)
+	}
+}
+
+func TestSanitizeURL(t *testing.T) {
+	if got := sanitizeURL("libsql://u:pw@db.turso.io?authToken=secret"); strings.Contains(got, "secret") || strings.Contains(got, "pw") {
+		t.Errorf("credentials shown: %q", got)
+	}
+	if got := sanitizeURL("libsql://db\x7f.io?authToken=secret"); strings.Contains(got, "secret") {
+		t.Errorf("unparsable URL shown raw: %q", got)
+	}
+}
+
+// A hanging atuin cannot stall iz sync's config lookup.
+func TestAtuinKVGetTimeout(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "atuin"), []byte("#!/bin/sh\nexec sleep 10\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	old := atuinTimeout
+	atuinTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { atuinTimeout = old })
+	start := time.Now()
+	if v := atuinKVGet("IZ_SYNC_URL"); v != "" {
+		t.Errorf("got %q", v)
+	}
+	if d := time.Since(start); d > 3*time.Second {
+		t.Errorf("atuin not timed out (took %s)", d)
 	}
 }
