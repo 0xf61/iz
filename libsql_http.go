@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -144,7 +145,11 @@ func (c *hranaConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.
 	if opts.Isolation != driver.IsolationLevel(sql.LevelDefault) {
 		return nil, fmt.Errorf("libsql: unsupported isolation level %d", opts.Isolation)
 	}
-	if _, err := c.execStmt(ctx, "BEGIN", nil, false); err != nil {
+	beginSQL := "BEGIN IMMEDIATE"
+	if opts.ReadOnly {
+		beginSQL = "BEGIN"
+	}
+	if _, err := c.execStmt(ctx, beginSQL, nil, false); err != nil {
 		return nil, err
 	}
 	c.inTx = true
@@ -354,17 +359,60 @@ func (c *hranaConn) applyBaseURL(raw string) error {
 	if err != nil || u.Host == "" {
 		return fmt.Errorf("libsql: invalid server base_url")
 	}
+	if u.User != nil {
+		return errors.New("libsql: refusing userinfo in server base_url")
+	}
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return fmt.Errorf("libsql: unsupported server base_url scheme %q", u.Scheme)
 	}
-	if strings.HasPrefix(c.baseEndpoint, "https://") && u.Scheme != "https" {
+	base, err := url.Parse(c.baseEndpoint)
+	if err != nil || base.Host == "" {
+		return errors.New("libsql: invalid base endpoint")
+	}
+	if base.Scheme == "https" && u.Scheme != "https" {
 		return errors.New("libsql: refusing https to http downgrade in base_url")
+	}
+	if !sameHostOrDomain(base.Hostname(), u.Hostname()) {
+		return fmt.Errorf("libsql: refusing untrusted base_url host %q", u.Hostname())
 	}
 	u.Path = strings.TrimRight(u.Path, "/") + "/v2/pipeline"
 	u.RawQuery = ""
 	u.Fragment = ""
 	c.endpoint = u.String()
 	return nil
+}
+
+// sameHostOrDomain reports whether target shares the same host or registrable
+// parent domain as base (blocking cross-domain SSRF and Bearer token leaks).
+func sameHostOrDomain(base, target string) bool {
+	base = strings.ToLower(strings.TrimSuffix(base, "."))
+	target = strings.ToLower(strings.TrimSuffix(target, "."))
+	if base == "" || target == "" {
+		return false
+	}
+	if base == target {
+		return true
+	}
+	if net.ParseIP(base) != nil || net.ParseIP(target) != nil {
+		return false
+	}
+	bd, td := parentDomain(base), parentDomain(target)
+	return bd != "" && bd == td
+}
+
+func parentDomain(host string) string {
+	parts := strings.Split(host, ".")
+	if len(parts) < 2 {
+		return ""
+	}
+	n := 2
+	if len(parts) >= 3 && len(parts[len(parts)-1]) == 2 {
+		switch parts[len(parts)-2] {
+		case "co", "com", "net", "org", "gov", "edu", "ac", "mil":
+			n = 3
+		}
+	}
+	return strings.Join(parts[len(parts)-n:], ".")
 }
 
 func (c *hranaConn) pipeline(ctx context.Context, reqs []hranaReq) (*hranaPipelineResp, error) {

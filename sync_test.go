@@ -1036,3 +1036,70 @@ func TestSyncPullScalePagingRebuildFTSAndReadRetry(t *testing.T) {
 		t.Errorf("expected >= 4 pull SELECT queries (2 byte-budget chunks + 2 retries), got %d", pullSelects)
 	}
 }
+
+func TestFixMemFTSFastCheckAndRowidDrift(t *testing.T) {
+	_, remoteBacking := syncDBs(t)
+	putNote(t, remoteBacking, "u1", "ns", "first", 100)
+	putNote(t, remoteBacking, "u2", "ns", "second", 200)
+
+	// 1. Clean DB: fixMemFTS must use a fast check with no LEFT JOIN or DELETE.
+	remote, queries, mu := startMockHranaSQLite(t, remoteBacking, nil)
+	if err := fixMemFTS(bg, remote); err != nil {
+		t.Fatalf("fixMemFTS clean: %v", err)
+	}
+	mu.Lock()
+	qs := append([]string(nil), (*queries)...)
+	mu.Unlock()
+	if len(qs) != 1 {
+		t.Fatalf("clean fixMemFTS ran %d queries, want 1: %v", len(qs), qs)
+	}
+	if strings.Contains(strings.ToUpper(qs[0]), "LEFT JOIN") {
+		t.Errorf("clean fixMemFTS ran expensive LEFT JOIN: %s", qs[0])
+	}
+
+	// 2. Rowid drift with identical row counts: fixMemFTS detects and repairs it.
+	if _, err := remoteBacking.Exec(`DELETE FROM memories WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := remoteBacking.Exec(`DELETE FROM memories_fts`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := remoteBacking.Exec(`INSERT INTO memories_fts(rowid, title, content, namespace, tags)
+		SELECT 1, title, content, namespace, tags FROM memories WHERE id = 2`); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixMemFTS(bg, remoteBacking); err != nil {
+		t.Fatalf("fixMemFTS drift: %v", err)
+	}
+	var ftsRowID int64
+	if err := remoteBacking.QueryRow(`SELECT rowid FROM memories_fts`).Scan(&ftsRowID); err != nil || ftsRowID != 2 {
+		t.Errorf("repaired memories_fts rowid = %d (%v), want 2", ftsRowID, err)
+	}
+}
+
+func TestAcquireSyncLock(t *testing.T) {
+	dbFile := filepath.Join(t.TempDir(), "iz.db")
+	unlock, err := acquireSyncLock(dbFile)
+	if err != nil {
+		t.Fatalf("first acquireSyncLock: %v", err)
+	}
+	if _, err := acquireSyncLock(dbFile); err == nil || !strings.Contains(err.Error(), "already running") {
+		t.Fatalf("concurrent acquireSyncLock = %v, want already-running error", err)
+	}
+	unlock()
+
+	unlock2, err := acquireSyncLock(dbFile)
+	if err != nil {
+		t.Fatalf("re-acquireSyncLock after unlock: %v", err)
+	}
+	unlock2()
+
+	// Special paths (:memory:, file:) are no-ops and do not create lock files.
+	for _, p := range []string{":memory:", "file:memdb1?mode=memory"} {
+		u, err := acquireSyncLock(p)
+		if err != nil {
+			t.Errorf("acquireSyncLock(%q): %v", p, err)
+		}
+		u()
+	}
+}

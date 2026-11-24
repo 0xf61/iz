@@ -15,6 +15,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // Replication between two iz databases. One primitive, replicate(src, dst),
@@ -138,6 +140,13 @@ Environment:
 		return 2
 	}
 	defer localDB.Close()
+
+	unlock, err := acquireSyncLock(dbPath())
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "iz sync:", err)
+		return 1
+	}
+	defer unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -1005,17 +1014,48 @@ func setNotes(ctx context.Context, tx *sql.Tx, cols []string, rows [][]any) erro
 	return nil
 }
 
+// acquireSyncLock takes an exclusive non-blocking advisory flock on <db>.lock
+// so two local `iz sync` processes cannot race against the same database.
+func acquireSyncLock(dbFile string) (func(), error) {
+	if dbFile == "" || dbFile == ":memory:" || strings.HasPrefix(dbFile, "file:") {
+		return func() {}, nil
+	}
+	lockPath := dbFile + ".lock"
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		f.Close()
+		if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {
+			return nil, fmt.Errorf("another iz sync is already running (lock: %s)", lockPath)
+		}
+		return nil, err
+	}
+	return func() {
+		_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
+		_ = f.Close()
+	}, nil
+}
+
 // fixMemFTS rebuilds memories_fts when it no longer mirrors memories (older
-// syncs inserted remote index rows without an explicit rowid).
+// syncs inserted remote index rows without an explicit rowid). A fast count
+// and rowid-bound check avoids scanning/joining full note bodies on every sync.
 func fixMemFTS(ctx context.Context, db *sql.DB) error {
-	var bad int
+	var memCnt, ftsCnt, memMin, ftsMin, memMax, ftsMax int64
 	err := db.QueryRowContext(ctx, `SELECT
-	  (SELECT count(*) FROM memories m LEFT JOIN memories_fts f ON f.rowid = m.id
-	    WHERE f.rowid IS NULL OR f.title IS NOT m.title OR f.content IS NOT m.content
-	       OR f.namespace IS NOT m.namespace OR f.tags IS NOT m.tags)
-	  + abs((SELECT count(*) FROM memories) - (SELECT count(*) FROM memories_fts))`).Scan(&bad)
-	if err != nil || bad == 0 {
+	  (SELECT count(*) FROM memories),
+	  (SELECT count(*) FROM memories_fts),
+	  coalesce((SELECT id FROM memories ORDER BY id ASC LIMIT 1), 0),
+	  coalesce((SELECT rowid FROM memories_fts ORDER BY rowid ASC LIMIT 1), 0),
+	  coalesce((SELECT id FROM memories ORDER BY id DESC LIMIT 1), 0),
+	  coalesce((SELECT rowid FROM memories_fts ORDER BY rowid DESC LIMIT 1), 0)`).
+		Scan(&memCnt, &ftsCnt, &memMin, &ftsMin, &memMax, &ftsMax)
+	if err != nil {
 		return err
+	}
+	if memCnt == ftsCnt && memMin == ftsMin && memMax == ftsMax {
+		return nil
 	}
 	return inTx(ctx, db, func(tx *sql.Tx) error {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM memories_fts`); err != nil {

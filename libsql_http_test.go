@@ -574,7 +574,7 @@ func TestHranaTransactionsCommitRollbackAndBaseURL(t *testing.T) {
 	if len(got) < 7 {
 		t.Fatalf("expected at least 7 calls, got %d: %+v", len(got), got)
 	}
-	if got[0].server != "primary" || got[0].baton != "" || strings.Join(got[0].reqs, ",") != "execute:BEGIN" {
+	if got[0].server != "primary" || got[0].baton != "" || strings.Join(got[0].reqs, ",") != "execute:BEGIN IMMEDIATE" {
 		t.Errorf("call[0] = %+v", got[0])
 	}
 	if got[1].server != "replica" || got[1].baton != "b1" || strings.Join(got[1].reqs, ",") != "execute:INSERT INTO t VALUES (1)" {
@@ -589,35 +589,79 @@ func TestHranaTransactionsCommitRollbackAndBaseURL(t *testing.T) {
 	if got[4].server != "primary" || got[4].baton != "" || strings.Join(got[4].reqs, ",") != "execute:SELECT 7,close" {
 		t.Errorf("call[4] = %+v", got[4])
 	}
-	if got[5].server != "primary" || got[5].baton != "" || strings.Join(got[5].reqs, ",") != "execute:BEGIN" {
+	if got[5].server != "primary" || got[5].baton != "" || strings.Join(got[5].reqs, ",") != "execute:BEGIN IMMEDIATE" {
 		t.Errorf("call[5] = %+v", got[5])
 	}
 	if got[6].server != "replica" || got[6].baton != "b1" || strings.Join(got[6].reqs, ",") != "execute:ROLLBACK,close" {
 		t.Errorf("call[6] = %+v", got[6])
 	}
 
-	// 4. Unsupported isolation level returns error.
+	// 4. Read-only transaction uses plain BEGIN (not BEGIN IMMEDIATE).
+	txRO, err := db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("BeginTx read-only: %v", err)
+	}
+	if err := txRO.Rollback(); err != nil {
+		t.Fatalf("Rollback read-only: %v", err)
+	}
+	mu.Lock()
+	roCall := calls[len(calls)-2]
+	mu.Unlock()
+	if strings.Join(roCall.reqs, ",") != "execute:BEGIN" {
+		t.Errorf("read-only begin call = %+v, want execute:BEGIN", roCall)
+	}
+
+	// 5. Unsupported isolation level returns error.
 	if _, err := db.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelSerializable}); err == nil {
 		t.Error("expected error for unsupported isolation level")
 	}
 }
 
 func TestHranaBaseURLDowngradeRejected(t *testing.T) {
-	c := &hranaConn{
-		baseEndpoint: "https://db.turso.io/v2/pipeline",
-		endpoint:     "https://db.turso.io/v2/pipeline",
+	cases := []struct {
+		name     string
+		base     string
+		raw      string
+		want     string
+		wantErr  bool
+	}{
+		{"https downgrade rejected", "https://db.turso.io/v2/pipeline", "http://db.turso.io", "", true},
+		{"unsupported scheme rejected", "https://db.turso.io/v2/pipeline", "file:///etc/passwd", "", true},
+		{"userinfo rejected", "https://db.turso.io/v2/pipeline", "https://user:pass@replica.turso.io", "", true},
+		{"username-only rejected", "https://db.turso.io/v2/pipeline", "https://user@db.turso.io", "", true},
+		{"cross-domain rejected", "https://db.turso.io/v2/pipeline", "https://attacker.example.com", "", true},
+		{"suffix-spoof rejected", "https://db.turso.io/v2/pipeline", "https://turso.io.evil.com", "", true},
+		{"lookalike domain rejected", "https://db.turso.io/v2/pipeline", "https://not-turso.io", "", true},
+		{"ip target from domain rejected", "https://db.turso.io/v2/pipeline", "https://169.254.169.254", "", true},
+		{"different ip rejected", "http://127.0.0.1:8080/v2/pipeline", "http://169.254.169.254", "", true},
+		{"ccTLD cross-tenant rejected", "https://app.example.co.uk/v2/pipeline", "https://evil.co.uk", "", true},
+		{"same ip different port allowed", "http://127.0.0.1:8080/v2/pipeline", "http://127.0.0.1:9090", "http://127.0.0.1:9090/v2/pipeline", false},
+		{"same host allowed", "https://db.turso.io/v2/pipeline", "https://db.turso.io", "https://db.turso.io/v2/pipeline", false},
+		{"sibling subdomain allowed", "https://db.turso.io/v2/pipeline", "https://replica.turso.io", "https://replica.turso.io/v2/pipeline", false},
+		{"multi-level turso subdomain allowed", "https://db.aws-us-east-1.turso.io/v2/pipeline", "https://replica.aws-eu-west-1.turso.io", "https://replica.aws-eu-west-1.turso.io/v2/pipeline", false},
+		{"ccTLD sibling subdomain allowed", "https://app.example.co.uk/v2/pipeline", "https://replica.example.co.uk", "https://replica.example.co.uk/v2/pipeline", false},
 	}
-	if err := c.applyBaseURL("http://db.turso.io"); err == nil {
-		t.Fatal("expected https -> http downgrade error")
-	}
-	if err := c.applyBaseURL("file:///etc/passwd"); err == nil {
-		t.Fatal("expected unsupported scheme error")
-	}
-	if err := c.applyBaseURL("https://replica.turso.io"); err != nil {
-		t.Fatalf("valid https base_url failed: %v", err)
-	}
-	if c.endpoint != "https://replica.turso.io/v2/pipeline" {
-		t.Errorf("endpoint = %q", c.endpoint)
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &hranaConn{baseEndpoint: tc.base, endpoint: tc.base}
+			err := c.applyBaseURL(tc.raw)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("applyBaseURL(%q) = nil, want error", tc.raw)
+				}
+				if c.endpoint != tc.base {
+					t.Errorf("endpoint mutated on error: got %q, want %q", c.endpoint, tc.base)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("applyBaseURL(%q) unexpected error: %v", tc.raw, err)
+			}
+			if c.endpoint != tc.want {
+				t.Errorf("endpoint = %q, want %q", c.endpoint, tc.want)
+			}
+		})
 	}
 }
 
