@@ -498,26 +498,27 @@ func TestHranaTransactionsCommitRollbackAndBaseURL(t *testing.T) {
 		return out
 	}
 
-	// Replica server handles sticky base_url requests during the transaction.
-	replica := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		req := record("replica", r)
-		nextBaton := "b2"
-		for _, rr := range req.Requests {
-			if rr.Type == "close" {
-				nextBaton = ""
+	// Single server routes /sticky/v2/pipeline for sticky base_url requests
+	// (same host and port, distinct path prefix).
+	var srvURL string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/sticky/") {
+			req := record("replica", r)
+			nextBaton := "b2"
+			for _, rr := range req.Requests {
+				if rr.Type == "close" {
+					nextBaton = ""
+				}
 			}
+			writeHranaJSON(t, w, map[string]any{
+				"baton":   nextBaton,
+				"results": okResults(req),
+			})
+			return
 		}
-		writeHranaJSON(t, w, map[string]any{
-			"baton":   nextBaton,
-			"results": okResults(req),
-		})
-	}))
-	defer replica.Close()
-
-	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		req := record("primary", r)
 		nextBaton := "b1"
-		baseURL := replica.URL
+		baseURL := srvURL + "/sticky"
 		for _, rr := range req.Requests {
 			if rr.Type == "close" {
 				nextBaton = ""
@@ -530,9 +531,10 @@ func TestHranaTransactionsCommitRollbackAndBaseURL(t *testing.T) {
 			"results":  okResults(req),
 		})
 	}))
-	defer primary.Close()
+	srvURL = srv.URL
+	defer srv.Close()
 
-	db := openTestLibsql(t, primary.URL)
+	db := openTestLibsql(t, srv.URL)
 	db.SetMaxOpenConns(1)
 
 	// 1. Commit flow with sticky base_url
@@ -619,27 +621,28 @@ func TestHranaTransactionsCommitRollbackAndBaseURL(t *testing.T) {
 
 func TestHranaBaseURLDowngradeRejected(t *testing.T) {
 	cases := []struct {
-		name     string
-		base     string
-		raw      string
-		want     string
-		wantErr  bool
+		name    string
+		base    string
+		raw     string
+		want    string
+		wantErr bool
 	}{
 		{"https downgrade rejected", "https://db.turso.io/v2/pipeline", "http://db.turso.io", "", true},
 		{"unsupported scheme rejected", "https://db.turso.io/v2/pipeline", "file:///etc/passwd", "", true},
-		{"userinfo rejected", "https://db.turso.io/v2/pipeline", "https://user:pass@replica.turso.io", "", true},
+		{"userinfo rejected", "https://db.turso.io/v2/pipeline", "https://user:pass@db.turso.io", "", true},
 		{"username-only rejected", "https://db.turso.io/v2/pipeline", "https://user@db.turso.io", "", true},
 		{"cross-domain rejected", "https://db.turso.io/v2/pipeline", "https://attacker.example.com", "", true},
+		{"cross-tenant turso subdomain rejected", "https://db.turso.io/v2/pipeline", "https://replica.turso.io", "", true},
+		{"cross-tenant fly.dev subdomain rejected", "https://app.fly.dev/v2/pipeline", "https://evil.fly.dev", "", true},
 		{"suffix-spoof rejected", "https://db.turso.io/v2/pipeline", "https://turso.io.evil.com", "", true},
-		{"lookalike domain rejected", "https://db.turso.io/v2/pipeline", "https://not-turso.io", "", true},
 		{"ip target from domain rejected", "https://db.turso.io/v2/pipeline", "https://169.254.169.254", "", true},
-		{"different ip rejected", "http://127.0.0.1:8080/v2/pipeline", "http://169.254.169.254", "", true},
-		{"ccTLD cross-tenant rejected", "https://app.example.co.uk/v2/pipeline", "https://evil.co.uk", "", true},
-		{"same ip different port allowed", "http://127.0.0.1:8080/v2/pipeline", "http://127.0.0.1:9090", "http://127.0.0.1:9090/v2/pipeline", false},
+		{"different ip rejected", "http://127.0.0.1:8080/v2/pipeline", "http://169.254.169.254:8080", "", true},
+		{"same ip different port rejected", "http://127.0.0.1:8080/v2/pipeline", "http://127.0.0.1:9090", "", true},
+		{"same host different port rejected", "https://db.turso.io/v2/pipeline", "https://db.turso.io:8443", "", true},
 		{"same host allowed", "https://db.turso.io/v2/pipeline", "https://db.turso.io", "https://db.turso.io/v2/pipeline", false},
-		{"sibling subdomain allowed", "https://db.turso.io/v2/pipeline", "https://replica.turso.io", "https://replica.turso.io/v2/pipeline", false},
-		{"multi-level turso subdomain allowed", "https://db.aws-us-east-1.turso.io/v2/pipeline", "https://replica.aws-eu-west-1.turso.io", "https://replica.aws-eu-west-1.turso.io/v2/pipeline", false},
-		{"ccTLD sibling subdomain allowed", "https://app.example.co.uk/v2/pipeline", "https://replica.example.co.uk", "https://replica.example.co.uk/v2/pipeline", false},
+		{"same host case-insensitive and path prefix allowed", "https://db.turso.io/v2/pipeline", "https://DB.TURSO.IO./sticky/", "https://DB.TURSO.IO./sticky/v2/pipeline", false},
+		{"same ip and port allowed", "http://127.0.0.1:8080/v2/pipeline", "http://127.0.0.1:8080/node1", "http://127.0.0.1:8080/node1/v2/pipeline", false},
+		{"canonical ipv6 match allowed", "http://[::1]:8080/v2/pipeline", "http://[0:0:0:0:0:0:0:1]:8080/node1", "http://[0:0:0:0:0:0:0:1]:8080/node1/v2/pipeline", false},
 	}
 
 	for _, tc := range cases {
@@ -663,6 +666,105 @@ func TestHranaBaseURLDowngradeRejected(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestHranaBadConnOnBeginTxAndUntrustedBaseURL(t *testing.T) {
+	t.Run("BeginTx error with baton marks conn bad", func(t *testing.T) {
+		var failBegin atomic.Bool
+		failBegin.Store(true)
+		var closeCalls atomic.Int32
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req hranaPipelineReq
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			if len(req.Requests) == 1 && req.Requests[0].Type == "close" {
+				closeCalls.Add(1)
+				writeHranaJSON(t, w, map[string]any{
+					"baton":   nil,
+					"results": []any{map[string]any{"type": "ok", "response": map[string]any{"type": "close"}}},
+				})
+				return
+			}
+			if req.Requests[0].Stmt != nil && strings.HasPrefix(req.Requests[0].Stmt.SQL, "BEGIN") && failBegin.Load() {
+				writeHranaJSON(t, w, map[string]any{
+					"baton": "leaked-begin-baton",
+					"results": []any{
+						map[string]any{"type": "error", "error": map[string]string{"message": "database is locked"}},
+					},
+				})
+				return
+			}
+			writeHranaJSON(t, w, map[string]any{
+				"baton":   nil,
+				"results": []any{map[string]any{"type": "ok", "response": map[string]any{"type": "execute", "result": map[string]any{"cols": []any{}, "rows": []any{}}}}},
+			})
+		}))
+		defer srv.Close()
+
+		db := openTestLibsql(t, srv.URL)
+		db.SetMaxOpenConns(1)
+		if _, err := db.BeginTx(context.Background(), nil); err == nil {
+			t.Fatal("expected BeginTx error")
+		}
+		failBegin.Store(false)
+		if err := db.PingContext(context.Background()); err != nil {
+			t.Fatalf("PingContext after failed BeginTx: %v", err)
+		}
+		if closeCalls.Load() == 0 {
+			t.Error("expected discarded connection Close() to close leaked BeginTx baton")
+		}
+	})
+
+	t.Run("untrusted base_url marks conn bad and never hits target", func(t *testing.T) {
+		var attackerHits atomic.Int32
+		attacker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			attackerHits.Add(1)
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer attacker.Close()
+
+		var closeCalls atomic.Int32
+		var poison atomic.Bool
+		poison.Store(true)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req hranaPipelineReq
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			if len(req.Requests) == 1 && req.Requests[0].Type == "close" {
+				closeCalls.Add(1)
+				writeHranaJSON(t, w, map[string]any{
+					"baton":   nil,
+					"results": []any{map[string]any{"type": "ok", "response": map[string]any{"type": "close"}}},
+				})
+				return
+			}
+			resp := map[string]any{
+				"baton":   nil,
+				"results": []any{map[string]any{"type": "ok", "response": map[string]any{"type": "execute", "result": map[string]any{"cols": []any{}, "rows": []any{}}}}},
+			}
+			if poison.Load() {
+				resp["baton"] = "poison-baton"
+				resp["base_url"] = attacker.URL
+			}
+			writeHranaJSON(t, w, resp)
+		}))
+		defer srv.Close()
+
+		db := openTestLibsql(t, srv.URL+"?authToken=secret-token")
+		db.SetMaxOpenConns(1)
+		if _, err := db.BeginTx(context.Background(), nil); err == nil {
+			t.Fatal("expected BeginTx error on untrusted base_url")
+		}
+		poison.Store(false)
+		if err := db.PingContext(context.Background()); err != nil {
+			t.Fatalf("PingContext after rejected base_url: %v", err)
+		}
+		if attackerHits.Load() != 0 {
+			t.Fatalf("untrusted base_url target was hit %d times, want 0", attackerHits.Load())
+		}
+		if closeCalls.Load() == 0 {
+			t.Error("expected discarded connection Close() to close poison baton on trusted endpoint")
+		}
+	})
 }
 
 func TestHranaErrorResponses(t *testing.T) {

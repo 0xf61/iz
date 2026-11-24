@@ -158,6 +158,9 @@ func (c *hranaConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.
 		beginSQL = "BEGIN"
 	}
 	if _, err := c.execStmt(ctx, beginSQL, nil, false); err != nil {
+		if c.baton != "" {
+			c.bad = true
+		}
 		return nil, err
 	}
 	c.inTx = true
@@ -382,8 +385,8 @@ func (c *hranaConn) applyBaseURL(raw string) error {
 	if base.Scheme == "https" && u.Scheme != "https" {
 		return errors.New("libsql: refusing https to http downgrade in base_url")
 	}
-	if !sameHostOrDomain(base.Hostname(), u.Hostname()) {
-		return fmt.Errorf("libsql: refusing untrusted base_url host %q", u.Hostname())
+	if !sameHost(base.Hostname(), u.Hostname()) || u.Port() != base.Port() {
+		return fmt.Errorf("libsql: refusing untrusted base_url host %q", u.Host)
 	}
 	u.Path = strings.TrimRight(u.Path, "/") + "/v2/pipeline"
 	u.RawQuery = ""
@@ -392,37 +395,18 @@ func (c *hranaConn) applyBaseURL(raw string) error {
 	return nil
 }
 
-// sameHostOrDomain reports whether target shares the same host or registrable
-// parent domain as base (blocking cross-domain SSRF and Bearer token leaks).
-func sameHostOrDomain(base, target string) bool {
-	base = strings.ToLower(strings.TrimSuffix(base, "."))
-	target = strings.ToLower(strings.TrimSuffix(target, "."))
+// sameHost reports whether base and target refer to the exact same host or IP
+// (canonicalized via net.ParseIP for IPv4/IPv6, case-insensitive for DNS names).
+func sameHost(base, target string) bool {
+	base = strings.TrimSuffix(base, ".")
+	target = strings.TrimSuffix(target, ".")
 	if base == "" || target == "" {
 		return false
 	}
-	if base == target {
-		return true
+	if ip1, ip2 := net.ParseIP(base), net.ParseIP(target); ip1 != nil || ip2 != nil {
+		return ip1 != nil && ip2 != nil && ip1.Equal(ip2)
 	}
-	if net.ParseIP(base) != nil || net.ParseIP(target) != nil {
-		return false
-	}
-	bd, td := parentDomain(base), parentDomain(target)
-	return bd != "" && bd == td
-}
-
-func parentDomain(host string) string {
-	parts := strings.Split(host, ".")
-	if len(parts) < 2 {
-		return ""
-	}
-	n := 2
-	if len(parts) >= 3 && len(parts[len(parts)-1]) == 2 {
-		switch parts[len(parts)-2] {
-		case "co", "com", "net", "org", "gov", "edu", "ac", "mil":
-			n = 3
-		}
-	}
-	return strings.Join(parts[len(parts)-n:], ".")
+	return strings.EqualFold(base, target)
 }
 
 func (c *hranaConn) doPipelineHTTP(ctx context.Context, body []byte) ([]byte, int, error) {
@@ -456,7 +440,10 @@ func (c *hranaConn) updateStreamState(out *hranaPipelineResp) error {
 		return nil
 	}
 	if out.BaseURL != "" {
-		return c.applyBaseURL(out.BaseURL)
+		if err := c.applyBaseURL(out.BaseURL); err != nil {
+			c.bad = true
+			return err
+		}
 	}
 	return nil
 }
