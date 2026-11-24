@@ -218,9 +218,6 @@ func runPipeRecord(db *sql.DB, args []string) int {
 	capture := newCapture()
 	cmd.Stdout = io.MultiWriter(capture, os.Stdout)
 	cmd.Stderr = io.MultiWriter(capture, os.Stderr)
-	// Output goes through pipes; a daemonized grandchild keeping them open
-	// must not make Wait block after the child itself has exited.
-	cmd.WaitDelay = drainTimeout
 
 	// Signals iz must survive without acting on them, caught (not ignored)
 	// so the child still starts with default dispositions:
@@ -561,7 +558,7 @@ func passthrough(args []string) int {
 func joinArgs(a []string) string {
 	parts := make([]string, len(a))
 	for i, s := range a {
-		if s == "" || strings.ContainsAny(s, " \t\n\"'`$;&|<>(){}*?[]#~\\") {
+		if s == "" || strings.ContainsAny(s, " \t\n\"'`$;&|<>(){}*?[]#~\\!") {
 			parts[i] = "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 		} else {
 			parts[i] = s

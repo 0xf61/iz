@@ -35,7 +35,7 @@ func tidyRaw(b []byte) []byte {
 	b = reClear.ReplaceAll(b, nil)
 	lines := bytes.Split(b, []byte{'\n'})
 	for i, l := range lines {
-		l = bytes.TrimSuffix(l, []byte{'\r'})
+		l = bytes.TrimRight(l, "\r")
 		if j := bytes.LastIndexByte(l, '\r'); j >= 0 { // keep last redraw only
 			l = l[j+1:]
 		}

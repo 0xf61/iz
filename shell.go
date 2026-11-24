@@ -451,6 +451,8 @@ Usage:
 				fmt.Fprintf(os.Stderr, "[iz] configured shell hook in %s\n", detected)
 				installedShells++
 			}
+		} else {
+			fmt.Fprintf(os.Stderr, "[iz] unsupported shell (%s), skipping shell hook\n", os.Getenv("SHELL"))
 		}
 	}
 
@@ -501,7 +503,7 @@ func detectShell() string {
 	if base == "fish" || base == "zsh" || base == "bash" {
 		return base
 	}
-	return "zsh" // default on modern macOS
+	return ""
 }
 
 func installShellHook(home, sh string) (bool, error) {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"maps"
 	"math"
 	"os"
@@ -13,6 +14,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/creack/pty"
 )
 
 func TestMemoryCRUD(t *testing.T) {
@@ -487,5 +490,222 @@ func TestFzfExit(t *testing.T) {
 	}
 	if code := fzfExit(exec.Command("sh", "-c", "exit 130").Run()); code != 0 {
 		t.Errorf("fzf aborted (esc): exit=%d, want 0", code)
+	}
+}
+
+// captureStderr returns what fn prints to stderr.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stderr
+	os.Stderr = w
+	done := make(chan []byte, 1)
+	go func() { b, _ := io.ReadAll(r); done <- b }()
+	defer func() {
+		os.Stderr = old
+		_ = w.Close()
+		_ = r.Close()
+	}()
+	fn()
+	_ = w.Close()
+	os.Stderr = old
+	return string(<-done)
+}
+
+// Re-saving an identical note (including unnormalized tags like "a, b" vs "a,b")
+// must keep mtime unchanged, and re-importing unchanged markdown must not count
+// them as newly imported or updated.
+func TestUpsertUnchangedPreservesMtimeAndImportCount(t *testing.T) {
+	path := testDB(t)
+	t.Setenv("IZ", path)
+
+	db, err := openDBAt(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origID, status, err := upsertMemory(db, Memory{
+		Namespace: "ns",
+		Title:     "same",
+		Content:   "body text",
+		Tags:      "a,b",
+		TagsSet:   true,
+		Ts:        1000,
+		Mtime:     1000,
+	}, false)
+	if err != nil || status != "saved" {
+		t.Fatalf("initial upsert = (%d, %q, %v)", origID, status, err)
+	}
+
+	// Re-save with unnormalized equivalent tags ("a, b" and " a , , b ") and
+	// without -t: status must be "unchanged" and mtime must stay 1000.
+	for _, m := range []Memory{
+		{Namespace: "ns", Title: "same", Content: "body text", Tags: "a, b", TagsSet: true},
+		{Namespace: "ns", Title: "same", Content: "body text", Tags: " a , , b ", TagsSet: true},
+		{Namespace: "ns", Title: "same", Content: "body text"},
+	} {
+		id, st, err := upsertMemory(db, m, false)
+		if err != nil || id != origID || st != "unchanged" {
+			t.Fatalf("upsertMemory(%+v) = (%d, %q, %v), want (%d, unchanged, nil)", m, id, st, err, origID)
+		}
+		got, err := getMemory(db, origID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Mtime != 1000 || got.Tags != "a,b" {
+			t.Errorf("after unchanged upsert: mtime=%v tags=%q, want 1000 / a,b", got.Mtime, got.Tags)
+		}
+	}
+	db.Close()
+
+	// CLI noteCmd with unnormalized equivalent tags reports "unchanged" and keeps mtime.
+	stderr := captureStderr(t, func() {
+		if code := noteCmd([]string{"ns:same", "-t", "a, b", "body text"}); code != 0 {
+			t.Fatalf("noteCmd exit=%d", code)
+		}
+	})
+	if !strings.Contains(stderr, "[iz] unchanged") {
+		t.Errorf("stderr = %q, want '[iz] unchanged'", stderr)
+	}
+	if m := noteByTarget(t, path, "ns:same"); m.Mtime != 1000 {
+		t.Errorf("noteCmd unchanged bumped mtime to %v", m.Mtime)
+	}
+
+	// Changing tags actually updates and advances mtime.
+	if code := noteCmd([]string{"ns:same", "-t", "a,c", "body text"}); code != 0 {
+		t.Fatalf("noteCmd tag change exit=%d", code)
+	}
+	if m := noteByTarget(t, path, "ns:same"); m.Mtime <= 1000 || m.Tags != "a,c" {
+		t.Errorf("after tag change: mtime=%v tags=%q", m.Mtime, m.Tags)
+	}
+
+	// importNotes must not count unchanged notes as newly imported or updated.
+	mdFile := filepath.Join(t.TempDir(), "guide.md")
+	if err := os.WriteFile(mdFile, []byte("# One\nfirst\n\n## Two\nsecond\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out1 := captureStderr(t, func() {
+		if code := importNotes(mdFile); code != 0 {
+			t.Fatalf("first importNotes exit=%d", code)
+		}
+	})
+	if !strings.Contains(out1, "imported 2 new, updated 0 notes") {
+		t.Errorf("first import stderr = %q", out1)
+	}
+
+	// Pin imported notes' mtime so any unintended update is detectable.
+	db, err = openDBAt(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE memories SET mtime = 1000 WHERE namespace = 'guide'`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	out2 := captureStderr(t, func() {
+		if code := importNotes(mdFile); code != 0 {
+			t.Fatalf("second importNotes exit=%d", code)
+		}
+	})
+	if !strings.Contains(out2, "imported 0 new, updated 0 notes") {
+		t.Errorf("re-import unchanged stderr = %q, want 0 new / 0 updated", out2)
+	}
+	for _, target := range []string{"guide:One", "guide:Two"} {
+		if m := noteByTarget(t, path, target); m.Mtime != 1000 {
+			t.Errorf("re-import unchanged bumped %s mtime to %v", target, m.Mtime)
+		}
+	}
+
+	// Modifying one section updates only that section.
+	if err := os.WriteFile(mdFile, []byte("# One\nfirst\n\n## Two\nsecond edited\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out3 := captureStderr(t, func() {
+		if code := importNotes(mdFile); code != 0 {
+			t.Fatalf("third importNotes exit=%d", code)
+		}
+	})
+	if !strings.Contains(out3, "imported 0 new, updated 1 notes") {
+		t.Errorf("re-import 1 changed stderr = %q, want 0 new / 1 updated", out3)
+	}
+	if m := noteByTarget(t, path, "guide:One"); m.Mtime != 1000 {
+		t.Errorf("unchanged section guide:One mtime bumped to %v", m.Mtime)
+	}
+	if m := noteByTarget(t, path, "guide:Two"); m.Mtime <= 1000 || m.Content != "second edited" {
+		t.Errorf("updated section guide:Two = mtime %v content %q", m.Mtime, m.Content)
+	}
+}
+
+// On title collision / update failure, editNoteCmd preserves the user's edited
+// text in a temp file and prints its path on stderr.
+func TestEditNoteCmdPreservesTempFileOnUpdateFailure(t *testing.T) {
+	path := testDB(t)
+	t.Setenv("IZ", path)
+	if code := noteCmd([]string{"ns:first", "original first"}); code != 0 {
+		t.Fatalf("seed first exit=%d", code)
+	}
+	if code := noteCmd([]string{"ns:second", "original second"}); code != 0 {
+		t.Fatalf("seed second exit=%d", code)
+	}
+
+	// Fake $EDITOR that renames ns:first to collide with ns:second.
+	const editedDoc = "# ns:second\n\nmy edited content that must not be lost\n"
+	editorPath := filepath.Join(t.TempDir(), "fake-editor.sh")
+	script := "#!/bin/sh\nprintf '%s' " + joinArgs([]string{editedDoc}) + " > \"$1\"\n"
+	if err := os.WriteFile(editorPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("EDITOR", editorPath)
+
+	ptmx, tty, err := pty.Open()
+	if err != nil {
+		t.Fatalf("pty.Open: %v", err)
+	}
+	defer ptmx.Close()
+	defer tty.Close()
+
+	oldIn, oldOut := os.Stdin, os.Stdout
+	os.Stdin, os.Stdout = tty, tty
+	defer func() {
+		os.Stdin, os.Stdout = oldIn, oldOut
+	}()
+
+	var code int
+	stderr := captureStderr(t, func() {
+		code = editNoteCmd("ns:first")
+	})
+	if code != 1 {
+		t.Fatalf("editNoteCmd exit=%d, want 1 (stderr: %q)", code, stderr)
+	}
+	if !strings.Contains(stderr, "update failed") {
+		t.Fatalf("stderr missing update failed: %q", stderr)
+	}
+	const prefix = "(saved edit to "
+	_, after, ok := strings.Cut(stderr, prefix)
+	if !ok {
+		t.Fatalf("stderr missing saved temp path: %q", stderr)
+	}
+	savedPath, _, ok := strings.Cut(after, ")")
+	if !ok || savedPath == "" {
+		t.Fatalf("could not parse saved temp path from %q", stderr)
+	}
+	t.Cleanup(func() { _ = os.Remove(savedPath) })
+
+	gotBytes, err := os.ReadFile(savedPath)
+	if err != nil {
+		t.Fatalf("saved temp file %q unreadable: %v", savedPath, err)
+	}
+	if string(gotBytes) != editedDoc {
+		t.Errorf("saved temp file = %q, want %q", string(gotBytes), editedDoc)
+	}
+	// Neither existing note was clobbered.
+	if m := noteByTarget(t, path, "ns:first"); m.Content != "original first" {
+		t.Errorf("ns:first modified: %q", m.Content)
+	}
+	if m := noteByTarget(t, path, "ns:second"); m.Content != "original second" {
+		t.Errorf("ns:second modified: %q", m.Content)
 	}
 }

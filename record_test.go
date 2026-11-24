@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"io"
 	"math"
 	"os"
 	"os/exec"
@@ -24,6 +25,9 @@ func TestJoinArgs(t *testing.T) {
 		{[]string{"sh", "-c", "printf \"hi\"\n"}, "sh -c 'printf \"hi\"\n'"},
 		{[]string{"grep", "it's"}, `grep 'it'\''s'`},
 		{[]string{"echo", ""}, `echo ''`},
+		{[]string{"echo", "hello!"}, `echo 'hello!'`},
+		{[]string{"curl", "https://example.com/a!b"}, `curl 'https://example.com/a!b'`},
+		{[]string{"!", "foo"}, `'!' foo`},
 	}
 	for _, c := range cases {
 		if got := joinArgs(c.in); got != c.want {
@@ -126,6 +130,69 @@ func TestRunRecordPipeMode(t *testing.T) {
 	}
 	if !strings.Contains(out, "out-line") || !strings.Contains(out, "err-line") {
 		t.Errorf("output = %q", out)
+	}
+}
+
+// Pipe mode must preserve all output when a downstream reader stalls longer
+// than drainTimeout with more data than fits in the downstream pipe buffer.
+func TestRunRecordPipeModeSlowReader(t *testing.T) {
+	path := testDB(t)
+	t.Setenv("IZ", path)
+	t.Setenv("IZ_SHELL_CMD", "")
+	t.Setenv("IZ_PIPELINE_ID", "")
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldStdout := os.Stdout
+	os.Stdout = w
+	defer func() {
+		os.Stdout = oldStdout
+		_ = w.Close()
+		_ = r.Close()
+	}()
+
+	type readRes struct {
+		data []byte
+		err  error
+	}
+	done := make(chan readRes, 1)
+	go func() {
+		time.Sleep(drainTimeout + 250*time.Millisecond)
+		b, err := io.ReadAll(r)
+		done <- readRes{b, err}
+	}()
+
+	// Emit 112 KiB + marker: exceeds a 64 KiB downstream pipe + 32 KiB io.Copy
+	// buffer so the copy goroutine blocks on stdout while the remaining bytes
+	// fit in the child->iz pipe, letting the child exit before the reader wakes.
+	const marker = "SLOW_READER_END_MARKER\n"
+	const payloadBytes = 112 * 1024
+	awkProg := `BEGIN { s = "0123456789abcdef"; for (i = 0; i < 6; i++) s = s s; for (i = 0; i < 112; i++) printf "%s", s; print "SLOW_READER_END_MARKER" }`
+	code := runRecord([]string{"awk", awkProg})
+	os.Stdout = oldStdout
+	_ = w.Close()
+
+	res := <-done
+	if res.err != nil {
+		t.Fatalf("downstream read: %v", res.err)
+	}
+	if code != 0 {
+		t.Fatalf("exit=%d, want 0", code)
+	}
+	wantLen := payloadBytes + len(marker)
+	if len(res.data) != wantLen || !strings.HasSuffix(string(res.data), marker) {
+		t.Errorf("downstream got %d bytes (suffix=%q), want %d bytes ending with %q",
+			len(res.data), string(res.data[max(0, len(res.data)-32):]), wantLen, marker)
+	}
+	run, recorded := lastRun(t, path)
+	if !run.ExitCode.Valid || run.ExitCode.Int64 != 0 {
+		t.Errorf("recorded exit = %+v, want 0", run.ExitCode)
+	}
+	if len(recorded) != wantLen || !strings.HasSuffix(recorded, marker) {
+		t.Errorf("recorded got %d bytes (suffix=%q), want %d bytes ending with %q",
+			len(recorded), recorded[max(0, len(recorded)-32):], wantLen, marker)
 	}
 }
 

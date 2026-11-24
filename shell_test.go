@@ -292,3 +292,43 @@ __iz_precmd
 		t.Errorf("recorded output missing expected content:\n%s", recorded)
 	}
 }
+
+func TestDetectShellAndInitUnsupportedShell(t *testing.T) {
+	for sh, want := range map[string]string{
+		"/bin/zsh":            "zsh",
+		"/usr/local/bin/fish": "fish",
+		"/bin/bash":           "bash",
+		"/usr/bin/nu":         "",
+		"/bin/csh":            "",
+		"":                    "",
+	} {
+		t.Setenv("SHELL", sh)
+		if got := detectShell(); got != want {
+			t.Errorf("detectShell(SHELL=%q) = %q, want %q", sh, got, want)
+		}
+	}
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("SHELL", "/usr/bin/nu")
+
+	var code int
+	stderr := captureStderr(t, func() {
+		code = initCmd(nil)
+	})
+	if code != 0 {
+		t.Fatalf("initCmd(nil) exit=%d, want 0 (stderr: %q)", code, stderr)
+	}
+	if !strings.Contains(stderr, "unsupported shell") || !strings.Contains(stderr, "/usr/bin/nu") {
+		t.Errorf("stderr = %q, want unsupported shell message for /usr/bin/nu", stderr)
+	}
+	for _, rc := range []string{
+		filepath.Join(home, ".zshrc"),
+		filepath.Join(home, ".bashrc"),
+		filepath.Join(home, ".config", "fish", "config.fish"),
+	} {
+		if _, err := os.Stat(rc); !os.IsNotExist(err) {
+			t.Errorf("unsupported shell wrote %s (err=%v)", rc, err)
+		}
+	}
+}

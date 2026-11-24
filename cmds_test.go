@@ -268,6 +268,114 @@ func TestRecallCmdArgsAndErrors(t *testing.T) {
 	}
 }
 
+// Flag-like terms after "--" are treated as literal query terms, not recall flags.
+func TestRecallCmdDashDashFlagTerms(t *testing.T) {
+	path := testDB(t)
+	t.Setenv("IZ", path)
+
+	longBody := "flags -f -l -n -j -p " + strings.Repeat("word ", 150)
+	db, err := openDBAt(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := insertMemory(db, Memory{Namespace: "pentest", Title: "cli flags", Content: longBody}); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	mustInsert(t, path, sampleRun("grep", "grep -f -l -n -j -p", "matched -f -l -n -j -p"), "matched -f -l -n -j -p")
+
+	// JSON mode before "--": flag-like tokens after "--" must not trigger -l/-n/-p/-f.
+	var res struct {
+		Query string   `json:"query"`
+		Notes []Memory `json:"memories"`
+		Runs  []struct {
+			Tool string `json:"tool"`
+		} `json:"runs"`
+	}
+	jsonOut := captureStdout(t, func() {
+		if code := recallCmd([]string{"--json", "--", "-f", "-l", "-n", "-j", "-p"}); code != 0 {
+			t.Fatalf("recall --json -- flags exit=%d, want 0", code)
+		}
+	})
+	if strings.Contains(strings.TrimSpace(jsonOut), "\n") {
+		t.Errorf("-p after -- triggered pretty JSON:\n%s", jsonOut)
+	}
+	if err := json.Unmarshal([]byte(jsonOut), &res); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, jsonOut)
+	}
+	if res.Query != "-f -l -n -j -p" {
+		t.Errorf("query = %q, want %q", res.Query, "-f -l -n -j -p")
+	}
+	if len(res.Notes) != 1 || len(res.Runs) != 1 {
+		t.Errorf("got %d notes and %d runs, want 1 and 1", len(res.Notes), len(res.Runs))
+	}
+
+	// Text mode with "--": -j/-p must not emit JSON, -f must not disable truncation, -n must not hide runs.
+	textOut := captureStdout(t, func() {
+		if code := recallCmd([]string{"--", "-f", "-l", "-n", "-j", "-p"}); code != 0 {
+			t.Fatalf("recall -- flags exit=%d, want 0", code)
+		}
+	})
+	if strings.HasPrefix(strings.TrimSpace(textOut), "{") {
+		t.Errorf("-j/-p after -- enabled JSON output:\n%s", textOut)
+	}
+	if !strings.Contains(textOut, "(truncated") {
+		t.Errorf("-f after -- enabled --full:\n%s", textOut)
+	}
+	if !strings.Contains(textOut, "run#") {
+		t.Errorf("-n after -- suppressed runs:\n%s", textOut)
+	}
+}
+
+// -l N applies to runs too even without -r (default cap of 5 applies only when -l is unset).
+func TestRecallCmdLimitAppliesToRunsWithoutR(t *testing.T) {
+	path := testDB(t)
+	t.Setenv("IZ", path)
+
+	db, err := openDBAt(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := insertMemory(db, Memory{Namespace: "ops", Title: "deploy", Content: "limitneedle note"}); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	for i := range 8 {
+		r := sampleRun("nmap", "nmap scan "+strconv.Itoa(i), "limitneedle output")
+		r.Ts = 1700000000 + float64(i)
+		mustInsert(t, path, r, "limitneedle output")
+	}
+
+	queryJSON := func(args ...string) (notes, runs int) {
+		t.Helper()
+		var res struct {
+			Notes []Memory `json:"memories"`
+			Runs  []struct {
+				ID int64 `json:"id"`
+			} `json:"runs"`
+		}
+		out := captureStdout(t, func() {
+			if code := recallCmd(append([]string{"--json"}, args...)); code != 0 {
+				t.Fatalf("recall %q exit=%d", args, code)
+			}
+		})
+		if err := json.Unmarshal([]byte(out), &res); err != nil {
+			t.Fatalf("unmarshal: %v\n%s", err, out)
+		}
+		return len(res.Notes), len(res.Runs)
+	}
+
+	if notes, runs := queryJSON("limitneedle"); notes != 1 || runs != 5 {
+		t.Errorf("default recall = (%d notes, %d runs), want (1, 5)", notes, runs)
+	}
+	if notes, runs := queryJSON("-l", "8", "limitneedle"); notes != 1 || runs != 8 {
+		t.Errorf("recall -l 8 = (%d notes, %d runs), want (1, 8)", notes, runs)
+	}
+	if notes, runs := queryJSON("--limit", "7", "limitneedle"); notes != 1 || runs != 7 {
+		t.Errorf("recall --limit 7 = (%d notes, %d runs), want (1, 7)", notes, runs)
+	}
+}
+
 // Commands without options still answer --help and reject unknown options.
 func TestHelpAndUnknownOptions(t *testing.T) {
 	t.Setenv("IZ", testDB(t))

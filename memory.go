@@ -58,29 +58,29 @@ func insertMemory(db *sql.DB, m Memory) (int64, error) {
 	return id, err
 }
 
-func upsertMemory(db *sql.DB, m Memory, appendMode bool) (int64, bool, error) {
+func upsertMemory(db *sql.DB, m Memory, appendMode bool) (int64, string, error) {
 	tx, err := db.Begin()
 	if err != nil {
-		return 0, false, err
+		return 0, "", err
 	}
 	defer tx.Rollback() //nolint
-	id, updated, err := upsertMemoryTx(tx, m, appendMode)
+	id, status, err := upsertMemoryTx(tx, m, appendMode)
 	if err != nil {
-		return 0, false, err
+		return 0, "", err
 	}
-	return id, updated, tx.Commit()
+	return id, status, tx.Commit()
 }
 
-func upsertMemoryTx(ex dbtx, m Memory, appendMode bool) (int64, bool, error) {
+func upsertMemoryTx(ex dbtx, m Memory, appendMode bool) (int64, string, error) {
 	var old Memory
 	err := ex.QueryRowContext(bg, `SELECT id, content, tags FROM memories WHERE namespace=? AND title=?`,
 		m.Namespace, m.Title).Scan(&old.ID, &old.Content, &old.Tags)
 	switch {
 	case err == sql.ErrNoRows:
 		id, err := insertMemoryTx(ex, m)
-		return id, false, err
+		return id, "saved", err
 	case err != nil:
-		return 0, false, err
+		return 0, "", err
 	}
 	m.ID = old.ID
 	if appendMode && old.Content != "" {
@@ -89,7 +89,10 @@ func upsertMemoryTx(ex dbtx, m Memory, appendMode bool) (int64, bool, error) {
 	if m.Tags == "" && !m.TagsSet {
 		m.Tags = old.Tags
 	}
-	return old.ID, true, updateMemoryTx(ex, m)
+	if m.Content == old.Content && normTags(m.Tags) == old.Tags {
+		return old.ID, "unchanged", nil
+	}
+	return old.ID, "updated", updateMemoryTx(ex, m)
 }
 
 // defaultAuthor is who writes a note when no author is given.
@@ -498,6 +501,15 @@ func editNoteCmd(target string) int {
 	}
 	e.Mtime = 0
 	if err := updateMemory(db, e); err != nil {
+		if tmp, werr := os.CreateTemp("", fmt.Sprintf("iz-note-%d-*.md", id)); werr == nil {
+			_, werr = tmp.WriteString(text)
+			cerr := tmp.Close()
+			if werr == nil && cerr == nil {
+				fmt.Fprintf(os.Stderr, "iz: update failed: %v (saved edit to %s)\n", err, tmp.Name())
+				return 1
+			}
+			_ = os.Remove(tmp.Name())
+		}
 		fmt.Fprintf(os.Stderr, "iz: update failed: %v\n", err)
 		return 1
 	}
@@ -583,16 +595,12 @@ func saveNote(m Memory, appendMode, create bool) int {
 	if m.Author == "" {
 		m.Author = defaultAuthor()
 	}
-	id, updated, err := upsertMemory(db, m, appendMode)
+	id, status, err := upsertMemory(db, m, appendMode)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "iz: failed to save note:", err)
 		return 1
 	}
-	verb := "saved"
-	if updated {
-		verb = "updated"
-	}
-	fmt.Fprintf(os.Stderr, "[iz] %s note #%d [%s:%s]\n", verb, id, m.Namespace, m.Title)
+	fmt.Fprintf(os.Stderr, "[iz] %s note #%d [%s:%s]\n", status, id, m.Namespace, m.Title)
 	return 0
 }
 
@@ -911,15 +919,16 @@ func importNotes(path string) int {
 			}
 			seen[title] = true
 			m := Memory{Namespace: ns, Title: title, Content: sec.body, Author: "import"}
-			_, wasUpd, err := upsertMemoryTx(tx, m, false)
+			_, status, err := upsertMemoryTx(tx, m, false)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "iz: import %s [%s]: %v (nothing imported)\n", f, title, err)
 				return 1
 			}
-			if wasUpd {
-				updated++
-			} else {
+			switch status {
+			case "saved":
 				imported++
+			case "updated":
+				updated++
 			}
 		}
 	}
@@ -1038,11 +1047,14 @@ func recallCmd(args []string) int {
 	}
 
 	jsonOutput, pretty, notesOnly, runsOnly, full := false, false, false, false, false
-	limit := 10
+	limit, limitSet := 10, false
 	var queryTerms []string
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch a {
+		case "--":
+			queryTerms = append(queryTerms, args[i+1:]...)
+			i = len(args)
 		case "-h", "--help":
 			fmt.Println(usage)
 			return 0
@@ -1067,6 +1079,7 @@ func recallCmd(args []string) int {
 				return 2
 			}
 			limit = n
+			limitSet = true
 			i++
 		default:
 			queryTerms = append(queryTerms, a)
@@ -1106,9 +1119,9 @@ func recallCmd(args []string) int {
 	}
 	var runs []Run
 	if !notesOnly {
-		runLimit := min(limit, 5)
-		if runsOnly {
-			runLimit = limit
+		runLimit := limit
+		if !runsOnly && !limitSet {
+			runLimit = min(limit, 5)
 		}
 		if runs, err = searchRuns(db, query, runLimit, true); err != nil {
 			fmt.Fprintln(os.Stderr, "iz recall: runs:", err)

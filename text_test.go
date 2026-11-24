@@ -15,6 +15,23 @@ func TestTidyRawKeepsCRLF(t *testing.T) {
 	}
 }
 
+func TestTidyRawMultipleTrailingCR(t *testing.T) {
+	// Multiple trailing \r before \n must all be trimmed rather than treating the
+	// extra \r as a redraw that erases the line.
+	cases := []struct {
+		in, want string
+	}{
+		{"hello\r\r\nworld\r\r\r\n", "hello\nworld\n"},
+		{"loading 50%\rdone\r\r\n", "done\n"},
+		{"\r\r\n", "\n"},
+	}
+	for _, c := range cases {
+		if got := string(tidyRaw([]byte(c.in))); got != c.want {
+			t.Errorf("tidyRaw(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
 func TestTidyRawCollapsesProgressBars(t *testing.T) {
 	// \r re-draws (progress bars) collapse to their final state.
 	got := tidyRaw([]byte("esc8 vuln\r...loading 99%\r...done\n"))
