@@ -403,6 +403,18 @@ func TestPipelineHelpers(t *testing.T) {
 	if got := pipelineWrappedCount("out=$(subfinder -d example.com | httpx -silent)", "httpx -silent", "httpx", tools); got != 2 {
 		t.Errorf("command substitution pipeline: got %d, want 2", got)
 	}
+	if got := pipelineWrappedCount(`out="$(subfinder -d example.com | httpx -silent)"`, "httpx -silent", "httpx", tools); got != 2 {
+		t.Errorf("double-quoted command substitution: got %d, want 2", got)
+	}
+	if got := pipelineWrappedCount("subfinder -d example.com | command httpx -silent", "subfinder -d example.com", "subfinder", tools); got != 1 {
+		t.Errorf("command-bypassed downstream: got %d, want 1", got)
+	}
+	if got := pipelineWrappedCount("iz -- /usr/bin/curl -s https://example.com | jq .", "/usr/bin/curl -s https://example.com", "curl", tools); got != 1 {
+		t.Errorf("iz -- /path/to/cmd: got %d, want 1", got)
+	}
+	if got := pipelineWrappedCount("iz run -- curl -s https://example.com | jq .", "curl -s https://example.com", "curl", tools); got != 1 {
+		t.Errorf("iz run -- cmd: got %d, want 1", got)
+	}
 	got := extractPipelineCmd("cd /tmp && subfinder -d de2.in | httpx -silent", []PipelineStage{{Tool: "subfinder", Cmd: "subfinder -d de2.in"}, {Tool: "httpx", Cmd: "httpx -silent"}})
 	if got != "subfinder -d de2.in | httpx -silent" {
 		t.Errorf("extractPipelineCmd = %q", got)

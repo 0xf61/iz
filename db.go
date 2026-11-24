@@ -630,10 +630,11 @@ func splitTopLevel(s string, seps ...string) []string {
 }
 
 // cmdStageInfo returns the command name of a single pipeline stage (skipping
-// leading KEY=VAL assignments and "command" / "iz --" / "iz run" prefixes),
-// plus whether it was explicitly wrapped via iz. Path-qualified tool names
-// keep their '/' so they do not match bare shell wrapper names.
-func cmdStageInfo(stage string) (bin string, explicitIz bool) {
+// leading KEY=VAL assignments and "iz --" / "iz run [--]" prefixes), whether it
+// was explicitly wrapped via iz, and whether a "command" builtin bypassed
+// shell wrappers. Path-qualified tool names keep their '/' unless explicitIz is
+// true so "/usr/bin/httpx" does not match bare wrapper names.
+func cmdStageInfo(stage string) (bin string, explicitIz, bypassWrapper bool) {
 	fields := strings.Fields(stage)
 	i := 0
 	for i < len(fields) {
@@ -643,17 +644,25 @@ func cmdStageInfo(stage string) (bin string, explicitIz bool) {
 			continue
 		}
 		if f == "command" {
+			bypassWrapper = true
 			i++
 			continue
 		}
 		if filepath.Base(f) == "iz" && i+1 < len(fields) && (fields[i+1] == "--" || fields[i+1] == "run") {
 			explicitIz = true
-			i += 2
+			if fields[i+1] == "run" && i+2 < len(fields) && fields[i+2] == "--" {
+				i += 3
+			} else {
+				i += 2
+			}
 			continue
 		}
-		return f, explicitIz
+		if explicitIz {
+			return filepath.Base(f), true, false
+		}
+		return f, false, bypassWrapper
 	}
-	return "", explicitIz
+	return "", explicitIz, bypassWrapper
 }
 
 // containsCmd reports whether stage contains cmd at token boundaries (not as
@@ -683,7 +692,7 @@ func containsCmd(stage, cmd string) bool {
 }
 
 // collectPipelineSegments returns all pipeline segments in shellCmd, including
-// those nested inside (...) subshells or $(...) command substitutions.
+// those nested inside (...) subshells or $(...) / "$(...)" command substitutions.
 func collectPipelineSegments(shellCmd string) []string {
 	var out []string
 	var visit func(s string)
@@ -692,7 +701,7 @@ func collectPipelineSegments(shellCmd string) []string {
 			if len(splitTopLevel(seg, "|&", "|")) >= 2 {
 				out = append(out, seg)
 			}
-			// Descend into (...) / $(...) groups to find nested pipelines.
+			// Descend into (...) / $(...) groups (including inside "..." quotes).
 			var quote byte
 			escaped := false
 			for i := 0; i < len(seg); i++ {
@@ -705,13 +714,23 @@ func collectPipelineSegments(shellCmd string) []string {
 					escaped = true
 					continue
 				}
-				if quote != 0 {
-					if c == quote {
+				if quote == '\'' {
+					if c == '\'' {
 						quote = 0
 					}
 					continue
 				}
-				if c == '\'' || c == '"' {
+				if quote == '"' {
+					if c == '"' {
+						quote = 0
+						continue
+					}
+					if !(c == '$' && i+1 < len(seg) && seg[i+1] == '(') {
+						continue
+					}
+					i++ // advance to '('
+					c = '('
+				} else if c == '\'' || c == '"' {
 					quote = c
 					continue
 				}
@@ -726,9 +745,16 @@ func collectPipelineSegments(shellCmd string) []string {
 							esc2 = false
 						} else if ch == '\\' && q2 != '\'' {
 							esc2 = true
-						} else if q2 != 0 {
-							if ch == q2 {
+						} else if q2 == '\'' {
+							if ch == '\'' {
 								q2 = 0
+							}
+						} else if q2 == '"' {
+							if ch == '"' {
+								q2 = 0
+							} else if ch == '$' && j+1 < len(seg) && seg[j+1] == '(' {
+								depth++
+								j++
 							}
 						} else if ch == '\'' || ch == '"' {
 							q2 = ch
@@ -769,7 +795,7 @@ func extractPipelineCmd(shellCmd string, stages []PipelineStage) string {
 		si := 0
 		exact := true
 		for _, p := range pipes {
-			bin, _ := cmdStageInfo(p)
+			bin, _, _ := cmdStageInfo(p)
 			if si < len(stages) && bin == stages[si].Tool {
 				if stages[si].Cmd != "" && !containsCmd(p, stages[si].Cmd) {
 					exact = false
@@ -812,14 +838,15 @@ func pipelineWrappedCount(shellCmd, currentCmd, currentTool string, tools []stri
 		hasExactCmd := false
 		wrapped := 0
 		for _, p := range pipes {
-			bin, explicitIz := cmdStageInfo(p)
-			if bin == currentTool {
+			bin, explicitIz, bypassWrapper := cmdStageInfo(p)
+			isWrapped := explicitIz || (!bypassWrapper && toolSet[bin])
+			if isWrapped && bin == currentTool {
 				hasTool = true
 				if currentCmd != "" && containsCmd(p, currentCmd) {
 					hasExactCmd = true
 				}
 			}
-			if toolSet[bin] || explicitIz {
+			if isWrapped {
 				wrapped++
 			}
 		}
