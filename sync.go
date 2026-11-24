@@ -15,8 +15,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	_ "github.com/tursodatabase/libsql-client-go/libsql"
 )
 
 // Replication between two iz databases. One primitive, replicate(src, dst),
