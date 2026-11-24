@@ -295,19 +295,19 @@ func TestRecordPipelineBothOutputs(t *testing.T) {
 	}
 	defer db.Close()
 
-	id1, _, _, _, err := recordPipelineStage(db, PipelineStage{
+	id1, _, _, _, _, err := recordPipelineStage(db, PipelineStage{
 		PGID: 1234, PidKey: "p-1", StagePos: 0, Ts: 100.0, EndTs: 106.0,
 		Tool: "subfinder", Cmd: "subfinder -d de2.in", ShellCmd: "subfinder -d de2.in | httpx -silent",
 		Cwd: "/tmp", Hostname: "h", ExitCode: 0, Raw: []byte("a.de2.in\nb.de2.in\n"),
-	})
+	}, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
-	id2, _, exit, dur, err := recordPipelineStage(db, PipelineStage{
+	id2, _, exit, dur, _, err := recordPipelineStage(db, PipelineStage{
 		PGID: 1234, PidKey: "p-1", StagePos: 2, Ts: 100.0, EndTs: 110.0,
 		Tool: "httpx", Cmd: "httpx -silent", ShellCmd: "subfinder -d de2.in | httpx -silent",
 		Cwd: "/tmp", Hostname: "h", ExitCode: 0, Raw: []byte("https://a.de2.in\n"),
-	})
+	}, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -340,19 +340,19 @@ func TestRecordPipelineEmptyDownstream(t *testing.T) {
 	}
 	defer db.Close()
 
-	_, _, _, _, err = recordPipelineStage(db, PipelineStage{
+	_, _, _, _, _, err = recordPipelineStage(db, PipelineStage{
 		PGID: 5678, PidKey: "p-2", StagePos: 0, Ts: 200.0, EndTs: 206.0,
 		Tool: "subfinder", Cmd: "subfinder -d de2.in", ShellCmd: "subfinder -d de2.in | httpx -silent",
 		Cwd: "/tmp", Hostname: "h", ExitCode: 0, Raw: []byte("a.de2.in\nb.de2.in\n"),
-	})
+	}, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _, _, _, err = recordPipelineStage(db, PipelineStage{
+	_, _, _, _, _, err = recordPipelineStage(db, PipelineStage{
 		PGID: 5678, PidKey: "p-2", StagePos: 2, Ts: 200.0, EndTs: 210.0,
 		Tool: "httpx", Cmd: "httpx -silent", ShellCmd: "subfinder -d de2.in | httpx -silent",
 		Cwd: "/tmp", Hostname: "h", ExitCode: 0, Raw: nil,
-	})
+	}, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -369,18 +369,55 @@ func TestRecordPipelineEmptyDownstream(t *testing.T) {
 }
 
 func TestPipelineHelpers(t *testing.T) {
-	tools := []string{"subfinder", "httpx"}
-	if !hasDownstreamWrappedTool("subfinder -d de2.in | httpx -silent", "subfinder", tools) {
-		t.Error("expected subfinder to see downstream httpx")
+	tools := []string{"subfinder", "httpx", "gf"}
+	if got := pipelineWrappedCount("subfinder -d de2.in | httpx -silent", "subfinder -d de2.in", "subfinder", tools); got != 2 {
+		t.Errorf("got %d, want 2", got)
 	}
-	if hasDownstreamWrappedTool("subfinder -d de2.in | httpx -silent", "httpx", tools) {
-		t.Error("httpx should not see downstream wrapped tool")
+	if got := pipelineWrappedCount("subfinder -d de2.in |& FOO=1 httpx -silent", "subfinder -d de2.in", "subfinder", tools); got != 2 {
+		t.Errorf("|& + env prefix: got %d, want 2", got)
 	}
-	if hasDownstreamWrappedTool("subfinder -d de2.in | grep api", "subfinder", tools) {
-		t.Error("grep is unwrapped, should return false")
+	if got := pipelineWrappedCount("subfinder -d de2.in | /usr/bin/httpx -silent", "subfinder -d de2.in", "subfinder", tools); got != 1 {
+		t.Errorf("path-qualified downstream should not count as wrapped: got %d, want 1", got)
 	}
-	got := extractPipelineCmd("cd /tmp && subfinder -d de2.in | httpx -silent", []PipelineStage{{Tool: "subfinder"}, {Tool: "httpx"}})
+	if got := pipelineWrappedCount("subfinder -d de2.in | grep api", "subfinder -d de2.in", "subfinder", tools); got != 1 {
+		t.Errorf("grep is unwrapped: got %d, want 1", got)
+	}
+	if got := pipelineWrappedCount("gf a | gf b | grep foo", "gf a", "gf", tools); got != 2 {
+		t.Errorf("repeated tool: got %d, want 2", got)
+	}
+	if got := pipelineWrappedCount("subfinder -d $(cat d | head -1) | httpx", "httpx", "httpx", tools); got != 2 {
+		t.Errorf("cmdsub: got %d, want 2", got)
+	}
+	if got := pipelineWrappedCount("subfinder -d a | grep foo && subfinder -d b | httpx", "subfinder -d b", "subfinder", tools); got != 2 {
+		t.Errorf("chained pipeline second segment: got %d, want 2", got)
+	}
+	if got := pipelineWrappedCount("subfinder -d a.com | grep foo && subfinder -d a | httpx -silent", "subfinder -d a", "subfinder", tools); got != 2 {
+		t.Errorf("prefix overlap in chained pipeline: got %d, want 2", got)
+	}
+	if got := pipelineWrappedCount("iz -- curl -s https://example.com | jq .", "curl -s https://example.com", "curl", tools); got != 1 {
+		t.Errorf("explicit iz -- upstream: got %d, want 1", got)
+	}
+	if got := pipelineWrappedCount("iz -- seq 1 10 | iz -- head -1", "seq 1 10", "seq", tools); got != 2 {
+		t.Errorf("explicit iz -- both stages: got %d, want 2", got)
+	}
+	if got := pipelineWrappedCount("out=$(subfinder -d example.com | httpx -silent)", "httpx -silent", "httpx", tools); got != 2 {
+		t.Errorf("command substitution pipeline: got %d, want 2", got)
+	}
+	got := extractPipelineCmd("cd /tmp && subfinder -d de2.in | httpx -silent", []PipelineStage{{Tool: "subfinder", Cmd: "subfinder -d de2.in"}, {Tool: "httpx", Cmd: "httpx -silent"}})
 	if got != "subfinder -d de2.in | httpx -silent" {
 		t.Errorf("extractPipelineCmd = %q", got)
+	}
+	got2 := extractPipelineCmd("subfinder -d a.com | httpx && subfinder -d a | httpx", []PipelineStage{{Tool: "subfinder", Cmd: "subfinder -d a"}, {Tool: "httpx", Cmd: "httpx"}})
+	if got2 != "subfinder -d a | httpx" {
+		t.Errorf("extractPipelineCmd prefix overlap = %q", got2)
+	}
+
+	t.Setenv("IZ_SHELL_CMD", "a | b")
+	t.Setenv("IZ_PIPELINE_ID", "123-1")
+	env := cleanChildEnv(nil)
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "IZ_SHELL_CMD=") || strings.HasPrefix(kv, "IZ_PIPELINE_ID=") {
+			t.Errorf("cleanChildEnv leaked %q", kv)
+		}
 	}
 }

@@ -26,13 +26,16 @@ func (r Run) line(dw int, localHost string) string {
 	if dir == "" || dir == "." {
 		dir = "/"
 	}
-	rest := " " + r.Cmd
-	if r.Cmd == r.Tool || strings.HasPrefix(r.Cmd, r.Tool+" ") {
-		rest = r.Cmd[len(r.Tool):] // tool is printed (colored) in front already
-	}
 	host := ""
 	if r.Hostname != localHost {
 		host = " \x1b[2m@" + strings.TrimSuffix(r.Hostname, ".local") + "\x1b[0m"
+	}
+	rest := " " + r.Cmd
+	if r.Cmd == r.Tool || strings.HasPrefix(r.Cmd, r.Tool+" ") {
+		rest = r.Cmd[len(r.Tool):] // tool is printed (colored) in front already
+	} else if strings.Contains(r.Cmd, "|") && strings.Contains(r.Cmd, r.Tool) {
+		return fmt.Sprintf("%s \x1b[90m%-*s\x1b[0m \x1b[34m%s\x1b[0m %s%s",
+			id, dw, fmtTsShort(r.Ts), dir, truncLeft(r.Cmd, 120), host)
 	}
 	return fmt.Sprintf("%s \x1b[90m%-*s\x1b[0m \x1b[34m%s\x1b[0m \x1b[36m%s\x1b[0m%s%s",
 		id, dw, fmtTsShort(r.Ts), dir, r.Tool, truncLeft(rest, 120), host)
@@ -92,7 +95,7 @@ func tuiSearch(query string, pick bool) int {
 		"--bind", "change:reload(" + src + ")",
 		"--preview", izCmd + " show {1} -- {q}",
 		"--preview-window", "right:55%:wrap",
-		"--bind", "enter:execute(" + izCmd + " show {+} -- {q} | less -R)",
+		"--bind", "enter:execute(" + izCmd + " show {+} -- {q} 2>&1 | less -R)",
 		"--bind", "ctrl-e:execute(" + izCmd + " edit {1})",
 		"--bind", "ctrl-y:execute-silent(" + izCmd + " --rm {+})+reload(" + src + ")",
 		"--bind", "ctrl-o:execute(" + izCmd + " n)",

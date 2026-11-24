@@ -69,11 +69,34 @@ func runRecord(args []string) int {
 	return runPipeRecord(db, args)
 }
 
+// cleanChildEnv returns os.Environ() (or base) without IZ_SHELL_CMD and
+// IZ_PIPELINE_ID so child scripts and subshells never inherit a parent
+// pipeline's coordination context.
+func cleanChildEnv(base []string) []string {
+	if base == nil {
+		base = os.Environ()
+	}
+	out := make([]string, 0, len(base))
+	for _, kv := range base {
+		if strings.HasPrefix(kv, "IZ_SHELL_CMD=") || strings.HasPrefix(kv, "IZ_PIPELINE_ID=") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
+}
+
+// isNamedPipe reports whether f is connected to a pipe (not a regular file or TTY).
+func isNamedPipe(f *os.File) bool {
+	fi, err := f.Stat()
+	return err == nil && fi.Mode()&os.ModeNamedPipe != 0
+}
+
 // runPTYRecord runs the command inside a PTY so it sees a terminal (colors,
 // progress bars, interactive prompts).
 func runPTYRecord(db *sql.DB, args []string) int {
 	cmd := exec.Command(args[0], args[1:]...)
-	cmd.Env = ptyEnv(args[0])
+	cmd.Env = cleanChildEnv(ptyEnv(args[0]))
 	// `cmd 2>file`: keep the redirect (pty.Start only fills nil streams), so
 	// stderr goes to the file instead of being merged into the PTY output.
 	if !term.IsTerminal(int(os.Stderr.Fd())) {
@@ -186,6 +209,7 @@ const drainTimeout = 500 * time.Millisecond
 // recording the combined output.
 func runPipeRecord(db *sql.DB, args []string) int {
 	cmd := exec.Command(args[0], args[1:]...)
+	cmd.Env = cleanChildEnv(nil)
 	cmd.Stdin = os.Stdin
 	start := time.Now()
 
@@ -240,8 +264,8 @@ func saveRun(db *sql.DB, args []string, start time.Time, out []byte, exit int) i
 	now := time.Now()
 	dur := now.Sub(start)
 
-	inPipe := !term.IsTerminal(int(os.Stdin.Fd()))
-	outPipe := !term.IsTerminal(int(os.Stdout.Fd()))
+	inPipe := isNamedPipe(os.Stdin)
+	outPipe := isNamedPipe(os.Stdout)
 	shellCmd := os.Getenv("IZ_SHELL_CMD")
 	pidKey := os.Getenv("IZ_PIPELINE_ID")
 
@@ -269,12 +293,20 @@ func saveRun(db *sql.DB, args []string, start time.Time, out []byte, exit int) i
 			ExitCode: exit,
 			Raw:      raw,
 		}
-		id, finalSize, finalExit, finalDur, err := recordPipelineStage(db, st)
+		expected := 0
+		if shellCmd != "" {
+			expected = pipelineWrappedCount(shellCmd, cmdStr, tool, queryNames(db, "tools"))
+		}
+		id, finalSize, finalExit, finalDur, stageCount, err := recordPipelineStage(db, st, expected)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[iz] RECORD FAILED: %v\n", err)
 			return exit
 		}
-		if outPipe && shellCmd != "" && hasDownstreamWrappedTool(shellCmd, tool, queryNames(db, "tools")) {
+		if expected > 0 {
+			if stageCount < expected {
+				return exit
+			}
+		} else if outPipe {
 			return exit
 		}
 		fmt.Fprintf(os.Stderr, "[iz] #%d saved · exit=%d · %.1fs · %s\n",

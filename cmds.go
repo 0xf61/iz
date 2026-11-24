@@ -53,7 +53,10 @@ func toolsCmd(sub string, args []string) int {
 		fmt.Fprintln(os.Stderr, "[iz] added. Refresh wrappers by restarting your shell or re-sourcing 'iz init <shell>'")
 	case "del":
 		for _, t := range args {
-			db.Exec(`DELETE FROM tools WHERE name=?`, t) //nolint
+			if _, err := db.Exec(`DELETE FROM tools WHERE name=?`, t); err != nil {
+				fmt.Fprintln(os.Stderr, "iz:", err)
+				return 1
+			}
 		}
 		fmt.Fprintln(os.Stderr, "[iz] removed. Refresh wrappers by restarting your shell.")
 	case "list":
@@ -263,7 +266,11 @@ func showCmd(args []string) int {
 	for n, id := range ids {
 		raw, r, err := getMeta(db, id)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "iz: no such run:", id)
+			if errors.Is(err, sql.ErrNoRows) {
+				fmt.Fprintln(os.Stderr, "iz: no such run:", id)
+			} else {
+				fmt.Fprintln(os.Stderr, "iz:", err)
+			}
 			code = 1
 			continue
 		}
@@ -450,7 +457,11 @@ func editCmd(idArg string) int {
 	defer db.Close()
 	raw, r, err := getMeta(db, id)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "iz: no such run:", id)
+		if errors.Is(err, sql.ErrNoRows) {
+			fmt.Fprintln(os.Stderr, "iz: no such run:", id)
+		} else {
+			fmt.Fprintln(os.Stderr, "iz:", err)
+		}
 		return 1
 	}
 	f, err := os.CreateTemp("", fmt.Sprintf("iz-%d-*.ansi", id))

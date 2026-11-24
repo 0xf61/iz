@@ -34,15 +34,17 @@ import (
 // getSyncConfig reads connection parameters from environment variables,
 // falling back to Atuin KV store if unset (e.g. across machines with atuin sync).
 func getSyncConfig() (remoteURL, authToken string) {
+	fromAtuin := false
 	remoteURL = firstEnv("IZ_SYNC_URL", "IZ_URL", "TURSO_DATABASE_URL")
 	if remoteURL == "" {
 		remoteURL = atuinKVGet("IZ_SYNC_URL")
+		fromAtuin = true
 	}
 	if remoteURL = strings.TrimSpace(remoteURL); remoteURL == "" {
 		return "", "" // no remote: a token lookup would only cost another atuin call
 	}
 	authToken = firstEnv("IZ_AUTH_TOKEN", "IZ_TOKEN", "TURSO_AUTH_TOKEN")
-	if authToken == "" {
+	if authToken == "" && fromAtuin {
 		authToken = atuinKVGet("IZ_AUTH_TOKEN")
 	}
 	return remoteURL, strings.TrimSpace(authToken)
@@ -107,7 +109,7 @@ Usage:
 
 Environment:
   IZ_SYNC_URL     Remote LibSQL URL (e.g. libsql://your-db.turso.io)
-  IZ_AUTH_TOKEN   Auth token (falls back to atuin kv if unset)
+  IZ_AUTH_TOKEN   Auth token (falls back to atuin kv when URL is also from atuin)
   IZ_SYNC_TIMEOUT Sync timeout duration (default 5m)`)
 			return 0
 		case "--reset-tombstones":
@@ -419,6 +421,31 @@ func readRuns(ctx context.Context, db *sql.DB, dead runTombs) (live []Run, deadI
 	return live, deadIDs, err
 }
 
+// excludePendingRuns filters out local runs that belong to an active in-flight
+// pipeline (pending=1 in pipeline_stages within the last 24h) so sync never
+// pushes partial output while orphaned rows age out cleanly.
+func excludePendingRuns(ctx context.Context, db *sql.DB, runs []Run) []Run {
+	pending := map[int64]bool{}
+	cutoff := now() - 86400
+	_ = each(ctx, db, `SELECT DISTINCT run_id FROM pipeline_stages WHERE pending=1 AND run_id>0 AND end_ts>?`, func(r *sql.Rows) error {
+		var id int64
+		if err := r.Scan(&id); err == nil {
+			pending[id] = true
+		}
+		return nil
+	}, cutoff)
+	if len(pending) == 0 {
+		return runs
+	}
+	out := make([]Run, 0, len(runs))
+	for _, r := range runs {
+		if !pending[r.ID] {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
 // missingRuns returns the ids of runs that have lacks, each key once.
 func missingRuns(runs, have []Run) (ids []any) {
 	set := runSet{}
@@ -442,6 +469,7 @@ func syncRunsBidirectional(ctx context.Context, local, remote *sql.DB, tomb map[
 	if err != nil {
 		return 0, 0, err
 	}
+	localRuns = excludePendingRuns(ctx, local, localRuns)
 	remoteRuns, remoteDead, err := readRuns(ctx, remote, dead)
 	if err != nil {
 		return 0, 0, err
@@ -476,7 +504,7 @@ func transferRuns(ctx context.Context, src, dst *sql.DB, ids []any) (int, error)
 				return err
 			}
 			if !text.Valid { // index row missing on src: rebuild it
-				text.String = ftsPrefix(x) + string(truncFTS(stripANSI(ungz(raw))))
+				text.String = ftsPrefix(x) + string(truncFTS(stripANSI(tidyRaw(ungz(raw)))))
 			}
 			rows = append(rows, []any{x.Ts, x.Hostname, x.Tool, x.Cmd, x.Cwd, x.ExitCode, x.Dur, x.Size, raw})
 			fts = append(fts, []any{text.String})
@@ -587,6 +615,7 @@ func readMemMeta(ctx context.Context, db *sql.DB, tomb map[string]bool) (side me
 type memNote struct {
 	memMeta         // final slot and mtime; id: its row on the side with the winning content
 	ver     float64 // mtime of that content (before a conflict rename)
+	winSide int     // index (0 or 1) of the side that supplied the winning content
 }
 
 // memMerge is the outcome of merging two sides' notes.
@@ -612,12 +641,12 @@ type memMerge struct {
 // side is which — so every direction and machine reaches the same state.
 func mergeMemories(a, b memSide) memMerge {
 	g := memMerge{sides: [2]memSide{a, b}, notes: map[string]memNote{}}
-	for _, s := range g.sides {
+	for sideIdx, s := range g.sides {
 		for uid, m := range s.byUID {
 			n, ok := g.notes[uid]
 			eq := ok && sameTime(m.mtime, n.mtime)
 			if !ok || (!eq && m.mtime > n.mtime) || (eq && m.slot() < n.slot()) {
-				g.notes[uid] = memNote{m, m.mtime}
+				g.notes[uid] = memNote{m, m.mtime, sideIdx}
 			}
 		}
 	}
@@ -662,7 +691,7 @@ func mergeMemories(a, b memSide) memMerge {
 	for _, n := range losers {
 		win := owner[n.slot()]
 		n.title = conflictTitle(n.memMeta, owner)
-		n.mtime = max(win.mtime, n.mtime) + 0.001
+		n.mtime = math.Round((max(win.mtime, n.mtime)+0.001)*1e3) / 1e3
 		owner[n.slot()] = n.memMeta
 		g.notes[n.uid] = n
 	}
@@ -699,7 +728,8 @@ func (g memMerge) plan(dst int) memPlan {
 	side := g.sides[dst]
 	for uid, n := range g.notes {
 		cur, has := side.byUID[uid]
-		if has && (cur.mtime >= n.ver || sameTime(cur.mtime, n.ver)) { // dst holds this content
+		winSlot := g.sides[n.winSide].byUID[uid].slot()
+		if has && (cur.mtime > n.ver && !sameTime(cur.mtime, n.ver) || (sameTime(cur.mtime, n.ver) && (dst == n.winSide || cur.slot() == winSlot))) { // dst holds this content
 			if cur.slot() != n.slot() || !sameTime(cur.mtime, n.mtime) {
 				r := n.memMeta
 				r.id = cur.id

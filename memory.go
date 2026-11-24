@@ -195,8 +195,11 @@ func deleteMemory(db *sql.DB, id int64) error {
 	}
 	defer tx.Rollback() //nolint
 	var uid string
-	if err := tx.QueryRow(`SELECT uid FROM memories WHERE id=?`, id).Scan(&uid); err != nil {
-		return fmt.Errorf("note #%d not found", id)
+	if err := tx.QueryRow(`SELECT `+uidCol+` FROM memories WHERE id=?`, id).Scan(&uid); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("note #%d not found", id)
+		}
+		return err
 	}
 	if err := tombstone(tx, memTomb(uid)); err != nil {
 		return err
@@ -225,7 +228,10 @@ func resolveMemoryID(db *sql.DB, target string) (int64, error) {
 	}
 	var id int64
 	if err := db.QueryRow(`SELECT id FROM memories WHERE namespace=? AND title=?`, ns, title).Scan(&id); err != nil {
-		return 0, fmt.Errorf("note %q not found", target)
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, fmt.Errorf("note %q not found", target)
+		}
+		return 0, err
 	}
 	return id, nil
 }
@@ -244,8 +250,10 @@ func queryMemories(db *sql.DB, query string, limit int) ([]Memory, error) {
 		val := t[strings.IndexByte(t, ':')+1:]
 		switch {
 		case strings.HasPrefix(t, "ns:"), strings.HasPrefix(t, "namespace:"):
-			c, a := likePrefix("m.namespace", val)
-			conds, args = conds+c, append(args, a)
+			if v := strings.TrimRight(val, "/"); v != "" {
+				conds += ` AND (m.namespace = ? OR m.namespace LIKE ? ESCAPE '\')`
+				args = append(args, v, likeEsc(v)+"/%")
+			}
 		case strings.HasPrefix(t, "author:"):
 			c, a := likePrefix("m.author", val)
 			conds, args = conds+c, append(args, a)
@@ -464,7 +472,11 @@ func editNoteCmd(target string) int {
 
 	m, err := getMemory(db, id)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "iz: note #%d not found\n", id)
+		if errors.Is(err, sql.ErrNoRows) {
+			fmt.Fprintf(os.Stderr, "iz: note #%d not found\n", id)
+		} else {
+			fmt.Fprintln(os.Stderr, "iz:", err)
+		}
 		return 1
 	}
 	text, err := editText(fmt.Sprintf("iz-note-%d-*.md", id), noteDoc(m))
@@ -678,7 +690,11 @@ Usage:
 		}
 		m, err := getMemory(db, id)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "iz: note #%d not found\n", id)
+			if errors.Is(err, sql.ErrNoRows) {
+				fmt.Fprintf(os.Stderr, "iz: note #%d not found\n", id)
+			} else {
+				fmt.Fprintln(os.Stderr, "iz:", err)
+			}
 			return 1
 		}
 		tags := ""
@@ -811,7 +827,8 @@ func listNotes(namespace string) int {
 		var ts float64
 		var ns, title string
 		if err := rows.Scan(&r.id, &ts, &ns, &title, &r.author, &r.size); err != nil {
-			continue
+			fmt.Fprintln(os.Stderr, "iz:", err)
+			return 1
 		}
 		r.name, r.date = trunc(ns+":"+title, 40), fmtTsShort(ts)
 		w = max(w, len([]rune(r.name)))
@@ -822,7 +839,7 @@ func listNotes(namespace string) int {
 		return 1
 	}
 	if len(out) == 0 {
-		fmt.Println("No notes found.")
+		fmt.Fprintln(os.Stderr, "No notes found.")
 		return 0
 	}
 	for _, r := range out {
@@ -1143,13 +1160,19 @@ func recallCmd(args []string) int {
 		fmt.Printf("No memories or command runs found for %q.\n", query)
 		return 0
 	}
+	useColor := term.IsTerminal(int(os.Stdout.Fd())) && os.Getenv("NO_COLOR") == ""
 	for _, m := range memories {
 		tags := ""
 		if m.Tags != "" {
 			tags = " [" + m.Tags + "]"
 		}
-		fmt.Printf("\x1b[32m#%d %s:%s\x1b[0m\x1b[90m%s · %s\x1b[0m\n",
-			m.ID, m.Namespace, m.Title, tags, noteDates(m))
+		if useColor {
+			fmt.Printf("\x1b[32m#%d %s:%s\x1b[0m\x1b[90m%s · %s\x1b[0m\n",
+				m.ID, m.Namespace, m.Title, tags, noteDates(m))
+		} else {
+			fmt.Printf("#%d %s:%s%s · %s\n",
+				m.ID, m.Namespace, m.Title, tags, noteDates(m))
+		}
 		body := strings.TrimSpace(m.Content)
 		if full {
 			fmt.Println(body)
@@ -1157,19 +1180,36 @@ func recallCmd(args []string) int {
 			preview := trunc(body, 600)
 			fmt.Println(preview)
 			if preview != body {
-				fmt.Printf("  \x1b[90m(truncated · full: iz n show %d)\x1b[0m\n", m.ID)
+				if useColor {
+					fmt.Printf("  \x1b[90m(truncated · full: iz n show %d)\x1b[0m\n", m.ID)
+				} else {
+					fmt.Printf("  (truncated · full: iz n show %d)\n", m.ID)
+				}
 			}
 		}
 	}
 	for _, r := range runs {
 		exit := ""
 		if r.ExitCode.Valid && r.ExitCode.Int64 != 0 {
-			exit = fmt.Sprintf(" \x1b[31mexit=%d\x1b[0m", r.ExitCode.Int64)
+			if useColor {
+				exit = fmt.Sprintf(" \x1b[31mexit=%d\x1b[0m", r.ExitCode.Int64)
+			} else {
+				exit = fmt.Sprintf(" exit=%d", r.ExitCode.Int64)
+			}
 		}
-		fmt.Printf("\x1b[33mrun#%d\x1b[0m \x1b[90m%s\x1b[0m \x1b[34m%s\x1b[0m%s $ %s\n",
-			r.ID, fmtTsShort(r.Ts), tildify(r.Cwd), exit, r.Cmd)
+		if useColor {
+			fmt.Printf("\x1b[33mrun#%d\x1b[0m \x1b[90m%s\x1b[0m \x1b[34m%s\x1b[0m%s $ %s\n",
+				r.ID, fmtTsShort(r.Ts), tildify(r.Cwd), exit, r.Cmd)
+		} else {
+			fmt.Printf("run#%d %s %s%s $ %s\n",
+				r.ID, fmtTsShort(r.Ts), tildify(r.Cwd), exit, r.Cmd)
+		}
 		if r.Snippet != "" {
-			fmt.Printf("  \x1b[90m↳ %s\x1b[0m\n", trunc(r.Snippet, 200))
+			if useColor {
+				fmt.Printf("  \x1b[90m↳ %s\x1b[0m\n", trunc(r.Snippet, 200))
+			} else {
+				fmt.Printf("  ↳ %s\n", trunc(r.Snippet, 200))
+			}
 		}
 	}
 	return 0

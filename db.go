@@ -60,6 +60,10 @@ func openDBAt(p string) (*sql.DB, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := ensureLocalTables(bg, db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	if p != ":memory:" && !strings.HasPrefix(p, "file:") {
 		_ = os.Chmod(p, 0o600)
 		_ = os.Chmod(p+"-wal", 0o600)
@@ -123,23 +127,6 @@ var schema = []string{
   title, content, namespace, tags, tokenize='unicode61'
 )`,
 	`CREATE TABLE IF NOT EXISTS tombstones(key TEXT PRIMARY KEY, ts REAL NOT NULL DEFAULT 0)`,
-	`CREATE TABLE IF NOT EXISTS pipeline_stages(
-  id        INTEGER PRIMARY KEY,
-  pgid      INTEGER NOT NULL,
-  pid_key   TEXT NOT NULL DEFAULT '',
-  run_id    INTEGER NOT NULL DEFAULT 0,
-  stage_pos INTEGER NOT NULL DEFAULT 0,
-  ts        REAL NOT NULL,
-  end_ts    REAL NOT NULL,
-  tool      TEXT NOT NULL,
-  cmd       TEXT NOT NULL,
-  shell_cmd TEXT NOT NULL DEFAULT '',
-  cwd       TEXT NOT NULL,
-  hostname  TEXT NOT NULL,
-  exit_code INTEGER NOT NULL,
-  raw       BLOB
-)`,
-	`CREATE INDEX IF NOT EXISTS pipeline_stages_group ON pipeline_stages(pgid, pid_key)`,
 	// pre-uid / pre-v4 databases: these fail with "duplicate column" once applied
 	`ALTER TABLE memories ADD COLUMN uid TEXT`,
 	`ALTER TABLE memories ADD COLUMN mtime REAL NOT NULL DEFAULT 0`,
@@ -181,7 +168,38 @@ const (
 	uidCol      = `coalesce(uid, ` + legacyUID + `)`
 )
 
-const schemaVersion = 6 // 6: pipeline_stages local coordination table
+const schemaVersion = 5 // 5: memories_ns dropped (memories_ns_title covers it)
+
+// ensureLocalTables creates local-only coordination tables (never created on
+// sync remotes).
+func ensureLocalTables(ctx context.Context, db dbtx) error {
+	for _, s := range []string{
+		`CREATE TABLE IF NOT EXISTS pipeline_stages(
+  id        INTEGER PRIMARY KEY,
+  pgid      INTEGER NOT NULL,
+  pid_key   TEXT NOT NULL DEFAULT '',
+  run_id    INTEGER NOT NULL DEFAULT 0,
+  stage_pos INTEGER NOT NULL DEFAULT 0,
+  pending   INTEGER NOT NULL DEFAULT 0,
+  ts        REAL NOT NULL,
+  end_ts    REAL NOT NULL,
+  tool      TEXT NOT NULL,
+  cmd       TEXT NOT NULL,
+  shell_cmd TEXT NOT NULL DEFAULT '',
+  cwd       TEXT NOT NULL,
+  hostname  TEXT NOT NULL,
+  exit_code INTEGER NOT NULL,
+  raw       BLOB
+)`,
+		`ALTER TABLE pipeline_stages ADD COLUMN pending INTEGER NOT NULL DEFAULT 0`,
+		`CREATE INDEX IF NOT EXISTS pipeline_stages_group ON pipeline_stages(pgid, pid_key)`,
+	} {
+		if _, err := db.ExecContext(ctx, s); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			return err
+		}
+	}
+	return nil
+}
 
 // ensureSchema creates/migrates the schema, skipped once PRAGMA user_version
 // says it is current. That holds for a sync remote too: rows older clients
@@ -346,18 +364,22 @@ func insertRunTx(tx *sql.Tx, r Run, raw, text []byte) (int64, error) {
 	return id, err
 }
 
-func updateRunTx(tx *sql.Tx, id int64, r Run, raw, text []byte) error {
-	if _, err := tx.Exec(
+func updateRunTx(tx *sql.Tx, id int64, r Run, raw, text []byte) (bool, error) {
+	res, err := tx.Exec(
 		`UPDATE runs SET ts=?,hostname=?,tool=?,cmd=?,cwd=?,exit_code=?,duration_ms=?,size=?,raw=? WHERE id=?`,
 		r.Ts, r.Hostname, r.Tool, r.Cmd, r.Cwd, r.ExitCode, r.Dur, r.Size, raw, id,
-	); err != nil {
-		return err
+	)
+	if err != nil {
+		return false, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return false, nil
 	}
 	if _, err := tx.Exec(`DELETE FROM outputs_fts WHERE rowid=?`, id); err != nil {
-		return err
+		return false, err
 	}
-	_, err := tx.Exec(`INSERT INTO outputs_fts(rowid,text) VALUES(?,?)`, id, ftsPrefix(r)+string(text))
-	return err
+	_, err = tx.Exec(`INSERT INTO outputs_fts(rowid,text) VALUES(?,?)`, id, ftsPrefix(r)+string(text))
+	return err == nil, err
 }
 
 // PipelineStage represents one wrapped command inside a shell pipeline.
@@ -377,75 +399,99 @@ type PipelineStage struct {
 }
 
 // recordPipelineStage stores this stage in pipeline_stages and creates or updates
-// the single merged runs row for (PGID, PidKey).
-func recordPipelineStage(db *sql.DB, st PipelineStage) (runID int64, mergedSize int64, mergedExit int, mergedDur time.Duration, err error) {
+// the single merged runs row for (PGID, PidKey). expectedStages is the number of
+// wrapped tools expected in this pipeline (0 if unknown).
+func recordPipelineStage(db *sql.DB, st PipelineStage, expectedStages int) (runID int64, mergedSize int64, mergedExit int, mergedDur time.Duration, stageCount int, err error) {
 	tx, err := db.Begin()
 	if err != nil {
-		return 0, 0, st.ExitCode, 0, err
+		return 0, 0, st.ExitCode, 0, 0, err
 	}
 	defer tx.Rollback() //nolint
 
-	// Prune stale coordination rows (>1h old) so the local table stays tiny.
-	_, _ = tx.Exec(`DELETE FROM pipeline_stages WHERE ts < ?`, st.Ts-3600)
+	// Prune coordination rows older than 24h so long pipelines run unhindered
+	// and orphaned/crashed rows never accumulate indefinitely.
+	_, _ = tx.Exec(`DELETE FROM pipeline_stages WHERE end_ts < ?`, st.Ts-86400)
 
 	if _, err := tx.Exec(
-		`INSERT INTO pipeline_stages(pgid,pid_key,run_id,stage_pos,ts,end_ts,tool,cmd,shell_cmd,cwd,hostname,exit_code,raw)
-		 VALUES(?,?,0,?,?,?,?,?,?,?,?,?,?)`,
+		`INSERT INTO pipeline_stages(pgid,pid_key,run_id,stage_pos,pending,ts,end_ts,tool,cmd,shell_cmd,cwd,hostname,exit_code,raw)
+		 VALUES(?,?,0,?,1,?,?,?,?,?,?,?,?,?)`,
 		st.PGID, st.PidKey, st.StagePos, st.Ts, st.EndTs, st.Tool, st.Cmd, st.ShellCmd, st.Cwd, st.Hostname, st.ExitCode, st.Raw,
 	); err != nil {
-		return 0, 0, st.ExitCode, 0, err
+		return 0, 0, st.ExitCode, 0, 0, err
 	}
 
 	rows, err := tx.Query(
-		`SELECT run_id,ts,end_ts,tool,cmd,shell_cmd,cwd,hostname,exit_code,raw
+		`SELECT run_id,stage_pos,ts,end_ts,tool,cmd,shell_cmd,cwd,hostname,exit_code,raw
 		 FROM pipeline_stages
 		 WHERE pgid=? AND pid_key=?
 		 ORDER BY stage_pos ASC, ts ASC, id ASC`,
 		st.PGID, st.PidKey,
 	)
 	if err != nil {
-		return 0, 0, st.ExitCode, 0, err
+		return 0, 0, st.ExitCode, 0, 0, err
 	}
 	var stages []PipelineStage
 	var existingRunID int64
+	hasSink := false
 	for rows.Next() {
 		var s PipelineStage
 		var rid int64
-		if err := rows.Scan(&rid, &s.Ts, &s.EndTs, &s.Tool, &s.Cmd, &s.ShellCmd, &s.Cwd, &s.Hostname, &s.ExitCode, &s.Raw); err != nil {
+		if err := rows.Scan(&rid, &s.StagePos, &s.Ts, &s.EndTs, &s.Tool, &s.Cmd, &s.ShellCmd, &s.Cwd, &s.Hostname, &s.ExitCode, &s.Raw); err != nil {
 			rows.Close()
-			return 0, 0, st.ExitCode, 0, err
+			return 0, 0, st.ExitCode, 0, 0, err
 		}
 		if rid > 0 && existingRunID == 0 {
 			existingRunID = rid
+		}
+		if s.StagePos >= 2 {
+			hasSink = true
 		}
 		stages = append(stages, s)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return 0, 0, st.ExitCode, 0, err
+		return 0, 0, st.ExitCode, 0, 0, err
+	}
+
+	stageCount = len(stages)
+	pending := 0
+	if expectedStages > 0 && stageCount < expectedStages {
+		pending = 1
+	} else if expectedStages == 0 && !hasSink {
+		pending = 1
 	}
 
 	r, rawGz, ftsText := mergePipelineStages(stages)
 	if existingRunID > 0 {
-		if err := updateRunTx(tx, existingRunID, r, rawGz, ftsText); err != nil {
-			return 0, 0, st.ExitCode, 0, err
+		updated, err := updateRunTx(tx, existingRunID, r, rawGz, ftsText)
+		if err != nil {
+			return 0, 0, st.ExitCode, 0, stageCount, err
 		}
-		runID = existingRunID
+		if updated {
+			runID = existingRunID
+		} else {
+			// Run was deleted mid-pipeline; create a fresh run row.
+			id, err := insertRunTx(tx, r, rawGz, ftsText)
+			if err != nil {
+				return 0, 0, st.ExitCode, 0, stageCount, err
+			}
+			runID = id
+		}
 	} else {
 		id, err := insertRunTx(tx, r, rawGz, ftsText)
 		if err != nil {
-			return 0, 0, st.ExitCode, 0, err
+			return 0, 0, st.ExitCode, 0, stageCount, err
 		}
 		runID = id
 	}
 
-	if _, err := tx.Exec(`UPDATE pipeline_stages SET run_id=? WHERE pgid=? AND pid_key=?`, runID, st.PGID, st.PidKey); err != nil {
-		return 0, 0, st.ExitCode, 0, err
+	if _, err := tx.Exec(`UPDATE pipeline_stages SET run_id=?, pending=? WHERE pgid=? AND pid_key=?`, runID, pending, st.PGID, st.PidKey); err != nil {
+		return 0, 0, st.ExitCode, 0, stageCount, err
 	}
 	if err := tx.Commit(); err != nil {
-		return 0, 0, st.ExitCode, 0, err
+		return 0, 0, st.ExitCode, 0, stageCount, err
 	}
-	return runID, r.Size.Int64, int(r.ExitCode.Int64), time.Duration(r.Dur.Int64) * time.Millisecond, nil
+	return runID, r.Size.Int64, int(r.ExitCode.Int64), time.Duration(r.Dur.Int64) * time.Millisecond, stageCount, nil
 }
 
 // mergePipelineStages combines multiple wrapped stages into one Run.
@@ -494,7 +540,7 @@ func mergePipelineStages(stages []PipelineStage) (Run, []byte, []byte) {
 			if i > 0 {
 				buf.WriteString("\n\n")
 			}
-			fmt.Fprintf(&buf, "── [%d/%d] %s (exit=%d) ──\n", i+1, len(nonEmpty), s.Cmd, s.ExitCode)
+			fmt.Fprintf(&buf, "\x1b[0m── [%d/%d] %s (exit=%d) ──\n", i+1, len(nonEmpty), s.Cmd, s.ExitCode)
 			buf.Write(bytes.TrimRight(s.Raw, "\r\n"))
 			buf.WriteByte('\n')
 		}
@@ -519,12 +565,13 @@ func mergePipelineStages(stages []PipelineStage) (Run, []byte, []byte) {
 	return r, z, truncFTS(stripANSI(combined))
 }
 
-// splitTopLevel splits s on separator tokens (e.g. "|" or "&&", "||", ";")
-// outside single/double quotes and backslash escapes.
+// splitTopLevel splits s on separator tokens outside quotes, escapes, and (...)
+// subshell/command-substitution groups.
 func splitTopLevel(s string, seps ...string) []string {
 	var parts []string
 	var cur strings.Builder
 	var quote byte
+	depth := 0
 	escaped := false
 	for i := 0; i < len(s); i++ {
 		c := s[i]
@@ -550,17 +597,29 @@ func splitTopLevel(s string, seps ...string) []string {
 			cur.WriteByte(c)
 			continue
 		}
-		matched := ""
-		for _, sep := range seps {
-			if strings.HasPrefix(s[i:], sep) && len(sep) > len(matched) {
-				matched = sep
-			}
-		}
-		if matched != "" {
-			parts = append(parts, strings.TrimSpace(cur.String()))
-			cur.Reset()
-			i += len(matched) - 1
+		if c == '(' {
+			depth++
+			cur.WriteByte(c)
 			continue
+		}
+		if c == ')' && depth > 0 {
+			depth--
+			cur.WriteByte(c)
+			continue
+		}
+		if depth == 0 {
+			matched := ""
+			for _, sep := range seps {
+				if strings.HasPrefix(s[i:], sep) && len(sep) > len(matched) {
+					matched = sep
+				}
+			}
+			if matched != "" {
+				parts = append(parts, strings.TrimSpace(cur.String()))
+				cur.Reset()
+				i += len(matched) - 1
+				continue
+			}
 		}
 		cur.WriteByte(c)
 	}
@@ -570,65 +629,208 @@ func splitTopLevel(s string, seps ...string) []string {
 	return parts
 }
 
-// extractPipelineCmd picks the pipeline segment from shellCmd that contains
-// the recorded stages (e.g. stripping a leading "cd dir && ").
-func extractPipelineCmd(shellCmd string, stages []PipelineStage) string {
-	lists := splitTopLevel(shellCmd, "&&", "||", ";")
-	if len(lists) <= 1 {
-		return strings.TrimSpace(shellCmd)
-	}
-	for _, seg := range lists {
-		if !strings.Contains(seg, "|") {
+// cmdStageInfo returns the command name of a single pipeline stage (skipping
+// leading KEY=VAL assignments and "command" / "iz --" / "iz run" prefixes),
+// plus whether it was explicitly wrapped via iz. Path-qualified tool names
+// keep their '/' so they do not match bare shell wrapper names.
+func cmdStageInfo(stage string) (bin string, explicitIz bool) {
+	fields := strings.Fields(stage)
+	i := 0
+	for i < len(fields) {
+		f := fields[i]
+		if eq := strings.IndexByte(f, '='); eq > 0 && !strings.HasPrefix(f, "-") {
+			i++
 			continue
 		}
-		allMatch := true
-		for _, st := range stages {
-			if !strings.Contains(seg, st.Tool) {
-				allMatch = false
-				break
+		if f == "command" {
+			i++
+			continue
+		}
+		if filepath.Base(f) == "iz" && i+1 < len(fields) && (fields[i+1] == "--" || fields[i+1] == "run") {
+			explicitIz = true
+			i += 2
+			continue
+		}
+		return f, explicitIz
+	}
+	return "", explicitIz
+}
+
+// containsCmd reports whether stage contains cmd at token boundaries (not as
+// a prefix of a longer argument like "a" inside "a.com").
+func containsCmd(stage, cmd string) bool {
+	if cmd == "" {
+		return false
+	}
+	isBoundary := func(b byte) bool {
+		return b == ' ' || b == '\t' || b == '(' || b == ')' || b == ';' || b == '&' || b == '|' || b == '>' || b == '<'
+	}
+	for off := 0; off < len(stage); {
+		idx := strings.Index(stage[off:], cmd)
+		if idx < 0 {
+			return false
+		}
+		start := off + idx
+		end := start + len(cmd)
+		leftOK := start == 0 || isBoundary(stage[start-1])
+		rightOK := end == len(stage) || isBoundary(stage[end])
+		if leftOK && rightOK {
+			return true
+		}
+		off = start + 1
+	}
+	return false
+}
+
+// collectPipelineSegments returns all pipeline segments in shellCmd, including
+// those nested inside (...) subshells or $(...) command substitutions.
+func collectPipelineSegments(shellCmd string) []string {
+	var out []string
+	var visit func(s string)
+	visit = func(s string) {
+		for _, seg := range splitTopLevel(s, "&&", "||", ";") {
+			if len(splitTopLevel(seg, "|&", "|")) >= 2 {
+				out = append(out, seg)
+			}
+			// Descend into (...) / $(...) groups to find nested pipelines.
+			var quote byte
+			escaped := false
+			for i := 0; i < len(seg); i++ {
+				c := seg[i]
+				if escaped {
+					escaped = false
+					continue
+				}
+				if c == '\\' && quote != '\'' {
+					escaped = true
+					continue
+				}
+				if quote != 0 {
+					if c == quote {
+						quote = 0
+					}
+					continue
+				}
+				if c == '\'' || c == '"' {
+					quote = c
+					continue
+				}
+				if c == '(' {
+					depth := 1
+					j := i + 1
+					var q2 byte
+					esc2 := false
+					for j < len(seg) && depth > 0 {
+						ch := seg[j]
+						if esc2 {
+							esc2 = false
+						} else if ch == '\\' && q2 != '\'' {
+							esc2 = true
+						} else if q2 != 0 {
+							if ch == q2 {
+								q2 = 0
+							}
+						} else if ch == '\'' || ch == '"' {
+							q2 = ch
+						} else if ch == '(' {
+							depth++
+						} else if ch == ')' {
+							depth--
+						}
+						j++
+					}
+					if depth == 0 {
+						visit(seg[i+1 : j-1])
+						i = j - 1
+					}
+				}
 			}
 		}
-		if allMatch {
-			return seg
+	}
+	visit(shellCmd)
+	return out
+}
+
+// extractPipelineCmd picks the pipeline segment from shellCmd whose wrapped
+// stages match stages in order (preferring exact stage command matches when
+// chained segments repeat the same tool names).
+func extractPipelineCmd(shellCmd string, stages []PipelineStage) string {
+	lists := splitTopLevel(shellCmd, "&&", "||", ";")
+	segs := collectPipelineSegments(shellCmd)
+	if len(lists) <= 1 && len(segs) <= 1 {
+		return strings.TrimSpace(shellCmd)
+	}
+	fallback := ""
+	for _, seg := range segs {
+		pipes := splitTopLevel(seg, "|&", "|")
+		if len(pipes) < 2 {
+			continue
 		}
+		si := 0
+		exact := true
+		for _, p := range pipes {
+			bin, _ := cmdStageInfo(p)
+			if si < len(stages) && bin == stages[si].Tool {
+				if stages[si].Cmd != "" && !containsCmd(p, stages[si].Cmd) {
+					exact = false
+				}
+				si++
+			}
+		}
+		if si == len(stages) {
+			if exact {
+				return seg
+			}
+			if fallback == "" {
+				fallback = seg
+			}
+		}
+	}
+	if fallback != "" {
+		return fallback
 	}
 	return strings.TrimSpace(shellCmd)
 }
 
-// hasDownstreamWrappedTool reports whether shellCmd has a wrapped tool in a
-// pipeline stage after currentTool.
-func hasDownstreamWrappedTool(shellCmd, currentTool string, tools []string) bool {
+// pipelineWrappedCount returns the number of wrapped tools in the pipeline
+// segment containing currentCmd/currentTool (0 if shellCmd has no matching pipeline).
+func pipelineWrappedCount(shellCmd, currentCmd, currentTool string, tools []string) int {
 	if shellCmd == "" || !strings.Contains(shellCmd, "|") {
-		return false
+		return 0
 	}
 	toolSet := make(map[string]bool, len(tools))
 	for _, t := range tools {
 		toolSet[t] = true
 	}
-	for _, seg := range splitTopLevel(shellCmd, "&&", "||", ";") {
-		pipes := splitTopLevel(seg, "|")
+	fallback := 0
+	for _, seg := range collectPipelineSegments(shellCmd) {
+		pipes := splitTopLevel(seg, "|&", "|")
 		if len(pipes) < 2 {
 			continue
 		}
-		seenCurrent := false
+		hasTool := false
+		hasExactCmd := false
+		wrapped := 0
 		for _, p := range pipes {
-			fields := strings.Fields(p)
-			if len(fields) == 0 {
-				continue
-			}
-			bin := filepath.Base(fields[0])
-			if !seenCurrent {
-				if bin == currentTool {
-					seenCurrent = true
+			bin, explicitIz := cmdStageInfo(p)
+			if bin == currentTool {
+				hasTool = true
+				if currentCmd != "" && containsCmd(p, currentCmd) {
+					hasExactCmd = true
 				}
-				continue
 			}
-			if toolSet[bin] {
-				return true
+			if toolSet[bin] || explicitIz {
+				wrapped++
 			}
 		}
+		if hasExactCmd && wrapped > 0 {
+			return wrapped
+		}
+		if hasTool && wrapped > 0 && fallback == 0 {
+			fallback = wrapped
+		}
 	}
-	return false
+	return fallback
 }
 
 // deleteRuns removes runs and their FTS rows in one transaction, leaving
@@ -648,6 +850,9 @@ func deleteRuns(db *sql.DB, ids []int64) (int, error) {
 		}
 		if err == nil {
 			err = tombstone(tx, runKey(r.Hostname, r.Ts, r.Tool, r.Cmd))
+		}
+		if err == nil {
+			_, err = tx.Exec(`DELETE FROM pipeline_stages WHERE run_id=?`, id)
 		}
 		if err == nil {
 			err = purge(bg, tx, "runs", "outputs_fts", []any{id})
@@ -812,7 +1017,7 @@ func orFallback(db *sql.DB, table string, terms []string) string {
 		return ""
 	}
 	for _, t := range terms {
-		if isFTSOp(t) {
+		if isFTSOp(t) || strings.Contains(t, `"`) {
 			return ""
 		}
 	}
@@ -958,8 +1163,13 @@ func searchRuns(db *sql.DB, query string, limit int, withText bool) ([]Run, erro
 	text := "''"
 	joinFTS := ""
 	if withText {
-		text = "f.text"
-		joinFTS = " JOIN outputs_fts f ON f.rowid = r.id"
+		if len(terms) > 0 {
+			text = "f.text"
+			joinFTS = " JOIN outputs_fts f ON f.rowid = r.id"
+		} else {
+			text = "coalesce(f.text, '')"
+			joinFTS = " LEFT JOIN outputs_fts f ON f.rowid = r.id"
+		}
 	} else if len(terms) > 0 {
 		joinFTS = " JOIN outputs_fts f ON f.rowid = r.id"
 	}
@@ -1086,7 +1296,7 @@ func scanRuns(db *sql.DB, q string, args []any) ([]Run, error) {
 		var r Run
 		if err := rows.Scan(&r.ID, &r.Ts, &r.Hostname, &r.Tool, &r.Cmd, &r.Cwd,
 			&r.ExitCode, &r.Dur, &r.Size, &r.Snippet); err != nil {
-			return out, err
+			return nil, err
 		}
 		out = append(out, r)
 	}

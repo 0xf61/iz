@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"golang.org/x/term"
 )
 
 // isToolName rejects anything that is not a plain binary name (injection
@@ -69,8 +71,17 @@ if status is-interactive
 end
 
 function __iz_preexec --on-event fish_preexec
-    set -gx IZ_SHELL_CMD $argv[1]
-    set -gx IZ_PIPELINE_ID "$fish_pid-"(random)
+    if string match -q '*|*' -- $argv[1]
+        set -gx IZ_SHELL_CMD $argv[1]
+        if not set -q __iz_seq
+            set -g __iz_seq 0
+        end
+        set -g __iz_seq (math $__iz_seq + 1)
+        set -gx IZ_PIPELINE_ID "$fish_pid-$__iz_seq"
+    else
+        set -e IZ_SHELL_CMD
+        set -e IZ_PIPELINE_ID
+    end
 end
 function __iz_postexec --on-event fish_postexec
     set -e IZ_SHELL_CMD
@@ -82,12 +93,14 @@ end
 			if !wrappable(name) {
 				continue
 			}
-			fmt.Fprintf(&b, `function %[1]s --wraps %[1]s --description 'iz: recorded %[1]s'
+			fmt.Fprintf(&b, `if not functions -q %[1]s
+function %[1]s --wraps %[1]s --description 'iz: recorded %[1]s'
     if set -q IZ
         command iz -- %[1]s $argv
     else
         command %[1]s $argv
     end
+end
 end
 `, name)
 		}
@@ -107,7 +120,6 @@ __iz_zsh_widget() {
     zle reset-prompt
 }
 zle -N __iz_zsh_widget
-bindkey "${IZ_KEY:-^G}" __iz_zsh_widget
 
 __iz_zsh_notes_widget() {
     zle -I
@@ -115,11 +127,20 @@ __iz_zsh_notes_widget() {
     zle reset-prompt
 }
 zle -N __iz_zsh_notes_widget
-bindkey "${IZ_NOTES_KEY:-^O}" __iz_zsh_notes_widget
+if [[ -o interactive ]]; then
+    bindkey "${IZ_KEY:-^G}" __iz_zsh_widget
+    bindkey "${IZ_NOTES_KEY:-^O}" __iz_zsh_notes_widget
+fi
 
 __iz_preexec() {
-    export IZ_SHELL_CMD="$1"
-    export IZ_PIPELINE_ID="$$-${RANDOM}"
+    local cmd="${2:-$1}"
+    if [[ "$cmd" == *"|"* ]]; then
+        export IZ_SHELL_CMD="$cmd"
+        __iz_seq=$(( ${__iz_seq:-0} + 1 ))
+        export IZ_PIPELINE_ID="$$-${__iz_seq}"
+    else
+        unset IZ_SHELL_CMD IZ_PIPELINE_ID
+    fi
 }
 __iz_precmd() {
     unset IZ_SHELL_CMD IZ_PIPELINE_ID
@@ -156,7 +177,11 @@ fi
 __iz_bash_precmd() {
     unset IZ_SHELL_CMD IZ_PIPELINE_ID
 }
-if [[ ";${PROMPT_COMMAND:-};" != *";__iz_bash_precmd;"* ]]; then
+if [[ "$(declare -p PROMPT_COMMAND 2>/dev/null)" == "declare -a"* ]]; then
+    if [[ " ${PROMPT_COMMAND[*]} " != *" __iz_bash_precmd "* ]]; then
+        PROMPT_COMMAND+=(__iz_bash_precmd)
+    fi
+elif [[ ";${PROMPT_COMMAND:-};" != *";__iz_bash_precmd;"* ]]; then
     PROMPT_COMMAND="__iz_bash_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
 fi
 
@@ -623,6 +648,22 @@ func patchManagedBlock(path, startMark, endMark, block string) (bool, error) {
 	return true, os.WriteFile(path, []byte(newContent), 0o644)
 }
 
+func hasActiveInitLine(content, line string) bool {
+	for _, l := range strings.Split(content, "\n") {
+		if idx := strings.IndexByte(l, '#'); idx >= 0 {
+			l = l[:idx]
+		}
+		t := strings.TrimSpace(l)
+		if t == "" {
+			continue
+		}
+		if (line != "" && strings.Contains(t, line)) || strings.Contains(t, "iz init") || strings.Contains(t, "iz fish") {
+			return true
+		}
+	}
+	return false
+}
+
 func appendLineIfMissing(path, line, comment string) (bool, error) {
 	data, err := os.ReadFile(path)
 	if err != nil && !os.IsNotExist(err) {
@@ -630,7 +671,7 @@ func appendLineIfMissing(path, line, comment string) (bool, error) {
 	}
 
 	content := string(data)
-	if strings.Contains(content, line) || strings.Contains(content, "iz init") || strings.Contains(content, "iz fish") {
+	if hasActiveInitLine(content, line) {
 		return false, nil // already configured
 	}
 
@@ -660,13 +701,14 @@ func showInitStatus(home string) int {
 		{"zsh", filepath.Join(home, ".zshrc")},
 		{"bash", filepath.Join(home, ".bashrc")},
 	}
+	stdoutTTY := term.IsTerminal(int(os.Stdout.Fd())) && os.Getenv("NO_COLOR") == ""
 	fmt.Println("\nShells:")
 	for _, s := range shells {
 		status := "not configured"
 		data, err := os.ReadFile(s.path)
-		if err == nil {
-			c := string(data)
-			if strings.Contains(c, "iz init") || strings.Contains(c, "iz fish") {
+		if err == nil && hasActiveInitLine(string(data), "") {
+			status = "configured"
+			if stdoutTTY {
 				status = "\x1b[32mconfigured\x1b[0m"
 			}
 		}
@@ -690,7 +732,10 @@ func showInitStatus(home string) int {
 			status = "not configured"
 			data, err := os.ReadFile(a.path)
 			if err == nil && strings.Contains(string(data), "<!-- iz-memory:begin -->") {
-				status = "\x1b[32mconfigured\x1b[0m"
+				status = "configured"
+				if stdoutTTY {
+					status = "\x1b[32mconfigured\x1b[0m"
+				}
 			}
 		}
 		fmt.Printf("  %-10s (%s): %s\n", a.name, a.path, status)
