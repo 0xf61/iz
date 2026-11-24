@@ -571,7 +571,7 @@ func splitTopLevel(s string, seps ...string) []string {
 	var parts []string
 	var cur strings.Builder
 	var quote byte
-	depth := 0
+	var qstack []byte
 	escaped := false
 	for i := 0; i < len(s); i++ {
 		c := s[i]
@@ -585,9 +585,23 @@ func splitTopLevel(s string, seps ...string) []string {
 			escaped = true
 			continue
 		}
-		if quote != 0 {
+		if quote == '\'' {
 			cur.WriteByte(c)
-			if c == quote {
+			if c == '\'' {
+				quote = 0
+			}
+			continue
+		}
+		if quote == '"' {
+			if c == '$' && i+1 < len(s) && s[i+1] == '(' {
+				qstack = append(qstack, '"')
+				quote = 0
+				cur.WriteString("$(")
+				i++
+				continue
+			}
+			cur.WriteByte(c)
+			if c == '"' {
 				quote = 0
 			}
 			continue
@@ -598,16 +612,17 @@ func splitTopLevel(s string, seps ...string) []string {
 			continue
 		}
 		if c == '(' {
-			depth++
+			qstack = append(qstack, 0)
 			cur.WriteByte(c)
 			continue
 		}
-		if c == ')' && depth > 0 {
-			depth--
+		if c == ')' && len(qstack) > 0 {
+			quote = qstack[len(qstack)-1]
+			qstack = qstack[:len(qstack)-1]
 			cur.WriteByte(c)
 			continue
 		}
-		if depth == 0 {
+		if len(qstack) == 0 {
 			matched := ""
 			for _, sep := range seps {
 				if strings.HasPrefix(s[i:], sep) && len(sep) > len(matched) {
@@ -735,11 +750,14 @@ func collectPipelineSegments(shellCmd string) []string {
 					continue
 				}
 				if c == '(' {
-					depth := 1
+					qstack := []byte{0}
+					if quote == '"' {
+						qstack[0] = '"'
+					}
 					j := i + 1
 					var q2 byte
 					esc2 := false
-					for j < len(seg) && depth > 0 {
+					for j < len(seg) && len(qstack) > 0 {
 						ch := seg[j]
 						if esc2 {
 							esc2 = false
@@ -753,20 +771,23 @@ func collectPipelineSegments(shellCmd string) []string {
 							if ch == '"' {
 								q2 = 0
 							} else if ch == '$' && j+1 < len(seg) && seg[j+1] == '(' {
-								depth++
+								qstack = append(qstack, '"')
+								q2 = 0
 								j++
 							}
 						} else if ch == '\'' || ch == '"' {
 							q2 = ch
 						} else if ch == '(' {
-							depth++
+							qstack = append(qstack, 0)
 						} else if ch == ')' {
-							depth--
+							q2 = qstack[len(qstack)-1]
+							qstack = qstack[:len(qstack)-1]
 						}
 						j++
 					}
-					if depth == 0 {
+					if len(qstack) == 0 {
 						visit(seg[i+1 : j-1])
+						quote = q2
 						i = j - 1
 					}
 				}
@@ -795,8 +816,8 @@ func extractPipelineCmd(shellCmd string, stages []PipelineStage) string {
 		si := 0
 		exact := true
 		for _, p := range pipes {
-			bin, _, _ := cmdStageInfo(p)
-			if si < len(stages) && bin == stages[si].Tool {
+			bin, _, bypassWrapper := cmdStageInfo(p)
+			if !bypassWrapper && bin != "" && si < len(stages) && bin == stages[si].Tool {
 				if stages[si].Cmd != "" && !containsCmd(p, stages[si].Cmd) {
 					exact = false
 				}
@@ -839,7 +860,7 @@ func pipelineWrappedCount(shellCmd, currentCmd, currentTool string, tools []stri
 		wrapped := 0
 		for _, p := range pipes {
 			bin, explicitIz, bypassWrapper := cmdStageInfo(p)
-			isWrapped := explicitIz || (!bypassWrapper && toolSet[bin])
+			isWrapped := bin != "" && (explicitIz || (!bypassWrapper && toolSet[bin]))
 			if isWrapped && bin == currentTool {
 				hasTool = true
 				if currentCmd != "" && containsCmd(p, currentCmd) {

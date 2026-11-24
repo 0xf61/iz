@@ -406,6 +406,15 @@ func TestPipelineHelpers(t *testing.T) {
 	if got := pipelineWrappedCount(`out="$(subfinder -d example.com | httpx -silent)"`, "httpx -silent", "httpx", tools); got != 2 {
 		t.Errorf("double-quoted command substitution: got %d, want 2", got)
 	}
+	if got := pipelineWrappedCount(`out=$(subfinder -d "$(cat domain)" | httpx -silent)`, "httpx -silent", "httpx", tools); got != 2 {
+		t.Errorf("nested double-quoted cmdsub: got %d, want 2", got)
+	}
+	if got := pipelineWrappedCount(`out="$(subfinder -d "a;b" | httpx -silent)"`, "httpx -silent", "httpx", tools); got != 2 {
+		t.Errorf("inner double quotes with semicolon in cmdsub: got %d, want 2", got)
+	}
+	if got := pipelineWrappedCount(`subfinder -d "$(echo "a | httpx -v")" | httpx -silent`, "httpx -silent", "httpx", tools); got != 2 {
+		t.Errorf("inner double quotes with pipe in cmdsub: got %d, want 2", got)
+	}
 	if got := pipelineWrappedCount("subfinder -d example.com | command httpx -silent", "subfinder -d example.com", "subfinder", tools); got != 1 {
 		t.Errorf("command-bypassed downstream: got %d, want 1", got)
 	}
@@ -422,6 +431,10 @@ func TestPipelineHelpers(t *testing.T) {
 	got2 := extractPipelineCmd("subfinder -d a.com | httpx && subfinder -d a | httpx", []PipelineStage{{Tool: "subfinder", Cmd: "subfinder -d a"}, {Tool: "httpx", Cmd: "httpx"}})
 	if got2 != "subfinder -d a | httpx" {
 		t.Errorf("extractPipelineCmd prefix overlap = %q", got2)
+	}
+	got3 := extractPipelineCmd("subfinder -d a | command httpx -silent && subfinder -d a | httpx -silent", []PipelineStage{{Tool: "subfinder", Cmd: "subfinder -d a"}, {Tool: "httpx", Cmd: "httpx -silent"}})
+	if got3 != "subfinder -d a | httpx -silent" {
+		t.Errorf("extractPipelineCmd bypassWrapper = %q", got3)
 	}
 
 	t.Setenv("IZ_SHELL_CMD", "a | b")
