@@ -31,6 +31,24 @@ func init() {
 
 type hranaDriver struct{}
 
+func normalizeScheme(scheme, tlsParam string) (string, error) {
+	switch scheme {
+	case "libsql":
+		if tlsParam == "false" || tlsParam == "0" {
+			return "http", nil
+		}
+		return "https", nil
+	case "wss":
+		return "https", nil
+	case "ws":
+		return "http", nil
+	case "http", "https":
+		return scheme, nil
+	default:
+		return "", fmt.Errorf("libsql: unsupported URL scheme %q", scheme)
+	}
+}
+
 func (d *hranaDriver) Open(dsn string) (driver.Conn, error) {
 	u, err := url.Parse(dsn)
 	if err != nil {
@@ -43,21 +61,11 @@ func (d *hranaDriver) Open(dsn string) (driver.Conn, error) {
 	tlsParam := q.Get("tls")
 	q.Del("tls")
 
-	switch u.Scheme {
-	case "libsql":
-		if tlsParam == "false" || tlsParam == "0" {
-			u.Scheme = "http"
-		} else {
-			u.Scheme = "https"
-		}
-	case "wss":
-		u.Scheme = "https"
-	case "ws":
-		u.Scheme = "http"
-	case "http", "https":
-	default:
-		return nil, fmt.Errorf("libsql: unsupported URL scheme %q", u.Scheme)
+	scheme, err := normalizeScheme(u.Scheme, tlsParam)
+	if err != nil {
+		return nil, err
 	}
+	u.Scheme = scheme
 	if u.Host == "" {
 		return nil, errors.New("libsql: missing host in URL")
 	}
@@ -270,21 +278,23 @@ type hranaPipelineReq struct {
 	Requests []hranaReq `json:"requests"`
 }
 
+type hranaExecResult struct {
+	Cols []struct {
+		Name string `json:"name"`
+	} `json:"cols"`
+	Rows             [][]hranaRawValue `json:"rows"`
+	AffectedRowCount int64             `json:"affected_row_count"`
+	LastInsertRowid  json.RawMessage   `json:"last_insert_rowid"`
+}
+
 type hranaPipelineResp struct {
 	Baton   string `json:"baton"`
 	BaseURL string `json:"base_url"`
 	Results []struct {
 		Type     string `json:"type"`
 		Response *struct {
-			Type   string `json:"type"`
-			Result struct {
-				Cols []struct {
-					Name string `json:"name"`
-				} `json:"cols"`
-				Rows             [][]hranaRawValue `json:"rows"`
-				AffectedRowCount int64             `json:"affected_row_count"`
-				LastInsertRowid  json.RawMessage   `json:"last_insert_rowid"`
-			} `json:"result"`
+			Type   string          `json:"type"`
+			Result hranaExecResult `json:"result"`
 		} `json:"response"`
 		Error *struct {
 			Message string `json:"message"`
@@ -415,6 +425,55 @@ func parentDomain(host string) string {
 	return strings.Join(parts[len(parts)-n:], ".")
 }
 
+func (c *hranaConn) doPipelineHTTP(ctx context.Context, body []byte) ([]byte, int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, hranaMaxRespBytes+1))
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(raw) > hranaMaxRespBytes {
+		return nil, 0, fmt.Errorf("libsql: response exceeds %d bytes", hranaMaxRespBytes)
+	}
+	return raw, resp.StatusCode, nil
+}
+
+func (c *hranaConn) updateStreamState(out *hranaPipelineResp) error {
+	c.baton = out.Baton
+	if out.Baton == "" {
+		c.endpoint = c.baseEndpoint
+		return nil
+	}
+	if out.BaseURL != "" {
+		return c.applyBaseURL(out.BaseURL)
+	}
+	return nil
+}
+
+func checkPipelineErrors(out *hranaPipelineResp) error {
+	for _, r := range out.Results {
+		if r.Type != "error" {
+			continue
+		}
+		if r.Error != nil && r.Error.Message != "" {
+			return errors.New(r.Error.Message)
+		}
+		return errors.New("hrana pipeline error")
+	}
+	return nil
+}
+
 func (c *hranaConn) pipeline(ctx context.Context, reqs []hranaReq) (*hranaPipelineResp, error) {
 	if c.bad {
 		return nil, driver.ErrBadConn
@@ -423,27 +482,11 @@ func (c *hranaConn) pipeline(ctx context.Context, reqs []hranaReq) (*hranaPipeli
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(body))
+	raw, status, err := c.doPipelineHTTP(ctx, body)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
-	}
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, hranaMaxRespBytes+1))
-	if err != nil {
-		return nil, err
-	}
-	if len(raw) > hranaMaxRespBytes {
-		return nil, fmt.Errorf("libsql: response exceeds %d bytes", hranaMaxRespBytes)
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+	if status < 200 || status >= 300 {
 		msg := strings.TrimSpace(string(raw))
 		if len(msg) > hranaMaxErrBody {
 			msg = msg[:hranaMaxErrBody] + "..."
@@ -452,28 +495,17 @@ func (c *hranaConn) pipeline(ctx context.Context, reqs []hranaReq) (*hranaPipeli
 			c.baton = ""
 			c.endpoint = c.baseEndpoint
 		}
-		return nil, fmt.Errorf("libsql http %d: %s", resp.StatusCode, msg)
+		return nil, fmt.Errorf("libsql http %d: %s", status, msg)
 	}
 	var out hranaPipelineResp
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return nil, err
 	}
-	c.baton = out.Baton
-	if out.Baton == "" {
-		c.endpoint = c.baseEndpoint
-	} else if out.BaseURL != "" {
-		if err := c.applyBaseURL(out.BaseURL); err != nil {
-			return nil, err
-		}
+	if err := c.updateStreamState(&out); err != nil {
+		return nil, err
 	}
-	for _, r := range out.Results {
-		if r.Type == "error" {
-			msg := "hrana pipeline error"
-			if r.Error != nil && r.Error.Message != "" {
-				msg = r.Error.Message
-			}
-			return nil, errors.New(msg)
-		}
+	if err := checkPipelineErrors(&out); err != nil {
+		return nil, err
 	}
 	return &out, nil
 }
@@ -482,7 +514,7 @@ func (c *hranaConn) exec(ctx context.Context, query string, args []driver.NamedV
 	return c.execStmt(ctx, query, args, !c.inTx)
 }
 
-func (c *hranaConn) execStmt(ctx context.Context, query string, args []driver.NamedValue, closeStream bool) (driver.Result, error) {
+func (c *hranaConn) runSingleStmt(ctx context.Context, query string, args []driver.NamedValue, closeStream bool) (*hranaExecResult, error) {
 	hargs, named, err := encodeArgs(args)
 	if err != nil {
 		return nil, err
@@ -501,30 +533,22 @@ func (c *hranaConn) execStmt(ctx context.Context, query string, args []driver.Na
 	if len(resp.Results) == 0 || resp.Results[0].Response == nil {
 		return nil, errors.New("libsql: empty pipeline response")
 	}
-	res := resp.Results[0].Response.Result
+	return &resp.Results[0].Response.Result, nil
+}
+
+func (c *hranaConn) execStmt(ctx context.Context, query string, args []driver.NamedValue, closeStream bool) (driver.Result, error) {
+	res, err := c.runSingleStmt(ctx, query, args, closeStream)
+	if err != nil {
+		return nil, err
+	}
 	return hranaResult{lastID: parseRowID(res.LastInsertRowid), affected: res.AffectedRowCount}, nil
 }
 
 func (c *hranaConn) query(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
-	hargs, named, err := encodeArgs(args)
+	res, err := c.runSingleStmt(ctx, query, args, !c.inTx)
 	if err != nil {
 		return nil, err
 	}
-	reqs := []hranaReq{{
-		Type: "execute",
-		Stmt: &hranaStmtPayload{SQL: query, Args: hargs, NamedArgs: named},
-	}}
-	if !c.inTx {
-		reqs = append(reqs, hranaReq{Type: "close"})
-	}
-	resp, err := c.pipeline(ctx, reqs)
-	if err != nil {
-		return nil, err
-	}
-	if len(resp.Results) == 0 || resp.Results[0].Response == nil {
-		return nil, errors.New("libsql: empty pipeline response")
-	}
-	res := resp.Results[0].Response.Result
 	cols := make([]string, len(res.Cols))
 	for i, col := range res.Cols {
 		cols[i] = col.Name
@@ -532,8 +556,12 @@ func (c *hranaConn) query(ctx context.Context, query string, args []driver.Named
 	return &hranaRows{cols: cols, rows: res.Rows}, nil
 }
 
+func isJSONNull(raw json.RawMessage) bool {
+	return len(raw) == 0 || bytes.Equal(raw, []byte("null"))
+}
+
 func parseRowID(raw json.RawMessage) int64 {
-	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+	if isJSONNull(raw) {
 		return 0
 	}
 	var s string
@@ -604,7 +632,7 @@ func decodeValue(rv hranaRawValue) (driver.Value, error) {
 		}
 		return n, nil
 	case "float":
-		if len(rv.Value) == 0 || bytes.Equal(rv.Value, []byte("null")) {
+		if isJSONNull(rv.Value) {
 			return nil, errors.New("libsql: missing float value")
 		}
 		var f float64
@@ -613,7 +641,7 @@ func decodeValue(rv hranaRawValue) (driver.Value, error) {
 		}
 		return f, nil
 	case "text":
-		if len(rv.Value) == 0 || bytes.Equal(rv.Value, []byte("null")) {
+		if isJSONNull(rv.Value) {
 			return nil, errors.New("libsql: missing text value")
 		}
 		var s string

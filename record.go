@@ -92,6 +92,50 @@ func isNamedPipe(f *os.File) bool {
 	return err == nil && fi.Mode()&os.ModeNamedPipe != 0
 }
 
+// startPTY starts cmd attached to a PTY sized to the current terminal.
+func startPTY(cmd *exec.Cmd) (*os.File, error) {
+	if ws, err := pty.GetsizeFull(os.Stdin); err == nil {
+		return pty.StartWithSize(cmd, ws)
+	}
+	return pty.Start(cmd) // child sees isatty(stdout) = true → colors
+}
+
+// makeRawStdin puts stdin into raw mode and returns an idempotent restore func.
+func makeRawStdin() func() {
+	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
+	if err != nil {
+		return func() {}
+	}
+	return sync.OnceFunc(func() {
+		_ = term.Restore(int(os.Stdin.Fd()), oldState)
+	})
+}
+
+// forwardWinch relays SIGWINCH terminal resizes to ptmx until stop is called.
+func forwardWinch(ptmx *os.File) (stop func()) {
+	winch := make(chan os.Signal, 1)
+	signal.Notify(winch, syscall.SIGWINCH)
+	resized := make(chan struct{})
+	go func() {
+		defer close(resized)
+		for range winch {
+			pty.InheritSize(os.Stdin, ptmx) //nolint
+		}
+	}()
+	return func() {
+		signal.Stop(winch) // no more sends after Stop: safe to close
+		close(winch)
+		<-resized
+	}
+}
+
+func waitTimeout(ch <-chan struct{}, d time.Duration) {
+	select {
+	case <-ch:
+	case <-time.After(d):
+	}
+}
+
 // runPTYRecord runs the command inside a PTY so it sees a terminal (colors,
 // progress bars, interactive prompts).
 func runPTYRecord(db *sql.DB, args []string) int {
@@ -111,15 +155,7 @@ func runPTYRecord(db *sql.DB, args []string) int {
 	sigs := forwardSignals(true, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	defer sigs.release()
 
-	// Start with the current terminal size: fast tools (fastfetch!) would
-	// otherwise render against the default 80x24 before the resize poller runs.
-	var ptmx *os.File
-	var err error
-	if ws, sizeErr := pty.GetsizeFull(os.Stdin); sizeErr == nil {
-		ptmx, err = pty.StartWithSize(cmd, ws)
-	} else {
-		ptmx, err = pty.Start(cmd) // child sees isatty(stdout) = true → colors
-	}
+	ptmx, err := startPTY(cmd)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "iz:", err)
 		return startFailure(err)
@@ -130,29 +166,10 @@ func runPTYRecord(db *sql.DB, args []string) int {
 	// Put stdin into raw mode so interactive tools (ssh, sudo, fzf) receive
 	// keystrokes directly, passwords are not echoed by the outer TTY, and
 	// Ctrl-C is delivered to the child PTY instead of killing iz mid-scan.
-	var oldTermState *term.State
-	if s, err := term.MakeRaw(int(os.Stdin.Fd())); err == nil {
-		oldTermState = s
-	}
-	restoreTerm := func() {
-		if oldTermState != nil {
-			_ = term.Restore(int(os.Stdin.Fd()), oldTermState)
-			oldTermState = nil
-		}
-	}
+	restoreTerm := makeRawStdin()
 	defer restoreTerm()
 
-	// Forward terminal resizes to the child PTY.
-	winch := make(chan os.Signal, 1)
-	signal.Notify(winch, syscall.SIGWINCH)
-	resized := make(chan struct{})
-	go func() {
-		defer close(resized)
-		for range winch {
-			pty.InheritSize(os.Stdin, ptmx) //nolint
-		}
-	}()
-
+	stopWinch := forwardWinch(ptmx)
 	stopStdin, stdinDone := forwardStdin(ptmx)
 
 	// PTY → buffer + screen (buffer first: it never fails, the screen may)
@@ -167,22 +184,11 @@ func runPTYRecord(db *sql.DB, args []string) int {
 	// The child is gone. Stop reading stdin, so typeahead stays with the
 	// shell, and give the remaining output a moment to drain: a daemonized
 	// grandchild still holding the PTY slave would otherwise block us forever.
-	// Nothing here waits unbounded: the stdin forwarder may be stuck writing
-	// to a full PTY nobody reads, so it is only waited for briefly, after the
-	// PTY is closed (which fails its next write).
 	stopStdin()
-	signal.Stop(winch) // no more sends after Stop: safe to close
-	close(winch)
-	<-resized
-	select {
-	case <-drained:
-	case <-time.After(drainTimeout):
-	}
+	stopWinch()
+	waitTimeout(drained, drainTimeout)
 	ptmx.Close()
-	select {
-	case <-stdinDone:
-	case <-time.After(drainTimeout):
-	}
+	waitTimeout(stdinDone, drainTimeout)
 	restoreTerm()
 
 	return saveRun(db, args, start, capture.Bytes(), exitStatus(waitErr, cmd.ProcessState))
@@ -231,36 +237,44 @@ func (d *pipeDrain) onChildExit() {
 	d.mu.Unlock()
 }
 
+func (d *pipeDrain) beginRead() (time.Time, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.exited {
+		if d.budget <= 0 {
+			return time.Time{}, false
+		}
+		_ = d.r.SetReadDeadline(time.Now().Add(d.budget))
+	}
+	d.reading = true
+	return time.Now(), true
+}
+
+func (d *pipeDrain) endRead(readStart time.Time) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.reading = false
+	if !d.exited {
+		return
+	}
+	since := readStart
+	if d.exitAt.After(since) {
+		since = d.exitAt
+	}
+	d.budget -= time.Since(since)
+	_ = d.r.SetReadDeadline(time.Time{})
+}
+
 func (d *pipeDrain) copyTo(dst io.Writer) {
 	defer d.r.Close()
 	buf := make([]byte, 32<<10)
 	for {
-		d.mu.Lock()
-		if d.exited {
-			if d.budget <= 0 {
-				d.mu.Unlock()
-				return
-			}
-			_ = d.r.SetReadDeadline(time.Now().Add(d.budget))
+		readStart, ok := d.beginRead()
+		if !ok {
+			return
 		}
-		readStart := time.Now()
-		d.reading = true
-		d.mu.Unlock()
-
 		n, err := d.r.Read(buf)
-
-		d.mu.Lock()
-		d.reading = false
-		if d.exited {
-			since := readStart
-			if d.exitAt.After(since) {
-				since = d.exitAt
-			}
-			d.budget -= time.Since(since)
-			_ = d.r.SetReadDeadline(time.Time{})
-		}
-		d.mu.Unlock()
-
+		d.endRead(readStart)
 		if n > 0 {
 			if _, werr := dst.Write(buf[:n]); werr != nil {
 				return
@@ -353,6 +367,40 @@ func runPipeRecord(db *sql.DB, args []string) int {
 	return saveRun(db, args, start, capture.Bytes(), exitStatus(waitErr, cmd.ProcessState))
 }
 
+func pipelineStagePos(inPipe, outPipe bool) int {
+	switch {
+	case !inPipe && outPipe:
+		return 0
+	case inPipe && outPipe:
+		return 1
+	case inPipe && !outPipe:
+		return 2
+	default:
+		return 3
+	}
+}
+
+func savePipelineRun(db *sql.DB, st PipelineStage, outPipe bool) int {
+	expected := 0
+	if st.ShellCmd != "" {
+		expected = pipelineWrappedCount(st.ShellCmd, st.Cmd, st.Tool, queryNames(db, "tools"))
+	}
+	id, finalSize, finalExit, finalDur, stageCount, err := recordPipelineStage(db, st, expected)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[iz] RECORD FAILED: %v\n", err)
+		return st.ExitCode
+	}
+	if expected > 0 && stageCount < expected {
+		return st.ExitCode
+	}
+	if expected == 0 && outPipe {
+		return st.ExitCode
+	}
+	fmt.Fprintf(os.Stderr, "[iz] #%d saved · exit=%d · %.1fs · %s\n",
+		id, finalExit, finalDur.Seconds(), humanBytes(finalSize))
+	return st.ExitCode
+}
+
 // saveRun stores a finished run and reports it on stderr; it returns exit.
 func saveRun(db *sql.DB, args []string, start time.Time, out []byte, exit int) int {
 	raw := tidyRaw(out)
@@ -369,19 +417,10 @@ func saveRun(db *sql.DB, args []string, start time.Time, out []byte, exit int) i
 	pidKey := os.Getenv("IZ_PIPELINE_ID")
 
 	if (inPipe || outPipe) && (pidKey != "" || strings.Contains(shellCmd, "|")) {
-		stagePos := 3
-		switch {
-		case !inPipe && outPipe:
-			stagePos = 0
-		case inPipe && outPipe:
-			stagePos = 1
-		case inPipe && !outPipe:
-			stagePos = 2
-		}
 		st := PipelineStage{
 			PGID:     unix.Getpgrp(),
 			PidKey:   pidKey,
-			StagePos: stagePos,
+			StagePos: pipelineStagePos(inPipe, outPipe),
 			Ts:       unixTime(start),
 			EndTs:    unixTime(now),
 			Tool:     tool,
@@ -392,25 +431,7 @@ func saveRun(db *sql.DB, args []string, start time.Time, out []byte, exit int) i
 			ExitCode: exit,
 			Raw:      raw,
 		}
-		expected := 0
-		if shellCmd != "" {
-			expected = pipelineWrappedCount(shellCmd, cmdStr, tool, queryNames(db, "tools"))
-		}
-		id, finalSize, finalExit, finalDur, stageCount, err := recordPipelineStage(db, st, expected)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[iz] RECORD FAILED: %v\n", err)
-			return exit
-		}
-		if expected > 0 {
-			if stageCount < expected {
-				return exit
-			}
-		} else if outPipe {
-			return exit
-		}
-		fmt.Fprintf(os.Stderr, "[iz] #%d saved · exit=%d · %.1fs · %s\n",
-			id, finalExit, finalDur.Seconds(), humanBytes(finalSize))
-		return exit
+		return savePipelineRun(db, st, outPipe)
 	}
 
 	z := gz(raw)
@@ -513,6 +534,33 @@ func foreground() bool {
 	return false
 }
 
+func copyStdinLoop(in int, cancelPipe *os.File, dst io.Writer) {
+	defer cancelPipe.Close() // only once select(2) no longer watches it
+	cancel := int(cancelPipe.Fd())
+	buf := make([]byte, 32<<10)
+	for {
+		var set unix.FdSet
+		set.Set(in)
+		set.Set(cancel)
+		_, err := unix.Select(max(in, cancel)+1, &set, nil, nil, nil)
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil || set.IsSet(cancel) {
+			return
+		}
+		n, err := unix.Read(in, buf)
+		if n > 0 {
+			if _, werr := dst.Write(buf[:n]); werr != nil {
+				return
+			}
+		}
+		if n == 0 || (err != nil && err != unix.EINTR && err != unix.EAGAIN) {
+			return // EOF or a real error
+		}
+	}
+}
+
 // forwardStdin copies stdin to dst until stop is called; done is closed once
 // the copier has exited. It waits for input with select(2) (poll(2) does not
 // support ttys on macOS) and reads only what is already there, so keystrokes
@@ -532,34 +580,9 @@ func forwardStdin(dst io.Writer) (stop func(), done <-chan struct{}) {
 		close(exited)
 		return func() {}, exited
 	}
-	cancel := int(r.Fd())
 	go func() {
 		defer close(exited)
-		defer r.Close() // only once select(2) no longer watches it
-		buf := make([]byte, 32<<10)
-		for {
-			var set unix.FdSet
-			set.Set(in)
-			set.Set(cancel)
-			if _, err := unix.Select(max(in, cancel)+1, &set, nil, nil, nil); err != nil {
-				if err == unix.EINTR {
-					continue
-				}
-				return
-			}
-			if set.IsSet(cancel) {
-				return
-			}
-			n, err := unix.Read(in, buf)
-			if n > 0 {
-				if _, werr := dst.Write(buf[:n]); werr != nil {
-					return
-				}
-			}
-			if n == 0 || err != nil && err != unix.EINTR && err != unix.EAGAIN {
-				return // EOF or a real error
-			}
-		}
+		copyStdinLoop(in, r, dst)
 	}()
 	return func() { w.Close() }, exited
 }
@@ -600,6 +623,24 @@ func (c *capture) Write(p []byte) (int, error) {
 	return n, nil
 }
 
+func trimHeadBoundary(head []byte) []byte {
+	if i := bytes.LastIndexByte(head, '\n'); i >= 0 {
+		return head[:i+1]
+	}
+	return head[:len(head)-partialRune(head)] // one huge line: end on a whole character
+}
+
+func trimTailBoundary(tail []byte) []byte {
+	if i := bytes.IndexByte(tail, '\n'); i >= 0 {
+		return tail[i+1:]
+	}
+	// one huge line: start on a whole character
+	for k := 0; k < utf8.UTFMax-1 && len(tail) > 0 && !utf8.RuneStart(tail[0]); k++ {
+		tail = tail[1:]
+	}
+	return tail
+}
+
 // Bytes returns the captured output; when some was dropped, a marker line
 // replaces the gap: the head ends and the tail starts at a full line (so no
 // UTF-8 sequence or escape is cut), and colors are reset before the marker.
@@ -611,18 +652,8 @@ func (c *capture) Bytes() []byte {
 	if dropped == 0 {
 		return append(append([]byte{}, head...), tail...)
 	}
-	if i := bytes.LastIndexByte(head, '\n'); i >= 0 {
-		head = head[:i+1]
-	} else { // one huge line: at least end on a whole character
-		head = head[:len(head)-partialRune(head)]
-	}
-	if i := bytes.IndexByte(tail, '\n'); i >= 0 {
-		tail = tail[i+1:]
-	} else { // one huge line: at least start on a whole character
-		for k := 0; k < utf8.UTFMax-1 && len(tail) > 0 && !utf8.RuneStart(tail[0]); k++ {
-			tail = tail[1:]
-		}
-	}
+	head = trimHeadBoundary(head)
+	tail = trimTailBoundary(tail)
 	dropped = c.total - int64(len(head)) - int64(len(tail))
 	out := append([]byte{}, head...)
 	if len(head) > 0 && head[len(head)-1] != '\n' {
