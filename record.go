@@ -204,6 +204,74 @@ func ptyEnv(name string) []string {
 // exits (only a lingering grandchild can make it matter).
 const drainTimeout = 500 * time.Millisecond
 
+// pipeDrain copies a child pipe to dst. While the child is running, reads block
+// normally; once onChildExit is called, drainTimeout bounds only time spent
+// waiting to read from a lingering grandchild, never time spent writing to a
+// slow downstream reader.
+type pipeDrain struct {
+	r       *os.File
+	mu      sync.Mutex
+	exited  bool
+	reading bool
+	exitAt  time.Time
+	budget  time.Duration
+}
+
+func newPipeDrain(r *os.File) *pipeDrain {
+	return &pipeDrain{r: r, budget: drainTimeout}
+}
+
+func (d *pipeDrain) onChildExit() {
+	d.mu.Lock()
+	d.exited = true
+	d.exitAt = time.Now()
+	if d.reading {
+		_ = d.r.SetReadDeadline(d.exitAt.Add(d.budget))
+	}
+	d.mu.Unlock()
+}
+
+func (d *pipeDrain) copyTo(dst io.Writer) {
+	defer d.r.Close()
+	buf := make([]byte, 32<<10)
+	for {
+		d.mu.Lock()
+		if d.exited {
+			if d.budget <= 0 {
+				d.mu.Unlock()
+				return
+			}
+			_ = d.r.SetReadDeadline(time.Now().Add(d.budget))
+		}
+		readStart := time.Now()
+		d.reading = true
+		d.mu.Unlock()
+
+		n, err := d.r.Read(buf)
+
+		d.mu.Lock()
+		d.reading = false
+		if d.exited {
+			since := readStart
+			if d.exitAt.After(since) {
+				since = d.exitAt
+			}
+			d.budget -= time.Since(since)
+			_ = d.r.SetReadDeadline(time.Time{})
+		}
+		d.mu.Unlock()
+
+		if n > 0 {
+			if _, werr := dst.Write(buf[:n]); werr != nil {
+				return
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
 // runPipeRecord runs the command without a PTY when stdin or stdout is piped
 // (or iz runs in the background), mirroring stdout/stderr cleanly while
 // recording the combined output.
@@ -213,11 +281,20 @@ func runPipeRecord(db *sql.DB, args []string) int {
 	cmd.Stdin = os.Stdin
 	start := time.Now()
 
-	// The capture comes first: it never fails, while a write to a closed
-	// stdout (`iz -- cmd | head`) stops the copy, and the chunk is kept.
-	capture := newCapture()
-	cmd.Stdout = io.MultiWriter(capture, os.Stdout)
-	cmd.Stderr = io.MultiWriter(capture, os.Stderr)
+	outR, outW, err := os.Pipe()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "iz:", err)
+		return 1
+	}
+	errR, errW, err := os.Pipe()
+	if err != nil {
+		outR.Close()
+		outW.Close()
+		fmt.Fprintln(os.Stderr, "iz:", err)
+		return 1
+	}
+	cmd.Stdout = outW
+	cmd.Stderr = errW
 
 	// Signals iz must survive without acting on them, caught (not ignored)
 	// so the child still starts with default dispositions:
@@ -241,13 +318,38 @@ func runPipeRecord(db *sql.DB, args []string) int {
 	defer sigs.release()
 
 	if err := cmd.Start(); err != nil {
+		outR.Close()
+		outW.Close()
+		errR.Close()
+		errW.Close()
 		fmt.Fprintln(os.Stderr, "iz:", err)
 		return startFailure(err)
 	}
+	outW.Close()
+	errW.Close()
 	sigs.to(cmd.Process)
+
+	// The capture comes first: it never fails, while a write to a closed
+	// stdout (`iz -- cmd | head`) stops the copy, and the chunk is kept.
+	capture := newCapture()
+	outDrain := newPipeDrain(outR)
+	errDrain := newPipeDrain(errR)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		outDrain.copyTo(io.MultiWriter(capture, os.Stdout))
+	}()
+	go func() {
+		defer wg.Done()
+		errDrain.copyTo(io.MultiWriter(capture, os.Stderr))
+	}()
 
 	waitErr := cmd.Wait()
 	sigs.stop()
+	outDrain.onChildExit()
+	errDrain.onChildExit()
+	wg.Wait()
 	return saveRun(db, args, start, capture.Bytes(), exitStatus(waitErr, cmd.ProcessState))
 }
 

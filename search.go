@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"fmt"
 	"io"
 	"os"
@@ -133,11 +134,18 @@ func tuiSearch(query string, pick bool) int {
 		return 2
 	}
 	defer db.Close()
-	if _, r, err := getMeta(db, id); err == nil {
-		fmt.Println(r.Cmd)
+	if cmd, err := getRunCmd(db, id); err == nil {
+		fmt.Println(cmd)
 		return 0
 	}
 	return 130
+}
+
+// getRunCmd reads only the command string for a run (without loading its raw blob).
+func getRunCmd(db *sql.DB, id int64) (string, error) {
+	var cmd string
+	err := db.QueryRow(`SELECT cmd FROM runs WHERE id=?`, id).Scan(&cmd)
+	return cmd, err
 }
 
 // linesCmd is the live reload source for the TUI: it runs the FTS query that

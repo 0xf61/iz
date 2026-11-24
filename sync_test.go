@@ -4,13 +4,18 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -564,7 +569,7 @@ func TestTransferRunsStopsOnCancel(t *testing.T) {
 	local, remote := syncDBs(t)
 	ctx, cancel := context.WithCancel(bg)
 	cancel()
-	if _, err := transferRuns(ctx, local, remote, []any{1, 2}); !errors.Is(err, context.Canceled) {
+	if _, err := transferRuns(ctx, local, remote, []Run{{ID: 1}, {ID: 2}}, true); !errors.Is(err, context.Canceled) {
 		t.Errorf("err = %v, want context.Canceled", err)
 	}
 }
@@ -733,5 +738,301 @@ func TestAtuinKVGetTimeout(t *testing.T) {
 	}
 	if d := time.Since(start); d > 3*time.Second {
 		t.Errorf("atuin not timed out (took %s)", d)
+	}
+}
+
+func TestReadRunsPaginated(t *testing.T) {
+	oldPage := runKeyPageSize
+	runKeyPageSize = 2
+	t.Cleanup(func() { runKeyPageSize = oldPage })
+
+	db, _ := syncDBs(t)
+	var ids []int64
+	for i := range 5 {
+		r := sampleRun("nmap", fmt.Sprintf("nmap %d", i), "ok")
+		r.Ts = 1700000000 + float64(i)
+		r.Size = ni(int64(100 * (i + 1)))
+		id, err := insertRun(db, r, gz([]byte("ok")), []byte("ok"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	// Create an ID gap to ensure keyset pagination skips gaps cleanly.
+	if _, err := db.Exec(`DELETE FROM runs WHERE id=?`, ids[2]); err != nil {
+		t.Fatal(err)
+	}
+
+	deadKey := runKey("kali", 1700000001, "nmap", "nmap 1")
+	live, deadIDs, err := readRuns(bg, db, newRunTombs(map[string]bool{deadKey: true}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deadIDs) != 1 || deadIDs[0] != ids[1] {
+		t.Fatalf("deadIDs = %v, want [%d]", deadIDs, ids[1])
+	}
+	if len(live) != 3 || live[0].ID != ids[0] || live[1].ID != ids[3] || live[2].ID != ids[4] {
+		t.Fatalf("live = %+v, want ids [%d %d %d]", live, ids[0], ids[3], ids[4])
+	}
+	if live[2].Size.Int64 != 500 {
+		t.Errorf("live[2].Size = %+v, want 500", live[2].Size)
+	}
+}
+
+func TestChunkRunsBySize(t *testing.T) {
+	runs := []Run{
+		{ID: 1, Size: ni(300)},
+		{ID: 2, Size: ni(300)},
+		{ID: 3, Size: ni(500)}, // would exceed 1000 with [1,2] -> new chunk
+		{ID: 4, Size: ni(1500)}, // single run > budget -> own chunk
+		{ID: 5, Size: ni(100)},
+		{ID: 6, Size: ni(100)},
+		{ID: 7, Size: ni(100)}, // maxRows=2 caps [5,6], so [7] starts a new chunk
+	}
+	got := chunkRunsBySize(runs, 2, 1000)
+	want := [][]int64{{1, 2}, {3}, {4}, {5, 6}, {7}}
+	if len(got) != len(want) {
+		t.Fatalf("got %d chunks, want %d: %+v", len(got), len(want), got)
+	}
+	for i, w := range want {
+		var ids []int64
+		for _, r := range got[i] {
+			ids = append(ids, r.ID)
+		}
+		if !slices.Equal(ids, w) {
+			t.Errorf("chunk[%d] = %v, want %v", i, ids, w)
+		}
+	}
+}
+
+// startMockHranaSQLite exposes a real SQLite DB over the Hrana v2 HTTP protocol
+// so sync tests can inspect SQL queries and inject read errors.
+func startMockHranaSQLite(t *testing.T, backing *sql.DB, onQuery func(sql string, args []any) error) (*sql.DB, *[]string, *sync.Mutex) {
+	t.Helper()
+	var mu sync.Mutex
+	var queries []string
+
+	decodeArg := func(hv hranaValue) (any, error) {
+		switch hv.Type {
+		case "null":
+			return nil, nil
+		case "integer":
+			if s, ok := hv.Value.(string); ok {
+				return strconv.ParseInt(s, 10, 64)
+			}
+			if f, ok := hv.Value.(float64); ok {
+				return int64(f), nil
+			}
+		case "float":
+			return hv.Value, nil
+		case "text":
+			return hv.Value, nil
+		case "blob":
+			if hv.Base64 != nil {
+				return base64.StdEncoding.DecodeString(*hv.Base64)
+			}
+			return []byte{}, nil
+		}
+		return nil, fmt.Errorf("unsupported arg %+v", hv)
+	}
+	encodeCell := func(v any) map[string]any {
+		switch x := v.(type) {
+		case nil:
+			return map[string]any{"type": "null"}
+		case int64:
+			return map[string]any{"type": "integer", "value": strconv.FormatInt(x, 10)}
+		case float64:
+			return map[string]any{"type": "float", "value": x}
+		case string:
+			return map[string]any{"type": "text", "value": x}
+		case []byte:
+			return map[string]any{"type": "blob", "base64": base64.StdEncoding.EncodeToString(x)}
+		default:
+			return map[string]any{"type": "text", "value": fmt.Sprint(x)}
+		}
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req hranaPipelineReq
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		results := make([]any, 0, len(req.Requests))
+		for _, rr := range req.Requests {
+			if rr.Type == "close" {
+				results = append(results, map[string]any{"type": "ok", "response": map[string]any{"type": "close"}})
+				continue
+			}
+			q := rr.Stmt.SQL
+			args := make([]any, len(rr.Stmt.Args))
+			for i, a := range rr.Stmt.Args {
+				v, err := decodeArg(a)
+				if err != nil {
+					results = append(results, map[string]any{"type": "error", "error": map[string]string{"message": err.Error()}})
+					continue
+				}
+				args[i] = v
+			}
+			mu.Lock()
+			queries = append(queries, q)
+			mu.Unlock()
+			if onQuery != nil {
+				if err := onQuery(q, args); err != nil {
+					results = append(results, map[string]any{"type": "error", "error": map[string]string{"message": err.Error()}})
+					continue
+				}
+			}
+			upper := strings.ToUpper(strings.TrimSpace(q))
+			if strings.HasPrefix(upper, "SELECT") || strings.HasPrefix(upper, "PRAGMA") {
+				rows, err := backing.Query(q, args...)
+				if err != nil {
+					results = append(results, map[string]any{"type": "error", "error": map[string]string{"message": err.Error()}})
+					continue
+				}
+				colNames, _ := rows.Columns()
+				cols := make([]map[string]string, len(colNames))
+				for i, c := range colNames {
+					cols[i] = map[string]string{"name": c}
+				}
+				var outRows [][]map[string]any
+				for rows.Next() {
+					vals := make([]any, len(colNames))
+					ptrs := make([]any, len(colNames))
+					for i := range vals {
+						ptrs[i] = &vals[i]
+					}
+					if err := rows.Scan(ptrs...); err != nil {
+						rows.Close()
+						results = append(results, map[string]any{"type": "error", "error": map[string]string{"message": err.Error()}})
+						continue
+					}
+					row := make([]map[string]any, len(colNames))
+					for i, v := range vals {
+						row[i] = encodeCell(v)
+					}
+					outRows = append(outRows, row)
+				}
+				rows.Close()
+				results = append(results, map[string]any{
+					"type": "ok",
+					"response": map[string]any{
+						"type":   "execute",
+						"result": map[string]any{"cols": cols, "rows": outRows},
+					},
+				})
+			} else {
+				res, err := backing.Exec(q, args...)
+				if err != nil {
+					results = append(results, map[string]any{"type": "error", "error": map[string]string{"message": err.Error()}})
+					continue
+				}
+				aff, _ := res.RowsAffected()
+				lid, _ := res.LastInsertId()
+				results = append(results, map[string]any{
+					"type": "ok",
+					"response": map[string]any{
+						"type": "execute",
+						"result": map[string]any{
+							"cols":               []any{},
+							"rows":               []any{},
+							"affected_row_count": aff,
+							"last_insert_rowid":  strconv.FormatInt(lid, 10),
+						},
+					},
+				})
+			}
+		}
+		writeHranaJSON(t, w, map[string]any{"baton": "", "results": results})
+	}))
+	t.Cleanup(srv.Close)
+	return openTestLibsql(t, srv.URL), &queries, &mu
+}
+
+// Pulling runs over Hrana pages key reads, omits f.text (rebuilding FTS locally
+// from raw), chunks by byte budget, and retries row-by-row on read errors.
+func TestSyncPullScalePagingRebuildFTSAndReadRetry(t *testing.T) {
+	oldPage := runKeyPageSize
+	oldBytes := runChunkBytes
+	runKeyPageSize = 2
+	runChunkBytes = 500
+	t.Cleanup(func() {
+		runKeyPageSize = oldPage
+		runChunkBytes = oldBytes
+	})
+
+	local, remoteBacking := syncDBs(t)
+	// Insert 4 runs on remote: run 1..2 fit in first byte-budget chunk (200+200<=500),
+	// run 3..4 in second chunk (200+200<=500). Poison run 2 so chunk 1 fails on read
+	// and falls back to per-row retry (saving run 1 while reporting run 2).
+	var badID int64
+	for i := range 4 {
+		out := fmt.Sprintf("\x1b[32mfinding-%d\x1b[0m\n", i+1)
+		z := gz([]byte(out))
+		r := sampleRun("nuclei", fmt.Sprintf("nuclei -t %d", i+1), out)
+		r.Ts = 1700001000 + float64(i)
+		r.Size = ni(200)
+		id, err := insertRun(remoteBacking, r, z, []byte("stale-remote-fts"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i == 1 {
+			badID = id
+		}
+	}
+
+	remote, queries, mu := startMockHranaSQLite(t, remoteBacking, func(q string, args []any) error {
+		if strings.Contains(q, "FROM runs WHERE id IN") {
+			for _, a := range args {
+				if id, ok := a.(int64); ok && id == badID {
+					return errors.New("response exceeds limit")
+				}
+			}
+		}
+		return nil
+	})
+
+	up, down, err := syncPair(bg, local, remote)
+	if err == nil || !strings.Contains(err.Error(), "response exceeds limit") {
+		t.Fatalf("err = %v, want read error reported for poisoned run", err)
+	}
+	if up.runs != 0 || down.runs != 3 {
+		t.Fatalf("runs up=%d down=%d, want 0 and 3 (runs 1, 3, 4 pulled despite run 2 read failure)", up.runs, down.runs)
+	}
+
+	// Verify FTS was rebuilt locally from raw (not copied from "stale-remote-fts").
+	for _, want := range []string{"finding-1", "finding-3", "finding-4"} {
+		if runs, err := queryRuns(local, want); err != nil || len(runs) != 1 {
+			t.Errorf("local FTS missing %q: %d (%v)", want, len(runs), err)
+		}
+	}
+	if runs, _ := queryRuns(local, "stale-remote-fts"); len(runs) != 0 {
+		t.Errorf("pull unexpectedly copied remote f.text instead of rebuilding locally")
+	}
+
+	// Inspect queries sent to remote: paged key reads, no outputs_fts on pull SELECTs,
+	// and multiple byte-budget chunks.
+	mu.Lock()
+	qs := append([]string(nil), (*queries)...)
+	mu.Unlock()
+	keyPages := 0
+	pullSelects := 0
+	for _, q := range qs {
+		if strings.Contains(q, "WHERE id > ? ORDER BY id LIMIT ?") {
+			keyPages++
+		}
+		if strings.Contains(q, "FROM runs") && strings.Contains(q, "WHERE id IN") {
+			pullSelects++
+			if strings.Contains(q, "outputs_fts") || strings.Contains(q, "f.text") {
+				t.Errorf("pull query selected f.text / outputs_fts: %s", q)
+			}
+		}
+	}
+	if keyPages < 2 {
+		t.Errorf("expected >= 2 paged run-key queries, got %d", keyPages)
+	}
+	// Chunk 1 (ids 1,2) fails -> retries id 1 and id 2 individually; chunk 2 (ids 3,4) succeeds -> 4 SELECTs total.
+	if pullSelects < 4 {
+		t.Errorf("expected >= 4 pull SELECT queries (2 byte-budget chunks + 2 retries), got %d", pullSelects)
 	}
 }

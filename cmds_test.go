@@ -429,3 +429,104 @@ func TestImportCmdQuotesFile(t *testing.T) {
 		t.Errorf("cmd = %q", r.Cmd)
 	}
 }
+
+// recall --json truncates note bodies to 600 runes unless --full is given.
+func TestRecallJSONTruncation(t *testing.T) {
+	path := testDB(t)
+	t.Setenv("IZ", path)
+
+	longBody := "truncneedle " + strings.Repeat("ş", 650)
+	shortBody := "shortneedle ok"
+	db, err := openDBAt(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := insertMemory(db, Memory{Namespace: "notes", Title: "long", Content: longBody}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := insertMemory(db, Memory{Namespace: "notes", Title: "short", Content: shortBody}); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	readNotes := func(args ...string) []Memory {
+		t.Helper()
+		out := captureStdout(t, func() {
+			if code := recallCmd(args); code != 0 {
+				t.Fatalf("recall %q exit=%d, want 0", args, code)
+			}
+		})
+		var res struct {
+			Memories []Memory `json:"memories"`
+		}
+		if err := json.Unmarshal([]byte(out), &res); err != nil {
+			t.Fatalf("unmarshal: %v\n%s", err, out)
+		}
+		return res.Memories
+	}
+
+	got := readNotes("--json", "truncneedle")
+	if len(got) != 1 {
+		t.Fatalf("got %d memories, want 1", len(got))
+	}
+	if len([]rune(got[0].Content)) != 600 || !strings.HasSuffix(got[0].Content, "…") {
+		t.Errorf("default --json content len=%d suffix=%q, want 600 runes ending in …",
+			len([]rune(got[0].Content)), got[0].Content[max(0, len(got[0].Content)-8):])
+	}
+
+	gotFull := readNotes("--json", "--full", "truncneedle")
+	if len(gotFull) != 1 || gotFull[0].Content != longBody {
+		t.Errorf("--json --full did not return full body (len=%d, want %d)", len(gotFull[0].Content), len(longBody))
+	}
+
+	gotShort := readNotes("--json", "shortneedle")
+	if len(gotShort) != 1 || gotShort[0].Content != shortBody {
+		t.Errorf("short note modified: %q", gotShort[0].Content)
+	}
+}
+
+// iz d reports missing tools with non-zero exit instead of printing "removed",
+// and iz a reports already-present tools instead of claiming "added".
+func TestToolsCmdRowsAffected(t *testing.T) {
+	path := testDB(t)
+	t.Setenv("IZ", path)
+
+	var code int
+	stderr := captureStderr(t, func() {
+		code = toolsCmd("del", []string{"does-not-exist"})
+	})
+	if code != 1 {
+		t.Errorf("del nonexistent exit=%d, want 1", code)
+	}
+	if strings.Contains(stderr, "removed") || !strings.Contains(stderr, "not in tools") {
+		t.Errorf("del nonexistent stderr = %q", stderr)
+	}
+
+	stderr = captureStderr(t, func() {
+		code = toolsCmd("add", []string{"nuclei"})
+	})
+	if code != 0 {
+		t.Errorf("add existing exit=%d, want 0", code)
+	}
+	if strings.Contains(stderr, "added.") || !strings.Contains(stderr, "already in tools") {
+		t.Errorf("add existing stderr = %q", stderr)
+	}
+
+	stderr = captureStderr(t, func() {
+		code = toolsCmd("add", []string{"brandnewtool"})
+	})
+	if code != 0 || !strings.Contains(stderr, "added.") {
+		t.Errorf("add new exit=%d stderr=%q", code, stderr)
+	}
+
+	// Mixed del: existing tool is removed, missing tool causes non-zero exit.
+	stderr = captureStderr(t, func() {
+		code = toolsCmd("del", []string{"brandnewtool", "still-missing"})
+	})
+	if code != 1 {
+		t.Errorf("mixed del exit=%d, want 1", code)
+	}
+	if !strings.Contains(stderr, "not in tools") || !strings.Contains(stderr, "removed.") {
+		t.Errorf("mixed del stderr = %q", stderr)
+	}
+}

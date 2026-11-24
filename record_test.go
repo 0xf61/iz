@@ -196,6 +196,45 @@ func TestRunRecordPipeModeSlowReader(t *testing.T) {
 	}
 }
 
+// Pipe mode must return after drainTimeout (~500ms) when a lingering grandchild
+// keeps stdout/stderr open after the child exits, without waiting for it.
+func TestRunRecordPipeModeLingeringGrandchild(t *testing.T) {
+	path := testDB(t)
+	t.Setenv("IZ", path)
+	t.Setenv("IZ_SHELL_CMD", "")
+	t.Setenv("IZ_PIPELINE_ID", "")
+
+	inR, inW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = inW.WriteString("\n")
+	_ = inW.Close()
+	oldStdin := os.Stdin
+	os.Stdin = inR
+	defer func() {
+		os.Stdin = oldStdin
+		_ = inR.Close()
+	}()
+
+	start := time.Now()
+	code := runRecord([]string{"sh", "-c", "sleep 4 & echo hi"})
+	elapsed := time.Since(start)
+	if code != 0 {
+		t.Fatalf("exit=%d, want 0", code)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("lingering grandchild stalled runRecord for %s, want ~%s", elapsed, drainTimeout)
+	}
+	r, out := lastRun(t, path)
+	if !r.ExitCode.Valid || r.ExitCode.Int64 != 0 {
+		t.Errorf("recorded exit = %+v, want 0", r.ExitCode)
+	}
+	if strings.TrimSpace(out) != "hi" {
+		t.Errorf("recorded output = %q, want %q", out, "hi")
+	}
+}
+
 // Pipe mode relays SIGTERM to the child once it has started (the forwarder
 // reads cmd.Process: -race catches a goroutine started before Start), and the
 // run is saved with the shell's 128+N status.
@@ -396,6 +435,55 @@ func TestRecordPipelineBothOutputs(t *testing.T) {
 	}
 	if !strings.Contains(out, "b.de2.in") || !strings.Contains(out, "https://a.de2.in") {
 		t.Errorf("missing stage outputs:\n%s", out)
+	}
+	var stageRows int
+	if err := db.QueryRow(`SELECT count(*) FROM pipeline_stages WHERE pgid=1234 AND pid_key='p-1'`).Scan(&stageRows); err != nil {
+		t.Fatal(err)
+	}
+	if stageRows != 0 {
+		t.Errorf("pipeline_stages rows after completion = %d, want 0", stageRows)
+	}
+}
+
+func TestRecordPipelineStageCleanupPreservesIncomplete(t *testing.T) {
+	path := testDB(t)
+	db, err := openDBAt(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// Stage 1 of 2 arrives: row must remain with pending=1.
+	_, _, _, _, _, err = recordPipelineStage(db, PipelineStage{
+		PGID: 9001, PidKey: "p-inc", StagePos: 0, Ts: 300.0, EndTs: 301.0,
+		Tool: "subfinder", Cmd: "subfinder -d a", ShellCmd: "subfinder -d a | httpx",
+		Cwd: "/tmp", Hostname: "h", ExitCode: 0, Raw: []byte("a\n"),
+	}, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pendingCount int
+	if err := db.QueryRow(`SELECT count(*) FROM pipeline_stages WHERE pgid=9001 AND pid_key='p-inc' AND pending=1`).Scan(&pendingCount); err != nil {
+		t.Fatal(err)
+	}
+	if pendingCount != 1 {
+		t.Fatalf("incomplete group stage rows = %d, want 1", pendingCount)
+	}
+
+	// Completing a different group cleans up only that group.
+	_, _, _, _, _, err = recordPipelineStage(db, PipelineStage{
+		PGID: 9002, PidKey: "p-done", StagePos: 0, Ts: 300.0, EndTs: 301.0,
+		Tool: "subfinder", Cmd: "subfinder -d b", ShellCmd: "subfinder -d b | grep x",
+		Cwd: "/tmp", Hostname: "h", ExitCode: 0, Raw: []byte("b\n"),
+	}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doneCount, stillPending int
+	db.QueryRow(`SELECT count(*) FROM pipeline_stages WHERE pgid=9002 AND pid_key='p-done'`).Scan(&doneCount)      //nolint
+	db.QueryRow(`SELECT count(*) FROM pipeline_stages WHERE pgid=9001 AND pid_key='p-inc'`).Scan(&stillPending) //nolint
+	if doneCount != 0 || stillPending != 1 {
+		t.Errorf("doneCount=%d stillPending=%d, want 0 and 1", doneCount, stillPending)
 	}
 }
 

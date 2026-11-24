@@ -342,7 +342,11 @@ func copyTombstones(ctx context.Context, src, dst *sql.DB) (map[string]bool, int
 	return have, len(fresh) / 2, nil
 }
 
-const runChunk = 32 // rows per round trip; outputs can be large
+var (
+	runKeyPageSize       = 5000    // key rows per page when scanning runs
+	runChunk             = 32      // max rows per round trip; outputs can be large
+	runChunkBytes  int64 = 4 << 20 // compressed raw byte budget per chunk
+)
 
 // Runs have no uid: they match across machines on (hostname, tool, cmd) and
 // a start time within sameTime. A remote may hand a float back a digit short
@@ -401,22 +405,34 @@ func (t runTombs) has(x Run) bool {
 		t.near.has(Run{Hostname: x.Hostname, Cmd: x.Tool + ":" + x.Cmd, Ts: x.Ts})
 }
 
-// readRuns reads db's run identities: the live runs (ID and key fields) and
-// the ids of runs a tombstone deletes.
+// readRuns reads db's run identities in id-ordered pages: the live runs
+// (ID, key fields, and compressed size) and the ids of runs a tombstone deletes.
 func readRuns(ctx context.Context, db *sql.DB, dead runTombs) (live []Run, deadIDs []any, err error) {
-	err = each(ctx, db, `SELECT id,hostname,ts,tool,cmd FROM runs`, func(r *sql.Rows) error {
-		var x Run
-		if err := r.Scan(&x.ID, &x.Hostname, &x.Ts, &x.Tool, &x.Cmd); err != nil {
-			return err
+	var afterID int64
+	for {
+		n := 0
+		err = each(ctx, db, `SELECT id,hostname,ts,tool,cmd,size FROM runs WHERE id > ? ORDER BY id LIMIT ?`, func(r *sql.Rows) error {
+			var x Run
+			if err := r.Scan(&x.ID, &x.Hostname, &x.Ts, &x.Tool, &x.Cmd, &x.Size); err != nil {
+				return err
+			}
+			afterID = x.ID
+			n++
+			if dead.has(x) {
+				deadIDs = append(deadIDs, x.ID)
+			} else {
+				live = append(live, x)
+			}
+			return nil
+		}, afterID, runKeyPageSize)
+		if err != nil {
+			return nil, nil, err
 		}
-		if dead.has(x) {
-			deadIDs = append(deadIDs, x.ID)
-		} else {
-			live = append(live, x)
+		if n < runKeyPageSize {
+			break
 		}
-		return nil
-	})
-	return live, deadIDs, err
+	}
+	return live, deadIDs, nil
 }
 
 // excludePendingRuns filters out local runs that belong to an active in-flight
@@ -444,8 +460,8 @@ func excludePendingRuns(ctx context.Context, db *sql.DB, runs []Run) []Run {
 	return out
 }
 
-// missingRuns returns the ids of runs that have lacks, each key once.
-func missingRuns(runs, have []Run) (ids []any) {
+// missingRuns returns the runs that have lacks, each key once.
+func missingRuns(runs, have []Run) (missing []Run) {
 	set := runSet{}
 	for _, x := range have {
 		set.add(x)
@@ -453,10 +469,39 @@ func missingRuns(runs, have []Run) (ids []any) {
 	for _, x := range runs {
 		if !set.has(x) {
 			set.add(x)
-			ids = append(ids, x.ID)
+			missing = append(missing, x)
 		}
 	}
-	return ids
+	return missing
+}
+
+// chunkRunsBySize groups runs into chunks of at most maxRows rows and at most
+// maxBytes total compressed size (a single run larger than maxBytes gets its
+// own 1-row chunk).
+func chunkRunsBySize(runs []Run, maxRows int, maxBytes int64) [][]Run {
+	if len(runs) == 0 {
+		return nil
+	}
+	if maxRows <= 0 {
+		maxRows = 1
+	}
+	var out [][]Run
+	var cur []Run
+	var curBytes int64
+	for _, r := range runs {
+		sz := max(int64(0), r.Size.Int64)
+		if len(cur) > 0 && (len(cur) >= maxRows || (maxBytes > 0 && curBytes+sz > maxBytes)) {
+			out = append(out, cur)
+			cur = nil
+			curBytes = 0
+		}
+		cur = append(cur, r)
+		curBytes += sz
+	}
+	if len(cur) > 0 {
+		out = append(out, cur)
+	}
+	return out
 }
 
 // syncRunsBidirectional reads run keys once from local and remote, purges
@@ -480,36 +525,90 @@ func syncRunsBidirectional(ctx context.Context, local, remote *sql.DB, tomb map[
 
 	// Both directions run even if one fails: a run the remote rejects must
 	// not keep the other machines' runs from arriving.
-	pushed, pushErr := transferRuns(ctx, local, remote, missingRuns(localRuns, remoteRuns))
-	pulled, pullErr := transferRuns(ctx, remote, local, missingRuns(remoteRuns, localRuns))
+	pushed, pushErr := transferRuns(ctx, local, remote, missingRuns(localRuns, remoteRuns), false)
+	pulled, pullErr := transferRuns(ctx, remote, local, missingRuns(remoteRuns, localRuns), true)
 	return pushed, pulled, errors.Join(purgeErr, pushErr, pullErr)
 }
 
-// transferRuns copies runs by id from src to dst in chunks. A chunk the
-// destination rejects (e.g. a request too large for the remote) is retried
-// row by row, so one oversized output does not block the others.
-func transferRuns(ctx context.Context, src, dst *sql.DB, ids []any) (int, error) {
-	added := 0
-	var failed []error
-	for c := range chunks(ids, runChunk) {
-		var rows, fts [][]any
-		err := each(ctx, src, `SELECT r.ts,r.hostname,r.tool,r.cmd,r.cwd,r.exit_code,r.duration_ms,r.size,r.raw,f.text
-		     FROM runs r LEFT JOIN outputs_fts f ON f.rowid = r.id WHERE r.id IN `+inList(len(c)), func(q *sql.Rows) error {
+// readRunChunk fetches full run rows for ids from src. When rebuildFTS is true
+// (pulling from a remote), outputs_fts is not queried over the wire and the
+// search text is rebuilt locally from the compressed output.
+func readRunChunk(ctx context.Context, src *sql.DB, ids []any, rebuildFTS bool) (rows, fts [][]any, err error) {
+	if rebuildFTS {
+		err = each(ctx, src, `SELECT ts,hostname,tool,cmd,cwd,exit_code,duration_ms,size,raw
+		     FROM runs WHERE id IN `+inList(len(ids)), func(q *sql.Rows) error {
 			var x Run
 			var raw []byte
-			var text sql.NullString
-			if err := q.Scan(&x.Ts, &x.Hostname, &x.Tool, &x.Cmd, &x.Cwd, &x.ExitCode, &x.Dur, &x.Size, &raw, &text); err != nil {
+			if err := q.Scan(&x.Ts, &x.Hostname, &x.Tool, &x.Cmd, &x.Cwd, &x.ExitCode, &x.Dur, &x.Size, &raw); err != nil {
 				return err
 			}
-			if !text.Valid { // index row missing on src: rebuild it
-				text.String = ftsPrefix(x) + string(truncFTS(stripANSI(tidyRaw(ungz(raw)))))
-			}
+			text := ftsPrefix(x) + string(truncFTS(stripANSI(tidyRaw(ungz(raw)))))
 			rows = append(rows, []any{x.Ts, x.Hostname, x.Tool, x.Cmd, x.Cwd, x.ExitCode, x.Dur, x.Size, raw})
-			fts = append(fts, []any{text.String})
+			fts = append(fts, []any{text})
 			return nil
-		}, c...)
+		}, ids...)
+		return rows, fts, err
+	}
+	err = each(ctx, src, `SELECT r.ts,r.hostname,r.tool,r.cmd,r.cwd,r.exit_code,r.duration_ms,r.size,r.raw,f.text
+	     FROM runs r LEFT JOIN outputs_fts f ON f.rowid = r.id WHERE r.id IN `+inList(len(ids)), func(q *sql.Rows) error {
+		var x Run
+		var raw []byte
+		var text sql.NullString
+		if err := q.Scan(&x.Ts, &x.Hostname, &x.Tool, &x.Cmd, &x.Cwd, &x.ExitCode, &x.Dur, &x.Size, &raw, &text); err != nil {
+			return err
+		}
+		if !text.Valid { // index row missing on src: rebuild it
+			text.String = ftsPrefix(x) + string(truncFTS(stripANSI(tidyRaw(ungz(raw)))))
+		}
+		rows = append(rows, []any{x.Ts, x.Hostname, x.Tool, x.Cmd, x.Cwd, x.ExitCode, x.Dur, x.Size, raw})
+		fts = append(fts, []any{text.String})
+		return nil
+	}, ids...)
+	return rows, fts, err
+}
+
+// transferRuns copies runs from src to dst in size- and count-bounded chunks.
+// A chunk that fails to read or write (e.g. an oversized response or request)
+// is retried row by row, so one oversized output does not block the others.
+func transferRuns(ctx context.Context, src, dst *sql.DB, runs []Run, rebuildFTS bool) (int, error) {
+	added := 0
+	var failed []error
+	for _, c := range chunkRunsBySize(runs, runChunk, runChunkBytes) {
+		if ctx.Err() != nil {
+			return added, ctx.Err()
+		}
+		ids := make([]any, len(c))
+		for i, r := range c {
+			ids[i] = r.ID
+		}
+		rows, fts, err := readRunChunk(ctx, src, ids, rebuildFTS)
 		if err != nil {
-			return added, err
+			if ctx.Err() != nil {
+				return added, ctx.Err()
+			}
+			if len(ids) == 1 {
+				failed = append(failed, err)
+				continue
+			}
+			rows, fts = nil, nil
+			for _, id := range ids {
+				if ctx.Err() != nil {
+					return added, ctx.Err()
+				}
+				r1, f1, rerr := readRunChunk(ctx, src, []any{id}, rebuildFTS)
+				if rerr != nil {
+					if ctx.Err() != nil {
+						return added, ctx.Err()
+					}
+					failed = append(failed, rerr)
+					continue
+				}
+				rows = append(rows, r1...)
+				fts = append(fts, f1...)
+			}
+			if len(rows) == 0 {
+				continue
+			}
 		}
 		insert := func(rows, fts [][]any) error {
 			return insertBatch(ctx, dst, "runs", "ts,hostname,tool,cmd,cwd,exit_code,duration_ms,size,raw",
@@ -553,7 +652,7 @@ func copyRuns(ctx context.Context, src, dst *sql.DB, tomb map[string]bool) (adde
 		return 0, 0, err
 	}
 	want := missingRuns(runs, have)
-	added, err = transferRuns(ctx, src, dst, want)
+	added, err = transferRuns(ctx, src, dst, want, false)
 	return added, len(srcDead) + len(runs) - len(want), err
 }
 

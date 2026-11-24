@@ -21,7 +21,6 @@ import (
 const (
 	hranaMaxRespBytes   = 64 << 20
 	hranaMaxErrBody     = 512
-	hranaRequestTimeout = 60 * time.Second
 	hranaCleanupTimeout = 5 * time.Second
 )
 
@@ -71,7 +70,6 @@ func (d *hranaDriver) Open(dsn string) (driver.Conn, error) {
 		endpoint:     endpoint,
 		token:        token,
 		client: &http.Client{
-			Timeout: hranaRequestTimeout,
 			CheckRedirect: func(*http.Request, []*http.Request) error {
 				return http.ErrUseLastResponse
 			},

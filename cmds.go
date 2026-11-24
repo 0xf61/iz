@@ -35,30 +35,51 @@ func toolsCmd(sub string, args []string) int {
 
 	switch sub {
 	case "add":
-		added := 0
+		added, already := 0, 0
 		for _, t := range args {
 			if !wrappable(t) {
 				fmt.Fprintf(os.Stderr, "[iz] %q cannot be wrapped safely (not a plain command name, or a shell builtin/keyword)\n", t)
 				continue
 			}
-			if _, err := db.Exec(`INSERT OR IGNORE INTO tools(name) VALUES(?)`, t); err != nil {
+			res, err := db.Exec(`INSERT OR IGNORE INTO tools(name) VALUES(?)`, t)
+			if err != nil {
 				fmt.Fprintln(os.Stderr, "iz:", err)
 				return 1
+			}
+			if n, _ := res.RowsAffected(); n == 0 {
+				fmt.Fprintf(os.Stderr, "[iz] %q is already in tools\n", t)
+				already++
+				continue
 			}
 			added++
 		}
-		if added == 0 {
+		if added > 0 {
+			fmt.Fprintln(os.Stderr, "[iz] added. Refresh wrappers by restarting your shell or re-sourcing 'iz init <shell>'")
+		}
+		if added == 0 && already == 0 {
 			return 1
 		}
-		fmt.Fprintln(os.Stderr, "[iz] added. Refresh wrappers by restarting your shell or re-sourcing 'iz init <shell>'")
 	case "del":
+		removed, missing := 0, 0
 		for _, t := range args {
-			if _, err := db.Exec(`DELETE FROM tools WHERE name=?`, t); err != nil {
+			res, err := db.Exec(`DELETE FROM tools WHERE name=?`, t)
+			if err != nil {
 				fmt.Fprintln(os.Stderr, "iz:", err)
 				return 1
 			}
+			if n, _ := res.RowsAffected(); n == 0 {
+				fmt.Fprintf(os.Stderr, "[iz] %q is not in tools\n", t)
+				missing++
+				continue
+			}
+			removed++
 		}
-		fmt.Fprintln(os.Stderr, "[iz] removed. Refresh wrappers by restarting your shell.")
+		if removed > 0 {
+			fmt.Fprintln(os.Stderr, "[iz] removed. Refresh wrappers by restarting your shell.")
+		}
+		if missing > 0 {
+			return 1
+		}
 	case "list":
 		fmt.Println("# tools:")
 		for _, n := range queryNames(db, "tools") {

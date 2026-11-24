@@ -56,15 +56,12 @@ func openDBAt(p string) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := ensureSchema(bg, db); err != nil {
+	migrated, err := initSchema(bg, db, true)
+	if err != nil {
 		db.Close()
 		return nil, err
 	}
-	if err := ensureLocalTables(bg, db); err != nil {
-		db.Close()
-		return nil, err
-	}
-	if p != ":memory:" && !strings.HasPrefix(p, "file:") {
+	if migrated && p != ":memory:" && !strings.HasPrefix(p, "file:") {
 		_ = os.Chmod(p, 0o600)
 		_ = os.Chmod(p+"-wal", 0o600)
 		_ = os.Chmod(p+"-shm", 0o600)
@@ -168,7 +165,10 @@ const (
 	uidCol      = `coalesce(uid, ` + legacyUID + `)`
 )
 
-const schemaVersion = 5 // 5: memories_ns dropped (memories_ns_title covers it)
+const (
+	sharedSchemaVersion = 5
+	localSchemaVersion  = 6 // 6: local pipeline_stages setup gated by user_version
+)
 
 // ensureLocalTables creates local-only coordination tables (never created on
 // sync remotes).
@@ -201,35 +201,54 @@ func ensureLocalTables(ctx context.Context, db dbtx) error {
 	return nil
 }
 
-// ensureSchema creates/migrates the schema, skipped once PRAGMA user_version
-// says it is current. That holds for a sync remote too: rows older clients
-// still write to it are handled by sync itself (tombKey, uidCol, fixMemFTS).
+// ensureSchema creates/migrates the shared schema, skipped once PRAGMA
+// user_version says it is current. That holds for a sync remote too: rows older
+// clients still write to it are handled by sync itself (tombKey, uidCol, fixMemFTS).
 func ensureSchema(ctx context.Context, db dbtx) error {
+	_, err := initSchema(ctx, db, false)
+	return err
+}
+
+// initSchema runs schema setup/migration behind PRAGMA user_version and reports
+// whether migration ran. When local is true, local-only tables are set up before
+// bumping user_version.
+func initSchema(ctx context.Context, db dbtx, local bool) (bool, error) {
+	target := sharedSchemaVersion
+	if local {
+		target = localSchemaVersion
+	}
 	var v int
-	if db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&v) == nil && v >= schemaVersion {
-		return nil
+	if db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&v) == nil && v >= target {
+		return false, nil
 	}
-	for _, s := range schema {
-		if _, err := db.ExecContext(ctx, s); err != nil && !strings.Contains(err.Error(), "duplicate column") {
-			return err
+	if v < sharedSchemaVersion {
+		for _, s := range schema {
+			if _, err := db.ExecContext(ctx, s); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+				return false, err
+			}
+		}
+		if err := fixLegacyTombs(ctx, db); err != nil {
+			return false, err
+		}
+		if err := dedupMemories(ctx, db); err != nil {
+			return false, err
+		}
+		for _, s := range []string{
+			`CREATE UNIQUE INDEX IF NOT EXISTS memories_ns_title ON memories(namespace, title)`,
+			`DROP INDEX IF EXISTS memories_ns`, // redundant with the unique index
+		} {
+			if _, err := db.ExecContext(ctx, s); err != nil {
+				return false, err
+			}
 		}
 	}
-	if err := fixLegacyTombs(ctx, db); err != nil {
-		return err
-	}
-	if err := dedupMemories(ctx, db); err != nil {
-		return err
-	}
-	for _, s := range []string{
-		`CREATE UNIQUE INDEX IF NOT EXISTS memories_ns_title ON memories(namespace, title)`,
-		`DROP INDEX IF EXISTS memories_ns`, // redundant with the unique index
-	} {
-		if _, err := db.ExecContext(ctx, s); err != nil {
-			return err
+	if local {
+		if err := ensureLocalTables(ctx, db); err != nil {
+			return false, err
 		}
 	}
-	db.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version=%d`, schemaVersion)) //nolint — optional on remotes
-	return nil
+	db.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version=%d`, target)) //nolint — optional on remotes
+	return true, nil
 }
 
 // fixLegacyTombs rewrites pre-v4 tombstone keys (NUL-delimited, which
@@ -485,8 +504,14 @@ func recordPipelineStage(db *sql.DB, st PipelineStage, expectedStages int) (runI
 		runID = id
 	}
 
-	if _, err := tx.Exec(`UPDATE pipeline_stages SET run_id=?, pending=? WHERE pgid=? AND pid_key=?`, runID, pending, st.PGID, st.PidKey); err != nil {
-		return 0, 0, st.ExitCode, 0, stageCount, err
+	if expectedStages > 0 && stageCount >= expectedStages {
+		if _, err := tx.Exec(`DELETE FROM pipeline_stages WHERE pgid=? AND pid_key=?`, st.PGID, st.PidKey); err != nil {
+			return 0, 0, st.ExitCode, 0, stageCount, err
+		}
+	} else {
+		if _, err := tx.Exec(`UPDATE pipeline_stages SET run_id=?, pending=? WHERE pgid=? AND pid_key=?`, runID, pending, st.PGID, st.PidKey); err != nil {
+			return 0, 0, st.ExitCode, 0, stageCount, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, 0, st.ExitCode, 0, stageCount, err

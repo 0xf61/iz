@@ -1129,7 +1129,13 @@ func recallCmd(args []string) int {
 		}
 	}
 
+	const recallNoteLimit = 600
 	if jsonOutput {
+		if !full {
+			for i := range memories {
+				memories[i].Content = trunc(memories[i].Content, recallNoteLimit)
+			}
+		}
 		type runJSON struct {
 			ID    int64  `json:"id"`
 			Date  string `json:"date"`
@@ -1190,7 +1196,7 @@ func recallCmd(args []string) int {
 		if full {
 			fmt.Println(body)
 		} else {
-			preview := trunc(body, 600)
+			preview := trunc(body, recallNoteLimit)
 			fmt.Println(preview)
 			if preview != body {
 				if useColor {

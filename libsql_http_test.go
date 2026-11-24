@@ -855,3 +855,16 @@ func TestHranaBadConnDiscardedAfterFailedRollback(t *testing.T) {
 		t.Error("expected discarded connection Close() to send close request for leaked baton")
 	}
 }
+
+func TestHranaClientReliesOnContextNotFixedTimeout(t *testing.T) {
+	d := &hranaDriver{}
+	c, err := d.Open("http://127.0.0.1:8080")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer c.Close()
+	hc := c.(*hranaConn)
+	if hc.client.Timeout != 0 {
+		t.Errorf("http.Client.Timeout = %v, want 0 (rely on request context)", hc.client.Timeout)
+	}
+}

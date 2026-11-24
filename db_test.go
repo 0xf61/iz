@@ -522,3 +522,83 @@ func TestDefaultToolsSeeded(t *testing.T) {
 		t.Errorf("tools = %q", got)
 	}
 }
+
+// Local table setup and chmod run only when migrating behind PRAGMA user_version.
+func TestOpenDBAtSchemaVersionGate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "iz.db")
+	db, err := openDBAt(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ver int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&ver); err != nil || ver != localSchemaVersion {
+		t.Fatalf("user_version = %d (%v), want %d", ver, err, localSchemaVersion)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o600 {
+		t.Errorf("initial db perm = %04o, want 0600", perm)
+	}
+
+	// Drop pipeline_stages and relax permissions while keeping user_version current:
+	// reopening must skip both ensureLocalTables and chmod.
+	if _, err := db.Exec(`DROP TABLE pipeline_stages`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = openDBAt(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tbl int
+	db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='pipeline_stages'`).Scan(&tbl) //nolint
+	if tbl != 0 {
+		t.Errorf("pipeline_stages recreated despite current user_version=%d", localSchemaVersion)
+	}
+	if fi, err := os.Stat(path); err != nil || fi.Mode().Perm() != 0o644 {
+		t.Errorf("chmod ran despite current user_version: perm=%04o err=%v", fi.Mode().Perm(), err)
+	}
+
+	// Downgrade user_version to 5: reopening must migrate, recreate pipeline_stages, and chmod 0600.
+	if _, err := db.Exec(`PRAGMA user_version=5`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	db, err = openDBAt(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='pipeline_stages'`).Scan(&tbl) //nolint
+	if tbl != 1 {
+		t.Errorf("pipeline_stages not created on v5->v%d migration", localSchemaVersion)
+	}
+	if fi, err := os.Stat(path); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Errorf("perm after migration = %04o (%v), want 0600", fi.Mode().Perm(), err)
+	}
+}
+
+func TestGetRunCmd(t *testing.T) {
+	path := testDB(t)
+	id := mustInsert(t, path, sampleRun("nmap", "nmap -sV 10.0.0.1", "80/tcp open"), "80/tcp open")
+	db, err := openDBAt(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	got, err := getRunCmd(db, id)
+	if err != nil || got != "nmap -sV 10.0.0.1" {
+		t.Errorf("getRunCmd(%d) = %q, %v; want nmap -sV 10.0.0.1", id, got, err)
+	}
+	if _, err := getRunCmd(db, id+999); err == nil {
+		t.Error("expected error for missing run id")
+	}
+}
