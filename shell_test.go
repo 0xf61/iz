@@ -221,3 +221,74 @@ func TestPatchManagedBlockBlankFile(t *testing.T) {
 		t.Errorf("file = %q", data)
 	}
 }
+
+// End-to-end zsh pipeline integration: two wrapped tools in a pipeline
+// ("subfinder -d de2.in | httpx -silent") produce a single runs row and a
+// single "[iz] #... saved" banner on stderr.
+func TestShellPipelineIntegration(t *testing.T) {
+	zsh, err := exec.LookPath("zsh")
+	if err != nil {
+		t.Skip("zsh not installed")
+	}
+	dir := t.TempDir()
+	binDir := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	izBin := filepath.Join(binDir, "iz")
+	if out, err := exec.Command("go", "build", "-o", izBin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, out)
+	}
+	// Stub wrapped binaries subfinder and httpx
+	if err := os.WriteFile(filepath.Join(binDir, "subfinder"), []byte("#!/bin/sh\necho a.de2.in\necho b.de2.in\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(binDir, "httpx"), []byte("#!/bin/sh\ngrep '^a\\.'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	dbPath := testDB(t)
+	db, err := openDBAt(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, err := shellEnv("zsh", db)
+	db.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	initFile := filepath.Join(dir, "iz.zsh")
+	if err := os.WriteFile(initFile, []byte(code), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	script := `
+source "$1"
+__iz_preexec "subfinder -d de2.in | httpx -silent"
+subfinder -d de2.in | httpx -silent
+__iz_precmd
+`
+	cmd := exec.Command(zsh, "-f", "-c", script, "zsh", initFile)
+	cmd.Env = []string{
+		"PATH=" + binDir + ":" + os.Getenv("PATH"),
+		"HOME=" + dir,
+		"IZ=" + dbPath,
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("zsh pipeline failed: %v\n%s", err, out)
+	}
+	if cnt := strings.Count(string(out), "[iz] #"); cnt != 1 {
+		t.Errorf("expected 1 [iz] saved line, got %d:\n%s", cnt, out)
+	}
+	if n := countRuns(t, dbPath); n != 1 {
+		t.Fatalf("expected 1 run in db, got %d", n)
+	}
+	r, recorded := lastRun(t, dbPath)
+	if r.Cmd != "subfinder -d de2.in | httpx -silent" {
+		t.Errorf("cmd = %q", r.Cmd)
+	}
+	if !strings.Contains(recorded, "b.de2.in") || !strings.Contains(recorded, "a.de2.in") {
+		t.Errorf("recorded output missing expected content:\n%s", recorded)
+	}
+}

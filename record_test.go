@@ -286,3 +286,101 @@ func TestPTYEnv(t *testing.T) {
 		t.Error("ptyEnv(ls) lacks CLICOLOR_FORCE=1")
 	}
 }
+
+func TestRecordPipelineBothOutputs(t *testing.T) {
+	path := testDB(t)
+	db, err := openDBAt(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	id1, _, _, _, err := recordPipelineStage(db, PipelineStage{
+		PGID: 1234, PidKey: "p-1", StagePos: 0, Ts: 100.0, EndTs: 106.0,
+		Tool: "subfinder", Cmd: "subfinder -d de2.in", ShellCmd: "subfinder -d de2.in | httpx -silent",
+		Cwd: "/tmp", Hostname: "h", ExitCode: 0, Raw: []byte("a.de2.in\nb.de2.in\n"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id2, _, exit, dur, err := recordPipelineStage(db, PipelineStage{
+		PGID: 1234, PidKey: "p-1", StagePos: 2, Ts: 100.0, EndTs: 110.0,
+		Tool: "httpx", Cmd: "httpx -silent", ShellCmd: "subfinder -d de2.in | httpx -silent",
+		Cwd: "/tmp", Hostname: "h", ExitCode: 0, Raw: []byte("https://a.de2.in\n"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id1 != id2 {
+		t.Fatalf("expected same run id, got %d and %d", id1, id2)
+	}
+	if n := countRuns(t, path); n != 1 {
+		t.Fatalf("runs count = %d, want 1", n)
+	}
+	if exit != 0 || dur != 10*time.Second {
+		t.Errorf("exit=%d dur=%v, want 0 and 10s", exit, dur)
+	}
+	r, out := lastRun(t, path)
+	if r.Cmd != "subfinder -d de2.in | httpx -silent" || r.Tool != "subfinder" {
+		t.Errorf("run = %+v", r)
+	}
+	if !strings.Contains(out, "[1/2] subfinder -d de2.in") || !strings.Contains(out, "[2/2] httpx -silent") {
+		t.Errorf("expected both stage sections in output:\n%s", out)
+	}
+	if !strings.Contains(out, "b.de2.in") || !strings.Contains(out, "https://a.de2.in") {
+		t.Errorf("missing stage outputs:\n%s", out)
+	}
+}
+
+func TestRecordPipelineEmptyDownstream(t *testing.T) {
+	path := testDB(t)
+	db, err := openDBAt(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	_, _, _, _, err = recordPipelineStage(db, PipelineStage{
+		PGID: 5678, PidKey: "p-2", StagePos: 0, Ts: 200.0, EndTs: 206.0,
+		Tool: "subfinder", Cmd: "subfinder -d de2.in", ShellCmd: "subfinder -d de2.in | httpx -silent",
+		Cwd: "/tmp", Hostname: "h", ExitCode: 0, Raw: []byte("a.de2.in\nb.de2.in\n"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, _, err = recordPipelineStage(db, PipelineStage{
+		PGID: 5678, PidKey: "p-2", StagePos: 2, Ts: 200.0, EndTs: 210.0,
+		Tool: "httpx", Cmd: "httpx -silent", ShellCmd: "subfinder -d de2.in | httpx -silent",
+		Cwd: "/tmp", Hostname: "h", ExitCode: 0, Raw: nil,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := countRuns(t, path); n != 1 {
+		t.Fatalf("runs count = %d, want 1", n)
+	}
+	r, out := lastRun(t, path)
+	if r.Cmd != "subfinder -d de2.in | httpx -silent" {
+		t.Errorf("cmd = %q", r.Cmd)
+	}
+	if out != "a.de2.in\nb.de2.in\n" {
+		t.Errorf("expected upstream output directly without empty downstream noise, got %q", out)
+	}
+}
+
+func TestPipelineHelpers(t *testing.T) {
+	tools := []string{"subfinder", "httpx"}
+	if !hasDownstreamWrappedTool("subfinder -d de2.in | httpx -silent", "subfinder", tools) {
+		t.Error("expected subfinder to see downstream httpx")
+	}
+	if hasDownstreamWrappedTool("subfinder -d de2.in | httpx -silent", "httpx", tools) {
+		t.Error("httpx should not see downstream wrapped tool")
+	}
+	if hasDownstreamWrappedTool("subfinder -d de2.in | grep api", "subfinder", tools) {
+		t.Error("grep is unwrapped, should return false")
+	}
+	got := extractPipelineCmd("cd /tmp && subfinder -d de2.in | httpx -silent", []PipelineStage{{Tool: "subfinder"}, {Tool: "httpx"}})
+	if got != "subfinder -d de2.in | httpx -silent" {
+		t.Errorf("extractPipelineCmd = %q", got)
+	}
+}

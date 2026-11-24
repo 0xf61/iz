@@ -233,15 +233,64 @@ func runPipeRecord(db *sql.DB, args []string) int {
 // saveRun stores a finished run and reports it on stderr; it returns exit.
 func saveRun(db *sql.DB, args []string, start time.Time, out []byte, exit int) int {
 	raw := tidyRaw(out)
+	tool := filepath.Base(args[0])
+	cmdStr := joinArgs(args)
+	host := hostname()
+	workDir := cwd()
+	now := time.Now()
+	dur := now.Sub(start)
+
+	inPipe := !term.IsTerminal(int(os.Stdin.Fd()))
+	outPipe := !term.IsTerminal(int(os.Stdout.Fd()))
+	shellCmd := os.Getenv("IZ_SHELL_CMD")
+	pidKey := os.Getenv("IZ_PIPELINE_ID")
+
+	if (inPipe || outPipe) && (pidKey != "" || strings.Contains(shellCmd, "|")) {
+		stagePos := 3
+		switch {
+		case !inPipe && outPipe:
+			stagePos = 0
+		case inPipe && outPipe:
+			stagePos = 1
+		case inPipe && !outPipe:
+			stagePos = 2
+		}
+		st := PipelineStage{
+			PGID:     unix.Getpgrp(),
+			PidKey:   pidKey,
+			StagePos: stagePos,
+			Ts:       unixTime(start),
+			EndTs:    unixTime(now),
+			Tool:     tool,
+			Cmd:      cmdStr,
+			ShellCmd: shellCmd,
+			Cwd:      workDir,
+			Hostname: host,
+			ExitCode: exit,
+			Raw:      raw,
+		}
+		id, finalSize, finalExit, finalDur, err := recordPipelineStage(db, st)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[iz] RECORD FAILED: %v\n", err)
+			return exit
+		}
+		if outPipe && shellCmd != "" && hasDownstreamWrappedTool(shellCmd, tool, queryNames(db, "tools")) {
+			return exit
+		}
+		fmt.Fprintf(os.Stderr, "[iz] #%d saved · exit=%d · %.1fs · %s\n",
+			id, finalExit, finalDur.Seconds(), humanBytes(finalSize))
+		return exit
+	}
+
 	z := gz(raw)
 	r := Run{
 		Ts:       unixTime(start),
-		Hostname: hostname(),
-		Tool:     filepath.Base(args[0]),
-		Cmd:      joinArgs(args),
-		Cwd:      cwd(),
+		Hostname: host,
+		Tool:     tool,
+		Cmd:      cmdStr,
+		Cwd:      workDir,
 		ExitCode: ni(int64(exit)),
-		Dur:      ni(int64(time.Since(start) / time.Millisecond)),
+		Dur:      ni(int64(dur / time.Millisecond)),
 		Size:     ni(int64(len(z))),
 	}
 	id, err := insertRun(db, r, z, truncFTS(stripANSI(raw)))
@@ -250,7 +299,7 @@ func saveRun(db *sql.DB, args []string, start time.Time, out []byte, exit int) i
 		return exit
 	}
 	fmt.Fprintf(os.Stderr, "[iz] #%d saved · exit=%d · %.1fs · %s\n",
-		id, exit, time.Since(start).Seconds(), humanBytes(r.Size.Int64))
+		id, exit, dur.Seconds(), humanBytes(r.Size.Int64))
 	return exit
 }
 

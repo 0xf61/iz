@@ -68,6 +68,15 @@ if status is-interactive
     bind -M insert  $__iz_notes_key __iz_notes_widget
 end
 
+function __iz_preexec --on-event fish_preexec
+    set -gx IZ_SHELL_CMD $argv[1]
+    set -gx IZ_PIPELINE_ID "$fish_pid-"(random)
+end
+function __iz_postexec --on-event fish_postexec
+    set -e IZ_SHELL_CMD
+    set -e IZ_PIPELINE_ID
+end
+
 `)
 		for _, name := range tools {
 			if !wrappable(name) {
@@ -108,6 +117,17 @@ __iz_zsh_notes_widget() {
 zle -N __iz_zsh_notes_widget
 bindkey "${IZ_NOTES_KEY:-^O}" __iz_zsh_notes_widget
 
+__iz_preexec() {
+    export IZ_SHELL_CMD="$1"
+    export IZ_PIPELINE_ID="$$-${RANDOM}"
+}
+__iz_precmd() {
+    unset IZ_SHELL_CMD IZ_PIPELINE_ID
+}
+autoload -Uz add-zsh-hook
+add-zsh-hook preexec __iz_preexec
+add-zsh-hook precmd __iz_precmd
+
 `)
 		posixWrappers(&b, tools)
 
@@ -131,6 +151,13 @@ __iz_bash_notes_widget() {
 if [[ $- == *i* ]]; then
     bind -x "\"${IZ_KEY:-\\C-g}\": __iz_bash_widget"
     bind -x "\"${IZ_NOTES_KEY:-\\C-o}\": __iz_bash_notes_widget"
+fi
+
+__iz_bash_precmd() {
+    unset IZ_SHELL_CMD IZ_PIPELINE_ID
+}
+if [[ ";${PROMPT_COMMAND:-};" != *";__iz_bash_precmd;"* ]]; then
+    PROMPT_COMMAND="__iz_bash_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
 fi
 
 `)

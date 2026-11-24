@@ -123,6 +123,23 @@ var schema = []string{
   title, content, namespace, tags, tokenize='unicode61'
 )`,
 	`CREATE TABLE IF NOT EXISTS tombstones(key TEXT PRIMARY KEY, ts REAL NOT NULL DEFAULT 0)`,
+	`CREATE TABLE IF NOT EXISTS pipeline_stages(
+  id        INTEGER PRIMARY KEY,
+  pgid      INTEGER NOT NULL,
+  pid_key   TEXT NOT NULL DEFAULT '',
+  run_id    INTEGER NOT NULL DEFAULT 0,
+  stage_pos INTEGER NOT NULL DEFAULT 0,
+  ts        REAL NOT NULL,
+  end_ts    REAL NOT NULL,
+  tool      TEXT NOT NULL,
+  cmd       TEXT NOT NULL,
+  shell_cmd TEXT NOT NULL DEFAULT '',
+  cwd       TEXT NOT NULL,
+  hostname  TEXT NOT NULL,
+  exit_code INTEGER NOT NULL,
+  raw       BLOB
+)`,
+	`CREATE INDEX IF NOT EXISTS pipeline_stages_group ON pipeline_stages(pgid, pid_key)`,
 	// pre-uid / pre-v4 databases: these fail with "duplicate column" once applied
 	`ALTER TABLE memories ADD COLUMN uid TEXT`,
 	`ALTER TABLE memories ADD COLUMN mtime REAL NOT NULL DEFAULT 0`,
@@ -164,7 +181,7 @@ const (
 	uidCol      = `coalesce(uid, ` + legacyUID + `)`
 )
 
-const schemaVersion = 5 // 5: memories_ns dropped (memories_ns_title covers it)
+const schemaVersion = 6 // 6: pipeline_stages local coordination table
 
 // ensureSchema creates/migrates the schema, skipped once PRAGMA user_version
 // says it is current. That holds for a sync remote too: rows older clients
@@ -327,6 +344,291 @@ func insertRunTx(tx *sql.Tx, r Run, raw, text []byte) (int64, error) {
 	// (FTS MATCH still would, silently hiding the bug).
 	_, err = tx.Exec(`INSERT INTO outputs_fts(rowid,text) VALUES(?,?)`, id, ftsPrefix(r)+string(text))
 	return id, err
+}
+
+func updateRunTx(tx *sql.Tx, id int64, r Run, raw, text []byte) error {
+	if _, err := tx.Exec(
+		`UPDATE runs SET ts=?,hostname=?,tool=?,cmd=?,cwd=?,exit_code=?,duration_ms=?,size=?,raw=? WHERE id=?`,
+		r.Ts, r.Hostname, r.Tool, r.Cmd, r.Cwd, r.ExitCode, r.Dur, r.Size, raw, id,
+	); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM outputs_fts WHERE rowid=?`, id); err != nil {
+		return err
+	}
+	_, err := tx.Exec(`INSERT INTO outputs_fts(rowid,text) VALUES(?,?)`, id, ftsPrefix(r)+string(text))
+	return err
+}
+
+// PipelineStage represents one wrapped command inside a shell pipeline.
+type PipelineStage struct {
+	PGID     int
+	PidKey   string
+	StagePos int
+	Ts       float64
+	EndTs    float64
+	Tool     string
+	Cmd      string
+	ShellCmd string
+	Cwd      string
+	Hostname string
+	ExitCode int
+	Raw      []byte
+}
+
+// recordPipelineStage stores this stage in pipeline_stages and creates or updates
+// the single merged runs row for (PGID, PidKey).
+func recordPipelineStage(db *sql.DB, st PipelineStage) (runID int64, mergedSize int64, mergedExit int, mergedDur time.Duration, err error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return 0, 0, st.ExitCode, 0, err
+	}
+	defer tx.Rollback() //nolint
+
+	// Prune stale coordination rows (>1h old) so the local table stays tiny.
+	_, _ = tx.Exec(`DELETE FROM pipeline_stages WHERE ts < ?`, st.Ts-3600)
+
+	if _, err := tx.Exec(
+		`INSERT INTO pipeline_stages(pgid,pid_key,run_id,stage_pos,ts,end_ts,tool,cmd,shell_cmd,cwd,hostname,exit_code,raw)
+		 VALUES(?,?,0,?,?,?,?,?,?,?,?,?,?)`,
+		st.PGID, st.PidKey, st.StagePos, st.Ts, st.EndTs, st.Tool, st.Cmd, st.ShellCmd, st.Cwd, st.Hostname, st.ExitCode, st.Raw,
+	); err != nil {
+		return 0, 0, st.ExitCode, 0, err
+	}
+
+	rows, err := tx.Query(
+		`SELECT run_id,ts,end_ts,tool,cmd,shell_cmd,cwd,hostname,exit_code,raw
+		 FROM pipeline_stages
+		 WHERE pgid=? AND pid_key=?
+		 ORDER BY stage_pos ASC, ts ASC, id ASC`,
+		st.PGID, st.PidKey,
+	)
+	if err != nil {
+		return 0, 0, st.ExitCode, 0, err
+	}
+	var stages []PipelineStage
+	var existingRunID int64
+	for rows.Next() {
+		var s PipelineStage
+		var rid int64
+		if err := rows.Scan(&rid, &s.Ts, &s.EndTs, &s.Tool, &s.Cmd, &s.ShellCmd, &s.Cwd, &s.Hostname, &s.ExitCode, &s.Raw); err != nil {
+			rows.Close()
+			return 0, 0, st.ExitCode, 0, err
+		}
+		if rid > 0 && existingRunID == 0 {
+			existingRunID = rid
+		}
+		stages = append(stages, s)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, 0, st.ExitCode, 0, err
+	}
+
+	r, rawGz, ftsText := mergePipelineStages(stages)
+	if existingRunID > 0 {
+		if err := updateRunTx(tx, existingRunID, r, rawGz, ftsText); err != nil {
+			return 0, 0, st.ExitCode, 0, err
+		}
+		runID = existingRunID
+	} else {
+		id, err := insertRunTx(tx, r, rawGz, ftsText)
+		if err != nil {
+			return 0, 0, st.ExitCode, 0, err
+		}
+		runID = id
+	}
+
+	if _, err := tx.Exec(`UPDATE pipeline_stages SET run_id=? WHERE pgid=? AND pid_key=?`, runID, st.PGID, st.PidKey); err != nil {
+		return 0, 0, st.ExitCode, 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, 0, st.ExitCode, 0, err
+	}
+	return runID, r.Size.Int64, int(r.ExitCode.Int64), time.Duration(r.Dur.Int64) * time.Millisecond, nil
+}
+
+// mergePipelineStages combines multiple wrapped stages into one Run.
+// If only one stage produced output, its output is kept directly (avoiding
+// empty downstream noise while preserving upstream findings). If multiple
+// stages produced output, each non-empty stage is labeled in order.
+func mergePipelineStages(stages []PipelineStage) (Run, []byte, []byte) {
+	first := stages[0]
+	last := stages[len(stages)-1]
+	minTs := first.Ts
+	maxEnd := first.EndTs
+	shellCmd := ""
+	var cmds []string
+	var nonEmpty []PipelineStage
+
+	for _, s := range stages {
+		if s.Ts < minTs {
+			minTs = s.Ts
+		}
+		if s.EndTs > maxEnd {
+			maxEnd = s.EndTs
+		}
+		if shellCmd == "" && s.ShellCmd != "" {
+			shellCmd = s.ShellCmd
+		}
+		cmds = append(cmds, s.Cmd)
+		if len(s.Raw) > 0 {
+			nonEmpty = append(nonEmpty, s)
+		}
+	}
+
+	fullCmd := strings.Join(cmds, " | ")
+	if shellCmd != "" {
+		fullCmd = extractPipelineCmd(shellCmd, stages)
+	}
+
+	var combined []byte
+	switch len(nonEmpty) {
+	case 0:
+		combined = nil
+	case 1:
+		combined = nonEmpty[0].Raw
+	default:
+		var buf bytes.Buffer
+		for i, s := range nonEmpty {
+			if i > 0 {
+				buf.WriteString("\n\n")
+			}
+			fmt.Fprintf(&buf, "── [%d/%d] %s (exit=%d) ──\n", i+1, len(nonEmpty), s.Cmd, s.ExitCode)
+			buf.Write(bytes.TrimRight(s.Raw, "\r\n"))
+			buf.WriteByte('\n')
+		}
+		combined = buf.Bytes()
+	}
+
+	z := gz(combined)
+	durMs := int64((maxEnd - minTs) * 1000)
+	if durMs < 0 {
+		durMs = 0
+	}
+	r := Run{
+		Ts:       minTs,
+		Hostname: first.Hostname,
+		Tool:     first.Tool,
+		Cmd:      fullCmd,
+		Cwd:      first.Cwd,
+		ExitCode: ni(int64(last.ExitCode)),
+		Dur:      ni(durMs),
+		Size:     ni(int64(len(z))),
+	}
+	return r, z, truncFTS(stripANSI(combined))
+}
+
+// splitTopLevel splits s on separator tokens (e.g. "|" or "&&", "||", ";")
+// outside single/double quotes and backslash escapes.
+func splitTopLevel(s string, seps ...string) []string {
+	var parts []string
+	var cur strings.Builder
+	var quote byte
+	escaped := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if escaped {
+			cur.WriteByte(c)
+			escaped = false
+			continue
+		}
+		if c == '\\' && quote != '\'' {
+			cur.WriteByte(c)
+			escaped = true
+			continue
+		}
+		if quote != 0 {
+			cur.WriteByte(c)
+			if c == quote {
+				quote = 0
+			}
+			continue
+		}
+		if c == '\'' || c == '"' {
+			quote = c
+			cur.WriteByte(c)
+			continue
+		}
+		matched := ""
+		for _, sep := range seps {
+			if strings.HasPrefix(s[i:], sep) && len(sep) > len(matched) {
+				matched = sep
+			}
+		}
+		if matched != "" {
+			parts = append(parts, strings.TrimSpace(cur.String()))
+			cur.Reset()
+			i += len(matched) - 1
+			continue
+		}
+		cur.WriteByte(c)
+	}
+	if tail := strings.TrimSpace(cur.String()); tail != "" || len(parts) > 0 {
+		parts = append(parts, tail)
+	}
+	return parts
+}
+
+// extractPipelineCmd picks the pipeline segment from shellCmd that contains
+// the recorded stages (e.g. stripping a leading "cd dir && ").
+func extractPipelineCmd(shellCmd string, stages []PipelineStage) string {
+	lists := splitTopLevel(shellCmd, "&&", "||", ";")
+	if len(lists) <= 1 {
+		return strings.TrimSpace(shellCmd)
+	}
+	for _, seg := range lists {
+		if !strings.Contains(seg, "|") {
+			continue
+		}
+		allMatch := true
+		for _, st := range stages {
+			if !strings.Contains(seg, st.Tool) {
+				allMatch = false
+				break
+			}
+		}
+		if allMatch {
+			return seg
+		}
+	}
+	return strings.TrimSpace(shellCmd)
+}
+
+// hasDownstreamWrappedTool reports whether shellCmd has a wrapped tool in a
+// pipeline stage after currentTool.
+func hasDownstreamWrappedTool(shellCmd, currentTool string, tools []string) bool {
+	if shellCmd == "" || !strings.Contains(shellCmd, "|") {
+		return false
+	}
+	toolSet := make(map[string]bool, len(tools))
+	for _, t := range tools {
+		toolSet[t] = true
+	}
+	for _, seg := range splitTopLevel(shellCmd, "&&", "||", ";") {
+		pipes := splitTopLevel(seg, "|")
+		if len(pipes) < 2 {
+			continue
+		}
+		seenCurrent := false
+		for _, p := range pipes {
+			fields := strings.Fields(p)
+			if len(fields) == 0 {
+				continue
+			}
+			bin := filepath.Base(fields[0])
+			if !seenCurrent {
+				if bin == currentTool {
+					seenCurrent = true
+				}
+				continue
+			}
+			if toolSet[bin] {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // deleteRuns removes runs and their FTS rows in one transaction, leaving
