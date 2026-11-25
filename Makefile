@@ -1,6 +1,7 @@
 .PHONY: build test install linux dist clean
 
-LDFLAGS := -s -w
+VERSION ?= dev
+LDFLAGS := -s -w -X main.version=$(VERSION)
 GOFLAGS := -trimpath
 
 build:
@@ -20,7 +21,6 @@ linux:
 dist: linux
 	CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build $(GOFLAGS) -ldflags="$(LDFLAGS)" -o dist/iz-darwin-amd64 .
 	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build $(GOFLAGS) -ldflags="$(LDFLAGS)" -o dist/iz-darwin-arm64 .
-	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build $(GOFLAGS) -ldflags="$(LDFLAGS)" -o dist/iz-windows-amd64.exe .
 
 clean:
 	rm -rf iz dist

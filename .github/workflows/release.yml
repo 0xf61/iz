@@ -23,11 +23,6 @@ jobs:
       - name: Run tests
         run: go test -race ./...
 
-      - name: Build release binaries
-        run: |
-          make dist
-          cd dist && sha256sum * > checksums.txt
-
       - name: Determine tag
         id: tag
         run: |
@@ -36,6 +31,11 @@ jobs:
           else
             echo "name=v$(date -u +%Y.%m.%d)" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Build release binaries
+        run: |
+          make dist VERSION=${{ steps.tag.outputs.name }}
+          cd dist && sha256sum * > checksums.txt
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2

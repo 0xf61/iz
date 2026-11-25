@@ -8,6 +8,8 @@ import (
 	"strings"
 )
 
+var version = "dev"
+
 const usage = `iz — command history, recorded output, and AI memory/recall
 
 Usage:
@@ -22,6 +24,8 @@ Usage:
   iz i [tool] <file>         import a file (e.g. iz i nmap gm.xml)
   iz m <iz.db>               merge another machine's database (runs + notes)
   iz sync                    two-way sync with remote LibSQL/Turso (IZ_SYNC_URL)
+  iz update                  update iz to the latest GitHub release
+  iz version                 print iz version
   iz init [fish|zsh|bash]    setup or print shell & AI assistant integration (iz init --help)
 
 Memory & Recall:
@@ -71,6 +75,10 @@ func main() {
 		os.Exit(listNotes(strings.Join(args, " ")))
 	case "sync", "s":
 		os.Exit(syncCmd(args))
+	case "update", "upgrade":
+		os.Exit(updateCmd(args))
+	case "version", "--version", "-v":
+		fmt.Println("iz", currentVersion())
 	case "ai":
 		os.Exit(aiGuideCmd())
 	case "--rm": // internal: delete runs, called by the TUI (ctrl-y)

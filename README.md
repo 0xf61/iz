@@ -52,11 +52,16 @@ go install github.com/0xf61/iz@latest
 The binary lands in `$GOBIN` (default `~/go/bin/iz`); make sure it is on your
 `$PATH`. Requires Go 1.26+. No cgo, so the same works on Linux.
 
+Prebuilt binaries are also published on [GitHub Releases](https://github.com/0xf61/iz/releases).
+Once installed, update in place with `iz update` (downloads the latest release
+for your platform and verifies its SHA-256 checksum) and check the installed
+version with `iz version`.
+
 Or build from source:
 
 ```fish
 git clone https://github.com/0xf61/iz && cd iz
-go build -o ~/.local/bin/iz .
+make install                      # builds and copies to ~/.local/bin/iz (re-signs on macOS)
 iz init                           # hook your shell (fish, zsh or bash) and AI assistants
 ```
 
@@ -64,8 +69,17 @@ Cross-compiling for another machine (a server, a VM, a container) is a single
 command since there is no cgo:
 
 ```fish
-GOOS=linux GOARCH=amd64 go build -o dist/iz-linux-amd64 .
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/iz-linux-amd64 .
 ```
+
+### Runtime dependencies
+
+- `fzf` — required for the interactive TUIs (`iz`, `iz n`) and shell widgets
+  (`ctrl-g`, `ctrl-o`). Non-interactive commands (`iz --`, `iz sh`, `iz recall`,
+  `iz prime`, `iz sync`, `iz update`, etc.) work without `fzf`.
+- `less` — used by the TUIs to view full outputs and notes (`enter` runs `less -R`).
+- `$EDITOR` — used by `iz e`, `iz n edit`, `iz n new`, and `ctrl-e`/`ctrl-n`
+  (falls back to `nvim`, `vim`, `vi`, or `nano`).
 
 ## Quick Setup & Shell Integration
 
@@ -95,7 +109,10 @@ iz sh 42 -- 443                   # same, highlighting "443" (after -- a number 
 iz e 42                           # open output #42 in $EDITOR
 iz i cargo build.log              # import a log file
 iz m laptop.db                    # merge a db from another machine (runs + notes)
+iz l                              # list auto-record wrappers
 iz d less                         # remove a wrapper
+iz update                         # update iz to the latest GitHub release
+iz version                        # print iz version
 
 # Memory, notes & cloud sync
 iz n                              # interactive notes TUI (ctrl-o in the shell)
@@ -148,7 +165,10 @@ set -gx IZ ~/.iz/iz.db    # resume
 
 ## Multiple machines & Cloud Sync
 
-Sync two-way across machines with Turso / LibSQL via `$IZ_SYNC_URL` and `$IZ_AUTH_TOKEN`:
+Sync two-way across machines with Turso / LibSQL over a built-in pure-Go Hrana
+v2 HTTP client (no cgo) via `$IZ_SYNC_URL` and `$IZ_AUTH_TOKEN` (also accepts
+`$TURSO_DATABASE_URL` / `$TURSO_AUTH_TOKEN`, optional `$IZ_SYNC_TIMEOUT`, or
+falls back to `atuin kv` when `$IZ_SYNC_URL` is unset):
 
 ```fish
 set -gx IZ_SYNC_URL "libsql://your-db.turso.io"
@@ -167,9 +187,12 @@ iz host:build01 failed
 ## Development
 
 ```fish
-make test      # go test ./...
-make build     # go build -o iz .
+make test      # go test -race ./...
+make build     # CGO_ENABLED=0 stripped build into ./iz (VERSION=dev)
+make install   # build and install to ~/.local/bin/iz (re-signs on macOS)
 make linux     # static linux/amd64 + linux/arm64 into dist/
+make dist      # release binaries into dist/ (set VERSION=v...)
+make clean     # remove ./iz and dist/
 ```
 
 | file | role |
@@ -182,5 +205,7 @@ make linux     # static linux/amd64 + linux/arm64 into dist/
 | `cmds.go` | add/del/list/rm/import/merge/show/edit |
 | `memory.go` | structured notes, FTS5 recall, notes TUI |
 | `sync.go` | two-way LibSQL/Turso & file replication |
+| `libsql_http.go` | pure-Go LibSQL Hrana v2 HTTP `database/sql` driver |
+| `update.go` | self-updater (`iz update`) via GitHub Releases with SHA-256 verification |
 | `shell.go` | fish, zsh, bash & AI assistant init generator |
 | `ai.go` | AI agent reference guide |
